@@ -1,0 +1,8 @@
+build/
+weights/*
+data/*
+!weights/.gitkeep
+!data/.gitkeep
+__pycache__/
+.venv/
+*.o
