@@ -5,23 +5,31 @@
 #include <stdint.h>
 
 #define CP_MAGIC 0x31575043u /* "CPW1" little-endian */
+#define CP_VERSION 2u
 
-/* File header: magic + reserved + 5 config ints = 28 bytes. */
+/* File header: magic + version + 6 config ints = 32 bytes. */
 typedef struct {
     uint32_t magic;
-    uint32_t reserved;
-    int32_t vocab, d_model, n_heads, d_ff, n_layer;
+    uint32_t version;
+    int32_t vocab, d_model, n_heads, d_ff, n_layer, n_ctx;
 } Header;
 
 /* The model's parameters as pointers INTO the mmap'd file — no copying,
-   the OS pages them in as we touch them. */
+   the OS pages them in as we touch them. Per-tensor-type across layers
+   (llama2.c style): e.g. Wq holds ALL layers, layer l at Wq + l*d*d.
+   Unembedding is TIED: logits use token_emb (GPT-2 semantics). */
 typedef struct {
-    float *token_emb;           /* (vocab, d_model)   */
-    float *Wq, *Wk, *Wv, *Wo;   /* (d_model, d_model) */
-    float *W1;                  /* (d_model, d_ff)    */
-    float *W2;                  /* (d_ff, d_model)    */
-    float *ln1_g, *ln2_g, *lnf_g; /* (d_model)        */
-    float *unemb;               /* (vocab, d_model)   */
+    float *token_emb;             /* (vocab, d_model)   */
+    float *pos_emb;               /* (n_ctx, d_model)   */
+    float *ln1_g, *ln1_b;         /* (n_layer, d_model) */
+    float *Wq, *bq;               /* (n_layer, d,d) / (n_layer, d) */
+    float *Wk, *bk;
+    float *Wv, *bv;
+    float *Wo, *bo;
+    float *ln2_g, *ln2_b;         /* (n_layer, d_model) */
+    float *W1, *b1;               /* (n_layer, d,f) / (n_layer, f) */
+    float *W2, *b2;               /* (n_layer, f,d) / (n_layer, d) */
+    float *lnf_g, *lnf_b;         /* (d_model)          */
 } Weights;
 
 typedef struct {

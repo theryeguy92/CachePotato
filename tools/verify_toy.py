@@ -1,8 +1,9 @@
 """verify_toy.py — prove the C forward pass matches the numpy ground truth.
 
-Runs ./build/cachepotato, parses its printed logits for tokens [5,1,7],
-recomputes the expected logits with the same seeded weights as
-forward_by_hand.py, and reports the max absolute difference.
+Runs ./build/cachepotato (toy weights, tokens 5 1 7), parses its printed
+logits, recomputes the expected logits with the same seeded weights as
+forward_by_hand.py (v2 semantics: GELU, zero biases/pos_emb, TIED unemb),
+and reports the max absolute difference.
 
 Exit 0 on PASS, 1 on FAIL. Run from repo root:  python3 tools/verify_toy.py
 """
@@ -26,17 +27,20 @@ def expected_logits():
     def rw(*s):
         return rng.standard_normal(s, dtype=np.float32) * 0.2
 
-    W = {"token_emb": rw(VOCAB, D), "Wq": rw(D, D), "Wk": rw(D, D),
-         "Wv": rw(D, D), "Wo": rw(D, D), "W1": rw(D, D_FF), "W2": rw(D_FF, D),
-         "unemb": rw(VOCAB, D)}
+    token_emb = rw(VOCAB, D)
+    Wq, Wk, Wv, Wo = rw(D, D), rw(D, D), rw(D, D), rw(D, D)
+    W1, W2 = rw(D, D_FF), rw(D_FF, D)
 
     def ln(v, eps=1e-5):
         return (v - v.mean(axis=-1, keepdims=True)) / \
                np.sqrt(v.var(axis=-1, keepdims=True) + eps)
 
-    x = W["token_emb"][[5, 1, 7]]
+    def gelu(v):  # tanh approximation, same as the C engine
+        return 0.5 * v * (1 + np.tanh(0.7978845608028654 * (v + 0.044715 * v ** 3)))
+
+    x = token_emb[[5, 1, 7]]  # pos_emb is zeros in the toy file
     xn = ln(x)
-    q, k, v = xn @ W["Wq"], xn @ W["Wk"], xn @ W["Wv"]
+    q, k, v = xn @ Wq, xn @ Wk, xn @ Wv
     qh, kh, vh = [a.reshape(T, H, HD) for a in (q, k, v)]
     att = np.zeros((H, T, T), dtype=np.float32)
     for h in range(H):
@@ -44,9 +48,9 @@ def expected_logits():
         s = np.where(np.triu(np.ones((T, T), dtype=bool), k=1), -np.inf, s)
         e = np.exp(s - s.max(axis=-1, keepdims=True))
         att[h] = e / e.sum(axis=-1, keepdims=True)
-    x = x + np.concatenate([att[h] @ vh[:, h, :] for h in range(H)], axis=1) @ W["Wo"]
-    x = x + np.maximum(0, ln(x) @ W["W1"]) @ W["W2"]
-    return ln(x) @ W["unemb"].T
+    x = x + np.concatenate([att[h] @ vh[:, h, :] for h in range(H)], axis=1) @ Wo
+    x = x + gelu(ln(x) @ W1) @ W2
+    return ln(x) @ token_emb.T  # tied unembedding (v2)
 
 
 def main():

@@ -11,30 +11,45 @@
    Independent of map_weights() ON PURPOSE — it's the cross-check. */
 static long expected_floats(const Header *h) {
     long v = h->vocab, d = h->d_model, f = h->d_ff;
-    /* token_emb + unemb: 2*v*d | Wq,Wk,Wv,Wo: 4*d*d | W1+W2: 2*d*f | gains: 3*d */
-    return 2 * v * d + 4 * d * d + 2 * d * f + 3 * d;
+    long c = h->n_ctx, L = h->n_layer;
+    long per_layer =
+        2 * d +              /* ln1 g,b   */
+        4 * (d * d + d) +    /* Wq..Wo + biases */
+        2 * d +              /* ln2 g,b   */
+        (d * f + f) +        /* W1 + b1   */
+        (f * d + d);         /* W2 + b2   */
+    return v * d + c * d + L * per_layer + 2 * d; /* + lnf g,b; unemb tied */
 }
 
 /* Assign every field of m->w by advancing ptr past each tensor, in the
- * SAME order the exporter wrote them:
- *   token_emb, Wq, Wk, Wv, Wo, W1, W2, ln1_g, ln2_g, lnf_g, unemb
- * This is llama2.c's memory_map_weights(), minus the multi-layer loop. */
+   SAME order the exporter wrote them. Per-tensor-type across layers:
+   layer l of Wq lives at w->Wq + l*d*d, etc. */
 static void map_weights(Model *m) {
     float *ptr = m->data + sizeof(Header) / sizeof(float); /* skip header */
-    int v = m->hdr.vocab, d = m->hdr.d_model, f = m->hdr.d_ff;
+    long v = m->hdr.vocab, d = m->hdr.d_model, f = m->hdr.d_ff;
+    long c = m->hdr.n_ctx, L = m->hdr.n_layer;
     Weights *w = &m->w;
 
     w->token_emb = ptr;  ptr += v * d;
-    w->Wq = ptr;         ptr += d * d;
-    w->Wk = ptr;         ptr += d * d;
-    w->Wv = ptr;         ptr += d * d;
-    w->Wo = ptr;         ptr += d * d;
-    w->W1 = ptr;         ptr += d * f;
-    w->W2 = ptr;         ptr += f * d;
-    w->ln1_g = ptr;      ptr += d;
-    w->ln2_g = ptr;      ptr += d;
+    w->pos_emb = ptr;    ptr += c * d;
+    w->ln1_g = ptr;      ptr += L * d;
+    w->ln1_b = ptr;      ptr += L * d;
+    w->Wq = ptr;         ptr += L * d * d;
+    w->bq = ptr;         ptr += L * d;
+    w->Wk = ptr;         ptr += L * d * d;
+    w->bk = ptr;         ptr += L * d;
+    w->Wv = ptr;         ptr += L * d * d;
+    w->bv = ptr;         ptr += L * d;
+    w->Wo = ptr;         ptr += L * d * d;
+    w->bo = ptr;         ptr += L * d;
+    w->ln2_g = ptr;      ptr += L * d;
+    w->ln2_b = ptr;      ptr += L * d;
+    w->W1 = ptr;         ptr += L * d * f;
+    w->b1 = ptr;         ptr += L * f;
+    w->W2 = ptr;         ptr += L * f * d;
+    w->b2 = ptr;         ptr += L * d;
     w->lnf_g = ptr;      ptr += d;
-    w->unemb = ptr;
+    w->lnf_b = ptr;
 }
 
 int model_load(Model *m, const char *path) {
@@ -50,9 +65,10 @@ int model_load(Model *m, const char *path) {
         fprintf(stderr, "couldn't read header\n");
         return -1;
     }
-    /* loud failure #1: wrong file / wrong format */
-    if (m->hdr.magic != CP_MAGIC) {
-        fprintf(stderr, "bad magic 0x%08x — not a CPW1 weight file\n", m->hdr.magic);
+    /* loud failure #1: wrong file / wrong format / stale version */
+    if (m->hdr.magic != CP_MAGIC || m->hdr.version != CP_VERSION) {
+        fprintf(stderr, "bad magic/version 0x%08x/%u — not a CPW1 v%u weight file\n",
+                m->hdr.magic, m->hdr.version, CP_VERSION);
         return -1;
     }
     /* loud failure #2: truncated file or exporter/loader layout drift */
