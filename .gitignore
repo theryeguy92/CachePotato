@@ -6,3 +6,6 @@ data/*
 __pycache__/
 .venv/
 *.o
+experiments/mmap_basics
+experiments/madvise_hints
+experiments/ssd_latency
