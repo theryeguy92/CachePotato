@@ -1,4 +1,5 @@
 #include "model.h"
+#include "instr.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -69,9 +70,12 @@ void forward(const Model *m, const int *tokens, int T, float *logits_out) {
     float *proj = malloc(D * sizeof(float));    /* residual scratch */
 
     /* step 0: token embedding + learned position embedding */
-    for (int t = 0; t < T; t++)
+    for (int t = 0; t < T; t++) {
+        instr_touch("token_emb", -1, t, D * sizeof(float));
+        instr_touch("pos_emb", -1, t, D * sizeof(float));
         for (int e = 0; e < D; e++)
             x[t * D + e] = w->token_emb[tokens[t] * D + e] + w->pos_emb[t * D + e];
+    }
 
     for (int l = 0; l < L; l++) {
         const float *ln1_g = w->ln1_g + l * D, *ln1_b = w->ln1_b + l * D;
@@ -84,8 +88,14 @@ void forward(const Model *m, const int *tokens, int T, float *logits_out) {
         const float *W2 = w->W2 + l * F * D, *b2 = w->b2 + l * D;
 
         /* attention half: norm -> qkv -> per-head masked attention -> Wo -> +res */
-        for (int t = 0; t < T; t++) layernorm(xn + t * D, x + t * D, ln1_g, ln1_b, D);
         for (int t = 0; t < T; t++) {
+            instr_touch("ln1", l, t, 2 * D * sizeof(float));
+            layernorm(xn + t * D, x + t * D, ln1_g, ln1_b, D);
+        }
+        for (int t = 0; t < T; t++) {
+            instr_touch("Wq", l, t, (D * D + D) * sizeof(float));
+            instr_touch("Wk", l, t, (D * D + D) * sizeof(float));
+            instr_touch("Wv", l, t, (D * D + D) * sizeof(float));
             matmul_xw(q  + t * D, xn + t * D, Wq, bq, D, D);
             matmul_xw(k  + t * D, xn + t * D, Wk, bk, D, D);
             matmul_xw(vv + t * D, xn + t * D, Wv, bv, D, D);
@@ -109,13 +119,19 @@ void forward(const Model *m, const int *tokens, int T, float *logits_out) {
             }
         }
         for (int t = 0; t < T; t++) {
+            instr_touch("Wo", l, t, (D * D + D) * sizeof(float));
             matmul_xw(proj, ao + t * D, Wo, bo, D, D);
             for (int e = 0; e < D; e++) x[t * D + e] += proj[e];
         }
 
         /* FFN half: norm -> W1 -> gelu -> W2 -> +res */
-        for (int t = 0; t < T; t++) layernorm(xn + t * D, x + t * D, ln2_g, ln2_b, D);
         for (int t = 0; t < T; t++) {
+            instr_touch("ln2", l, t, 2 * D * sizeof(float));
+            layernorm(xn + t * D, x + t * D, ln2_g, ln2_b, D);
+        }
+        for (int t = 0; t < T; t++) {
+            instr_touch("W1", l, t, (D * F + F) * sizeof(float));
+            instr_touch("W2", l, t, (F * D + D) * sizeof(float));
             matmul_xw(h + t * F, xn + t * D, W1, b1, D, F);
             for (int e = 0; e < F; e++) h[t * F + e] = gelu(h[t * F + e]);
             matmul_xw(proj, h + t * F, W2, b2, F, D);
@@ -125,6 +141,8 @@ void forward(const Model *m, const int *tokens, int T, float *logits_out) {
 
     /* head: final norm -> logits = xf @ token_emb^T (tied unembedding) */
     for (int t = 0; t < T; t++) {
+        instr_touch("lnf", -1, t, 2 * D * sizeof(float));
+        instr_touch("unemb", -1, t, (size_t)V * D * sizeof(float));
         layernorm(xn + t * D, x + t * D, w->lnf_g, w->lnf_b, D);
         matmul_wx(logits_out + t * V, xn + t * D, w->token_emb, D, V);
     }

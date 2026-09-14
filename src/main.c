@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "instr.h"
 #include "model.h"
 #include "weights.h"
 
@@ -39,6 +40,7 @@ int main(int argc, char **argv) {
     }
 
     free(logits);
+    instr_report();
     model_free(&m);
     return 0;
 }
