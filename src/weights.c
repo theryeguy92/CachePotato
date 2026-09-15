@@ -1,3 +1,4 @@
+#define _GNU_SOURCE /* madvise/posix_fadvise with -std=c11 */
 #include "weights.h"
 
 #include <fcntl.h>
@@ -89,4 +90,9 @@ int model_load(Model *m, const char *path) {
 void model_free(Model *m) {
     if (m->data) munmap(m->data, m->file_size);
     if (m->fd >= 0) close(m->fd);
+}
+
+void model_evict_all(Model *m) {
+    madvise(m->data, m->file_size, MADV_DONTNEED);
+    posix_fadvise(m->fd, 0, 0, POSIX_FADV_DONTNEED);
 }

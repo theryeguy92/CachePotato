@@ -45,4 +45,9 @@ typedef struct {
 int model_load(Model *m, const char *path);
 void model_free(Model *m);
 
+/* Experiment 1 (Phase 3): evict ALL weight pages — process-level
+   (MADV_DONTNEED) AND system page cache (POSIX_FADV_DONTNEED).
+   Next touch re-faults everything. Used by CP_COLD mode. */
+void model_evict_all(Model *m);
+
 #endif

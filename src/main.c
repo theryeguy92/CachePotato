@@ -25,6 +25,27 @@ static double now_s(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+static long rss_kb(void) {
+    FILE *f = fopen("/proc/self/statm", "r");
+    long total, resident = 0;
+    if (f) { if (fscanf(f, "%ld %ld", &total, &resident) != 2) resident = 0; fclose(f); }
+    return resident * 4; /* 4K pages */
+}
+
+static long disk_read_kb(void) {
+    /* /proc/self/io read_bytes = actual block-device reads (NOT page-cache
+       hits) — the honest measure of whether weights came off disk */
+    FILE *f = fopen("/proc/self/io", "r");
+    char key[64];
+    long val = 0;
+    if (f) {
+        while (fscanf(f, "%63[^:]: %ld\n", key, &val) == 2)
+            if (strcmp(key, "read_bytes") == 0) break;
+        fclose(f);
+    }
+    return val / 1024;
+}
+
 /* Stage-1 REPL (Interface-TUI-Design): prompt in, streamed tokens out,
    greedy decoding, tok/s on stderr. */
 static int repl(const char *path) {
@@ -53,9 +74,13 @@ static int repl(const char *path) {
             continue;
         }
 
+        int cold = getenv("CP_COLD") != NULL;
+        long io0 = disk_read_kb();
         double t0 = now_s();
-        for (int i = 0; i < n; i++)          /* warm the KV cache on the prompt */
+        for (int i = 0; i < n; i++) {        /* warm the KV cache on the prompt */
             forward_step(&m, &rs, ids[i], i);
+            if (cold) model_evict_all(&m);
+        }
 
         int gen = 0, pos = n;
         for (; gen < MAX_NEW && pos < m.hdr.n_ctx; gen++, pos++) {
@@ -65,9 +90,12 @@ static int repl(const char *path) {
             tokenizer_decode(&tk, &next, 1, stdout);
             fflush(stdout);
             forward_step(&m, &rs, next, pos);
+            if (cold) model_evict_all(&m);
         }
         double dt = now_s() - t0;
-        fprintf(stderr, "\n[%d tokens in %.1fs — %.2f tok/s]\n", gen, dt, gen / dt);
+        fprintf(stderr, "\n[%d tokens in %.1fs — %.2f tok/s | rss %ld MB | disk %ld MB]%s\n",
+                gen, dt, gen / dt, rss_kb() / 1024,
+                (disk_read_kb() - io0) / 1024, cold ? " (forced-cold)" : "");
     }
 
     runstate_free(&rs, &m);
