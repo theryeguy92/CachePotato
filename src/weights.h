@@ -45,6 +45,13 @@ typedef struct {
 int model_load(Model *m, const char *path);
 void model_free(Model *m);
 
+/* The pointer walk, exposed: lay out a Weights struct over any float
+   buffer (used by the mmap loader AND by the trainer, which lays the same
+   struct over its params and grads buffers). */
+void layout_weights(Weights *w, const Header *h, float *ptr);
+/* floats the CPW1 payload contains for this config (cross-check + sizing) */
+long expected_floats(const Header *h);
+
 /* Experiment 1 (Phase 3): evict ALL weight pages — process-level
    (MADV_DONTNEED) AND system page cache (POSIX_FADV_DONTNEED).
    Next touch re-faults everything. Used by CP_COLD mode. */

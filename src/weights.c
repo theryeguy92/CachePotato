@@ -10,7 +10,7 @@
 
 /* Floats the payload must contain, derived from the config alone.
    Independent of map_weights() ON PURPOSE — it's the cross-check. */
-static long expected_floats(const Header *h) {
+long expected_floats(const Header *h) {
     long v = h->vocab, d = h->d_model, f = h->d_ff;
     long c = h->n_ctx, L = h->n_layer;
     long per_layer =
@@ -22,14 +22,13 @@ static long expected_floats(const Header *h) {
     return v * d + c * d + L * per_layer + 2 * d; /* + lnf g,b; unemb tied */
 }
 
-/* Assign every field of m->w by advancing ptr past each tensor, in the
-   SAME order the exporter wrote them. Per-tensor-type across layers:
-   layer l of Wq lives at w->Wq + l*d*d, etc. */
-static void map_weights(Model *m) {
-    float *ptr = m->data + sizeof(Header) / sizeof(float); /* skip header */
-    long v = m->hdr.vocab, d = m->hdr.d_model, f = m->hdr.d_ff;
-    long c = m->hdr.n_ctx, L = m->hdr.n_layer;
-    Weights *w = &m->w;
+/* Assign every field of w by advancing ptr past each tensor, in the
+   CPW1 order. Per-tensor-type across layers: layer l of Wq lives at
+   w->Wq + l*d*d, etc. Works over ANY float buffer (mmap'd file, or the
+   trainer's params/grads buffers). */
+void layout_weights(Weights *w, const Header *h, float *ptr) {
+    long v = h->vocab, d = h->d_model, f = h->d_ff;
+    long c = h->n_ctx, L = h->n_layer;
 
     w->token_emb = ptr;  ptr += v * d;
     w->pos_emb = ptr;    ptr += c * d;
@@ -51,6 +50,10 @@ static void map_weights(Model *m) {
     w->b2 = ptr;         ptr += L * d;
     w->lnf_g = ptr;      ptr += d;
     w->lnf_b = ptr;
+}
+
+static void map_weights(Model *m) {
+    layout_weights(&m->w, &m->hdr, m->data + sizeof(Header) / sizeof(float));
 }
 
 int model_load(Model *m, const char *path) {

@@ -2,16 +2,22 @@ CC      ?= cc
 CFLAGS  ?= -O3 -march=native -Wall -Wextra -std=c11
 LDLIBS  ?= -lm
 BUILD   := build
-SRCS    := $(wildcard src/*.c)
-BIN     := $(BUILD)/cachepotato
+ENGINE  := src/weights.c src/kernels.c src/model.c src/tokenizer.c src/instr.c src/pager.c
+TRAINER := src/weights.c src/kernels.c src/train.c
 
-$(BIN): $(SRCS)
+all: $(BUILD)/cachepotato $(BUILD)/train
+
+$(BUILD)/cachepotato: src/main.c $(ENGINE)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+$(BUILD)/train: $(TRAINER)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 .PHONY: run clean
-run: $(BIN)
-	./$(BIN)
+run: $(BUILD)/cachepotato
+	./$(BUILD)/cachepotato
 
 clean:
 	rm -rf $(BUILD)

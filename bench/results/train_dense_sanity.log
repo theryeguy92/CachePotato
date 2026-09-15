@@ -1,0 +1,18 @@
+dense sanity: 7259008 params, 25538189 train tokens, 300 steps (B=4 T=64 lr=0.001)
+step    1 | loss 10.8219 | 4.16s/step
+step   20 | loss 8.0522 | 3.72s/step
+step   40 | loss 6.8587 | 3.39s/step
+step   60 | loss 6.2439 | 3.38s/step
+step   80 | loss 6.1421 | 3.40s/step
+step  100 | loss 6.2074 | 3.38s/step
+step  120 | loss 6.2120 | 3.43s/step
+step  140 | loss 6.4044 | 3.56s/step
+step  160 | loss 6.1236 | 3.42s/step
+step  180 | loss 6.0217 | 3.74s/step
+step  200 | loss 5.8973 | 3.78s/step
+step  220 | loss 5.9139 | 3.66s/step
+step  240 | loss 5.7423 | 3.70s/step
+step  260 | loss 6.0408 | 3.73s/step
+step  280 | loss 5.3854 | 4.13s/step
+step  300 | loss 5.7507 | 3.40s/step
+saved weights/tinystories_dense.bin (7259008 params, 29036064 bytes)
