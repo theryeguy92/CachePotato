@@ -105,11 +105,10 @@ class MoEModel(torch.nn.Module):
         q = q.view(B, T, H, HD).transpose(1, 2)  # (B,H,T,HD)
         k = k.view(B, T, H, HD).transpose(1, 2)
         v = v.view(B, T, H, HD).transpose(1, 2)
-        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(HD)
-        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=x.device), 1)
-        scores = scores.masked_fill(mask, float("-inf"))
-        att = F.softmax(scores, dim=-1)
-        ao = torch.matmul(att, v).transpose(1, 2).reshape(B, T, D)
+        # SDPA (flash kernel): identical math to masked softmax(qk^T/sqrt(HD))v,
+        # fused — no (B,H,T,T) materialization (memory) and much faster
+        ao = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        ao = ao.transpose(1, 2).reshape(B, T, D)
         return x + torch.matmul(ao, self.Wo[l]) + self.bo[l]
 
     def dense_ffn(self, l, x):
@@ -118,44 +117,55 @@ class MoEModel(torch.nn.Module):
         return x + torch.matmul(h, self.W2[l]) + self.b2[l], 0.0, None
 
     def moe_ffn(self, l, x, tokens):
-        """Sequential over T for locality (exactness over speed — profile later)."""
+        """Two phases: (1) SEQUENTIAL router selection over T — required for
+        locality (prev-token bias + EOS reset), tiny fp32 ops only;
+        (2) BATCHED expert compute via gather/scatter once selections are
+        known. Semantics identical to the naive per-position dispatch."""
         cfg = self.cfg
         B, T, D = x.shape
         N, EH, K = cfg.n_exp, cfg.exp_hid, cfg.topk
-        xn = self.ln(x, self.ln2_g[l], self.ln2_b[l]).float()  # router input fp32
-        prev = torch.zeros(B, N, device=x.device)
-        counts = torch.zeros(N, device=x.device)
-        prob_sum = torch.zeros(N, device=x.device)
-        out = torch.zeros(B, T, D, device=x.device)
+        xn = self.ln(x, self.ln2_g[l], self.ln2_b[l])
 
-        for t in range(T):
-            xt = xn[:, t]                                   # (B,D)
-            r = torch.matmul(xt, self.Wr[l]) + self.br[l]   # (B,N) fp32
-            p = F.softmax(r + cfg.lam * prev, dim=-1)
-            v2, i2 = p.topk(K, dim=-1)                      # (B,K)
-            w = v2 / v2.sum(dim=-1, keepdim=True)
+        # ---- phase 1: router selection (fp32, even under bf16 autocast)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            xnf = xn.float()
+            # the expensive part — router logits for ALL positions in ONE matmul;
+            # only the tiny bias/softmax/topk ops stay in the sequential loop
+            r_all = torch.matmul(xnf, self.Wr[l].float()) + self.br[l].float()  # (B,T,N)
+            prev = torch.zeros(B, N, device=x.device)
+            counts = torch.zeros(N, device=x.device)
+            probs_all = torch.zeros(B, T, N, device=x.device)
+            sel_idx = torch.zeros(B, T, K, dtype=torch.long, device=x.device)
+            sel_w = torch.zeros(B, T, K, device=x.device)
+            for t in range(T):
+                p = F.softmax(r_all[:, t] + cfg.lam * prev, dim=-1)
+                probs_all[:, t] = p
+                v2, i2 = p.topk(K, dim=-1)
+                sel_idx[:, t] = i2
+                sel_w[:, t] = v2 / v2.sum(dim=-1, keepdim=True)
+                onehot = torch.zeros_like(prev)
+                onehot.scatter_(1, i2, 1.0)
+                counts += onehot.sum(dim=0)
+                prev = onehot * (tokens[:, t] != EOS).unsqueeze(1).float()
 
-            prob_sum += p.sum(dim=0)
-            sel_onehot = torch.zeros_like(prev)
-            sel_onehot.scatter_(1, i2, 1.0)
-            counts += sel_onehot.sum(dim=0)
-            prev = sel_onehot * (tokens[:, t] != EOS).unsqueeze(1).float()
-
-            sha = gelu_tanh(torch.matmul(xt, self.W1s[l]) + self.b1s[l])
-            o = torch.matmul(sha, self.W2s[l]) + self.b2s[l]  # shared out (B,D)
-
-            for s in range(K):
-                for e in range(N):
-                    mask = i2[:, s] == e
-                    if mask.any():
-                        xe = xt[mask]
-                        he = gelu_tanh(torch.matmul(xe, self.W1e[l][e]) + self.b1e[l][e])
-                        oe = torch.matmul(he, self.W2e[l][e]) + self.b2e[l][e]
-                        o[mask] += w[mask, s].unsqueeze(1) * oe
-            out[:, t] = o
+        # ---- phase 2: batched expert compute
+        xf = xn.reshape(B * T, D)
+        sha = gelu_tanh(torch.matmul(xf, self.W1s[l]) + self.b1s[l])
+        out = torch.matmul(sha, self.W2s[l]) + self.b2s[l]      # shared (B*T,D)
+        flat_idx = sel_idx.reshape(B * T, K)
+        flat_w = sel_w.reshape(B * T, K).to(out.dtype)
+        for s in range(K):
+            for e in range(N):
+                mask = flat_idx[:, s] == e
+                if mask.any():
+                    xe = xf[mask]
+                    he = gelu_tanh(torch.matmul(xe, self.W1e[l][e]) + self.b1e[l][e])
+                    oe = torch.matmul(he, self.W2e[l][e]) + self.b2e[l][e]
+                    out[mask] += flat_w[mask, s].unsqueeze(1) * oe
+        out = out.reshape(B, T, D)
 
         fe = counts / (B * T * K)
-        pe = prob_sum / (B * T)
+        pe = probs_all.mean(dim=(0, 1))
         aux = cfg.aux_alpha * N * torch.dot(fe, pe)
         stats = {"counts": counts.detach(), "total": float(B * T * K)}
         return x + out, aux, stats
@@ -282,6 +292,7 @@ class TokenStream:
 
 def run_train(args, cfg):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    amp = args.bf16 and dev == "cuda"
     torch.manual_seed(args.seed)
     model = MoEModel(cfg).to(dev)
     stream = TokenStream(args.data, args.T, args.seed)
@@ -338,7 +349,8 @@ def run_train(args, cfg):
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
         x, y = stream.batch(args.B, dev)
-        _, loss, stats = model(x, y)
+        with torch.autocast("cuda", torch.bfloat16, enabled=amp):
+            _, loss, stats = model(x, y)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -410,6 +422,7 @@ def main():
     ap.add_argument("--warmup", type=int, default=0)
     ap.add_argument("--lr-floor", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--bf16", action="store_true")
     args = ap.parse_args()
 
     if args.mode == "bridge":
