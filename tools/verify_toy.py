@@ -54,8 +54,9 @@ def expected_logits():
 
 
 def main():
+    env = {**os.environ, "CP_LOGITS": "1"}
     out = subprocess.run(["./build/cachepotato"], capture_output=True,
-                         text=True, cwd=REPO).stdout
+                         text=True, cwd=REPO, env=env).stdout
     block = out.split("logits:\n")[1].strip().split("\n")
     got = np.array([[float(v) for v in line.split()] for line in block[:3]])
 

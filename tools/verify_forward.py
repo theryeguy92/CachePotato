@@ -28,8 +28,9 @@ print(f"prompt: {prompt!r} -> {len(ids)} tokens: {ids}")
 with torch.no_grad():
     ref = model(torch.tensor([ids])).logits[0].numpy()  # (T, V)
 
+env = {**os.environ, "CP_LOGITS": "1"}
 out = subprocess.run(["./build/cachepotato", "weights/gpt2.bin"] + [str(i) for i in ids],
-                     capture_output=True, text=True, cwd=REPO).stdout
+                     capture_output=True, text=True, cwd=REPO, env=env).stdout
 block = out.split("logits:\n")[1].strip().split("\n")
 got = np.array([np.fromstring(line, sep=" ") for line in block[:len(ids)]])
 
