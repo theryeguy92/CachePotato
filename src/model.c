@@ -1,5 +1,6 @@
 #include "model.h"
 #include "instr.h"
+#include "pager.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -249,4 +250,6 @@ void forward_step(const Model *m, RunState *s, int token, int pos) {
     instr_touch("unemb", -1, pos, (size_t)V * D * sizeof(float));
     layernorm(s->xn, s->x, w->lnf_g, w->lnf_b, D);
     matmul_wx(s->logits, s->xn, w->token_emb, D, V); /* tied unemb */
+
+    pager_enforce(); /* evict LRU regions if over CP_BUDGET (no-op otherwise) */
 }

@@ -6,6 +6,7 @@
 
 #include "instr.h"
 #include "model.h"
+#include "pager.h"
 #include "tokenizer.h"
 #include "weights.h"
 
@@ -55,6 +56,9 @@ static int repl(const char *path) {
     Model m;
     if (model_load(&m, path) != 0)
         return 1;
+    const char *b = getenv("CP_BUDGET");
+    if (b)
+        pager_init(&m, atol(b) * 1024L * 1024L);
     RunState rs;
     runstate_alloc(&rs, &m);
 
@@ -98,6 +102,7 @@ static int repl(const char *path) {
                 (disk_read_kb() - io0) / 1024, cold ? " (forced-cold)" : "");
     }
 
+    pager_report();
     runstate_free(&rs, &m);
     model_free(&m);
     tokenizer_free(&tk);

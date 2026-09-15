@@ -1,4 +1,5 @@
 #include "instr.h"
+#include "pager.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +8,7 @@ static FILE *log_file;
 static long n_touches = -1; /* -1 = disabled (CP_INSTR unset) */
 
 void instr_touch(const char *tensor, int layer, int token, size_t bytes) {
+    pager_touch(tensor, layer); /* pager is a no-op until CP_BUDGET is set */
     if (n_touches == -2)
         return; /* permanently disabled (fopen failed once) */
     if (n_touches < 0) {
