@@ -1,5 +1,5 @@
 CC      ?= cc
-CFLAGS  ?= -O2 -Wall -Wextra -std=c11
+CFLAGS  ?= -O3 -march=native -Wall -Wextra -std=c11
 LDLIBS  ?= -lm
 BUILD   := build
 SRCS    := $(wildcard src/*.c)
