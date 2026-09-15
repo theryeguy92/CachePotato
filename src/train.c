@@ -31,8 +31,76 @@ static long N_PARAMS;
 #define LR        1e-3f
 #define GRADCHECK_EPS 1e-3f
 
-static void set_toy_config(void)   { HDR = (Header){0, 0, 8, 4, 2, 8, 1, 8}; }
+static void set_toy_config(void)   { HDR = (Header){0, 0, 8, 4, 2, 8, 3, 8}; }
 static void set_dense_config(void) { HDR = (Header){0, 0, 50257, 128, 4, 512, 4, 256}; }
+
+/* ---------------- MoE config (Model-Architecture-Spec, scaled for CPU sanity) ----------------
+   Dense early/late, MoE middle: moe_layer(l) = 0 < l < L-1.
+   Per MoE layer: 1 shared expert (hidden = d_model) + N_EXP routed (top-2).
+   Router: linear D->N_EXP + softmax(biased logits), top-2, renormalize.
+   Locality bias: score += LAMBDA if expert was selected by the previous
+   token at this layer (spec mechanism; LAMBDA=0 = ablation baseline).
+   Aux loss: Switch-style alpha * N * sum_e f_e * P_e per MoE layer. */
+static int MOE = 0;
+static int N_EXP = 8;          /* routed experts per MoE layer (sanity scale) */
+static int EXP_HID = 32;       /* routed expert hidden dim (sanity scale) */
+static float LAMBDA = 0.5f;    /* locality bias strength; 0 = ablation */
+static float AUX_ALPHA = 0.01f;
+static int moe_layer(int l) { return MOE && l > 0 && l < HDR.n_layer - 1; }
+static float frand(void);
+
+typedef struct {
+    float *Wr, *br;      /* router: (L,D,N), (L,N) */
+    float *W1s, *b1s;    /* shared expert: (L,D,D), (L,D) */
+    float *W2s, *b2s;    /* shared expert: (L,D,D), (L,D) */
+    float *W1e, *b1e;    /* routed: (L,N,D,EH), (L,N,EH) */
+    float *W2e, *b2e;    /* routed: (L,N,EH,D), (L,N,D) */
+} MoeW;
+
+static MoeW MW, MG;
+static float *moe_params, *moe_grads;
+static long N_MOE;
+
+static void moe_layout(MoeW *m, float *ptr) {
+    int L = HDR.n_layer, D = HDR.d_model, N = N_EXP, EH = EXP_HID;
+    m->Wr = ptr;  ptr += (long)L * D * N;
+    m->br = ptr;  ptr += (long)L * N;
+    m->W1s = ptr; ptr += (long)L * D * D;
+    m->b1s = ptr; ptr += (long)L * D;
+    m->W2s = ptr; ptr += (long)L * D * D;
+    m->b2s = ptr; ptr += (long)L * D;
+    m->W1e = ptr; ptr += (long)L * N * D * EH;
+    m->b1e = ptr; ptr += (long)L * N * EH;
+    m->W2e = ptr; ptr += (long)L * N * EH * D;
+    m->b2e = ptr;
+}
+
+static long moe_count(void) {
+    int L = HDR.n_layer, D = HDR.d_model, N = N_EXP, EH = EXP_HID;
+    return (long)L * (D * N + N + 2 * (D * D + D) + N * (D * EH + EH + EH * D + D));
+}
+
+static void moe_alloc(void) {
+    if (!MOE) return;
+    N_MOE = moe_count();
+    moe_params = malloc(N_MOE * sizeof(float));
+    moe_grads = calloc(N_MOE, sizeof(float));
+    moe_layout(&MW, moe_params);
+    moe_layout(&MG, moe_grads);
+}
+
+static void moe_init(void) {
+    int L = HDR.n_layer, D = HDR.d_model, N = N_EXP, EH = EXP_HID;
+    if (!MOE) return;
+    for (long i = 0; i < (long)L * D * N; i++) MW.Wr[i] = frand() * 0.02f;
+    for (long i = 0; i < (long)L * D * D; i++) { MW.W1s[i] = frand() * 0.02f; MW.W2s[i] = frand() * 0.02f; }
+    for (long i = 0; i < (long)L * N * D * EH; i++) MW.W1e[i] = frand() * 0.02f;
+    for (long i = 0; i < (long)L * N * EH * D; i++) MW.W2e[i] = frand() * 0.02f;
+    for (long i = 0; i < (long)L * N; i++) MW.br[i] = 0.0f;
+    for (long i = 0; i < (long)L * D; i++) { MW.b1s[i] = 0.0f; MW.b2s[i] = 0.0f; }
+    for (long i = 0; i < (long)L * N * EH; i++) MW.b1e[i] = 0.0f;
+    for (long i = 0; i < (long)L * N * D; i++) MW.b2e[i] = 0.0f;
+}
 
 /* ---------------- params & grads ---------------- */
 
@@ -75,6 +143,17 @@ static void model_init(void) {
 static float *x_in, *xmid, *xn1, *q, *kk, *vv, *ao, *xn2, *hpre, *hact, *xf, *logits, *att, *scratchF, *zeros;
 static float *dx_next, *dx_cur, *dq, *dk, *dv, *dao, *dxn, *dh, *dlog, *rowbuf;
 
+/* MoE activation buffers (per MoE layer l) */
+static float *rprob;     /* (L,T,N) biased softmax router probs */
+static int *topk_id;     /* (L,T,2) selected expert ids */
+static float *topk_w;    /* (L,T,2) renormalized selection weights */
+static float *slot_hpre, *slot_hact; /* (L,T,2,EH) per selected slot */
+static float *slot_out;  /* (L,T,2,D) expert outputs (for dw_k grad) */
+static float *sh_hpre, *sh_hact;     /* (L,T,D) shared expert hidden */
+static float *aux_fe;    /* (L,N) fraction of tokens routed to e (window) */
+static long *util;       /* (L,N) selection counts across the run */
+static int *prev_sel;    /* (L,N) previous-token selection set (locality) */
+
 static inline float *arow(float *base, int l, int t, int dim) {
     return base + ((size_t)l * SEQ_LEN + t) * dim;
 }
@@ -112,6 +191,105 @@ static void buffers_alloc(void) {
     dh = malloc(tf * sizeof(float));
     dlog = malloc(V * sizeof(float));
     rowbuf = malloc(SEQ_LEN * D * sizeof(float));
+
+    if (MOE) {
+        int N = N_EXP, EH = EXP_HID;
+        rprob = malloc((size_t)L * SEQ_LEN * N * sizeof(float));
+        topk_id = malloc((size_t)L * SEQ_LEN * 2 * sizeof(int));
+        topk_w = malloc((size_t)L * SEQ_LEN * 2 * sizeof(float));
+        slot_hpre = malloc((size_t)L * SEQ_LEN * 2 * EH * sizeof(float));
+        slot_hact = malloc((size_t)L * SEQ_LEN * 2 * EH * sizeof(float));
+        slot_out = malloc((size_t)L * SEQ_LEN * 2 * D * sizeof(float));
+        sh_hpre = malloc((size_t)L * SEQ_LEN * D * sizeof(float));
+        sh_hact = malloc((size_t)L * SEQ_LEN * D * sizeof(float));
+        aux_fe = malloc((size_t)L * N * sizeof(float));
+        util = calloc((size_t)L * N, sizeof(long));
+        prev_sel = malloc((size_t)L * N * sizeof(int));
+    }
+}
+
+/* ---------------- MoE forward (per layer, all tokens) ---------------- */
+
+static float aux_loss_total; /* accumulated per forward_loss call */
+
+static void moe_ffn_forward(int l, int T) {
+    const int D = HDR.d_model, N = N_EXP, EH = EXP_HID;
+    float *Wr = MW.Wr + (size_t)l * D * N;
+    float *W1s = MW.W1s + (size_t)l * D * D, *b1s = MW.b1s + (size_t)l * D;
+    float *W2s = MW.W2s + (size_t)l * D * D, *b2s = MW.b2s + (size_t)l * D;
+    float *W1e = MW.W1e + (size_t)l * N * D * EH;
+    float *b1e = MW.b1e + (size_t)l * N * EH;
+    float *W2e = MW.W2e + (size_t)l * N * EH * D;
+    float *b2e = MW.b2e + (size_t)l * N * D;
+    float *fe = aux_fe + (size_t)l * N;
+    int *prev = prev_sel + (size_t)l * N;
+    float rlog[64], p[64];
+    if (N > 64) { fprintf(stderr, "N_EXP>64 unsupported\n"); exit(1); }
+
+    memset(fe, 0, N * sizeof(float));
+    memset(prev, 0, N * sizeof(int)); /* window start: no previous token */
+
+    for (int t = 0; t < T; t++) {
+        const float *xn2_t = arow(xn2, l, t, D);
+        float *rp = rprob + ((size_t)l * SEQ_LEN + t) * N;
+        int *ids = topk_id + ((size_t)l * SEQ_LEN + t) * 2;
+        float *ws = topk_w + ((size_t)l * SEQ_LEN + t) * 2;
+
+        /* router: logits -> + locality bias -> softmax */
+        matmul_xw(rlog, xn2_t, Wr, br, D, N);
+        for (int e = 0; e < N; e++) p[e] = rlog[e] + (prev[e] ? LAMBDA : 0.0f);
+        softmax(p, N);
+        memcpy(rp, p, N * sizeof(float));
+
+        /* top-2 by prob, renormalize */
+        int a = 0, b = 1;
+        if (p[b] > p[a]) { a = 1; b = 0; }
+        for (int e = 2; e < N; e++)
+            if (p[e] > p[a]) { b = a; a = e; }
+            else if (p[e] > p[b]) b = e;
+        float S = p[a] + p[b];
+        ids[0] = a; ids[1] = b;
+        ws[0] = p[a] / S; ws[1] = p[b] / S;
+        fe[a] += 1.0f / (T * 2); fe[b] += 1.0f / (T * 2);
+        util[(size_t)l * N + a]++; util[(size_t)l * N + b]++;
+        memset(prev, 0, N * sizeof(int));
+        prev[a] = 1; prev[b] = 1; /* next token's locality set */
+
+        /* shared expert (always active) */
+        float *shp = sh_hpre + ((size_t)l * SEQ_LEN + t) * D;
+        float *sha = sh_hact + ((size_t)l * SEQ_LEN + t) * D;
+        matmul_xw(shp, xn2_t, W1s, b1s, D, D);
+        for (int e = 0; e < D; e++) sha[e] = gelu(shp[e]);
+        float *out = arow(x_in, l + 1, t, D);
+        matmul_xw(out, sha, W2s, b2s, D, D);
+
+        /* routed experts: dispatch top-2 */
+        for (int s = 0; s < 2; s++) {
+            int e = ids[s];
+            const float *w1 = W1e + (size_t)e * D * EH;
+            const float *b1 = b1e + (size_t)e * EH;
+            const float *w2 = W2e + (size_t)e * EH * D;
+            const float *b2 = b2e + (size_t)e * D;
+            float *hp = slot_hpre + (((size_t)l * SEQ_LEN + t) * 2 + s) * EH;
+            float *ha = slot_hact + (((size_t)l * SEQ_LEN + t) * 2 + s) * EH;
+            float *so = slot_out + (((size_t)l * SEQ_LEN + t) * 2 + s) * D;
+            matmul_xw(hp, xn2_t, w1, b1, D, EH);
+            for (int i = 0; i < EH; i++) ha[i] = gelu(hp[i]);
+            matmul_xw(so, ha, w2, b2, EH, D);
+            for (int d = 0; d < D; d++) out[d] += ws[s] * so[d];
+        }
+        for (int d = 0; d < D; d++) out[d] += arow(xmid, l, t, D)[d];
+    }
+
+    /* aux loss (Switch): alpha * N * sum_e f_e * P_e, P_e = mean prob */
+    float aux = 0.0f;
+    for (int e = 0; e < N; e++) {
+        float P = 0.0f;
+        for (int t = 0; t < T; t++) P += rprob[((size_t)l * SEQ_LEN + t) * N + e];
+        P /= T;
+        aux += fe[e] * P;
+    }
+    aux_loss_total += AUX_ALPHA * N * aux;
 }
 
 /* ---------------- forward (stores activations) ---------------- */
@@ -120,6 +298,7 @@ static float forward_loss(const int *tokens, const int *targets, int T) {
     const int D = HDR.d_model, H = HDR.n_heads, L = HDR.n_layer;
     const long F = HDR.d_ff, V = HDR.vocab;
     const int HD = D / H;
+    aux_loss_total = 0.0f;
 
     for (int t = 0; t < T; t++)
         for (int e = 0; e < D; e++)
@@ -167,13 +346,21 @@ static float forward_loss(const int *tokens, const int *targets, int T) {
             matmul_xw(scratchF, arow(ao, l, t, D), Wo, bo, D, D);
             for (int e = 0; e < D; e++)
                 arow(xmid, l, t, D)[e] = arow(x_in, l, t, D)[e] + scratchF[e];
-            layernorm(arow(xn2, l, t, D), arow(xmid, l, t, D), ln2_g, ln2_b, D);
-            matmul_xw(arow(hpre, l, t, F), arow(xn2, l, t, D), W1, b1, D, F);
-            for (int e = 0; e < F; e++)
-                arow(hact, l, t, F)[e] = gelu(arow(hpre, l, t, F)[e]);
-            matmul_xw(scratchF, arow(hact, l, t, F), W2, b2, F, D);
-            for (int e = 0; e < D; e++)
-                arow(x_in, l + 1, t, D)[e] = arow(xmid, l, t, D)[e] + scratchF[e];
+        }
+        if (moe_layer(l)) {
+            for (int t = 0; t < T; t++)
+                layernorm(arow(xn2, l, t, D), arow(xmid, l, t, D), ln2_g, ln2_b, D);
+            moe_ffn_forward(l, T);
+        } else {
+            for (int t = 0; t < T; t++) {
+                layernorm(arow(xn2, l, t, D), arow(xmid, l, t, D), ln2_g, ln2_b, D);
+                matmul_xw(arow(hpre, l, t, F), arow(xn2, l, t, D), W1, b1, D, F);
+                for (int e = 0; e < F; e++)
+                    arow(hact, l, t, F)[e] = gelu(arow(hpre, l, t, F)[e]);
+                matmul_xw(scratchF, arow(hact, l, t, F), W2, b2, F, D);
+                for (int e = 0; e < D; e++)
+                    arow(x_in, l + 1, t, D)[e] = arow(xmid, l, t, D)[e] + scratchF[e];
+            }
         }
     }
 
@@ -185,7 +372,7 @@ static float forward_loss(const int *tokens, const int *targets, int T) {
         float p = logits[(size_t)t * V + targets[t]];
         loss += -logf(p > 1e-30f ? p : 1e-30f);
     }
-    return loss / T;
+    return loss / T + aux_loss_total;
 }
 
 /* ---------------- backward helpers ---------------- */
@@ -225,6 +412,132 @@ static void softmax_bwd(float *ds, const float *dout, const float *s, int n) {
     float dot = 0.0f;
     for (int j = 0; j < n; j++) dot += dout[j] * s[j];
     for (int j = 0; j < n; j++) ds[j] = s[j] * (dout[j] - dot);
+}
+
+/* ---------------- MoE backward (per layer, all tokens) ----------------
+   Fills dxmid (= grad on xmid rows) from dx_next; accumulates all MoE grads. */
+static void moe_ffn_backward(int l, int T, float *dxmid, float *dx_next_g) {
+    const int D = HDR.d_model, N = N_EXP, EH = EXP_HID;
+    const float *ln2_g = W.ln2_g + l * D;
+    float *gln2_g = G.ln2_g + l * D, *gln2_b = G.ln2_b + l * D;
+    float *Wr = MW.Wr + (size_t)l * D * N;
+    float *W1s = MW.W1s + (size_t)l * D * D;
+    float *W2s = MW.W2s + (size_t)l * D * D;
+    const float *W1e = MW.W1e + (size_t)l * N * D * EH;
+    const float *W2e = MW.W2e + (size_t)l * N * EH * D;
+    float *gWr = MG.Wr + (size_t)l * D * N, *gbr = MG.br + (size_t)l * N;
+    float *gW1s = MG.W1s + (size_t)l * D * D, *gb1s = MG.b1s + (size_t)l * D;
+    float *gW2s = MG.W2s + (size_t)l * D * D, *gb2s = MG.b2s + (size_t)l * D;
+    float *gW1e = MG.W1e + (size_t)l * N * D * EH, *gb1e = MG.b1e + (size_t)l * N * EH;
+    float *gW2e = MG.W2e + (size_t)l * N * EH * D, *gb2e = MG.b2e + (size_t)l * N * D;
+    const float *fe = aux_fe + (size_t)l * N;
+    float dprobs[64], drlog[64];
+
+    for (int t = 0; t < T; t++) {
+        const float *dout = trow(dx_next_g, t, D);
+        const float *xn2_t = arow(xn2, l, t, D);
+        const float *rp = rprob + ((size_t)l * SEQ_LEN + t) * N;
+        const int *ids = topk_id + ((size_t)l * SEQ_LEN + t) * 2;
+        const float *ws = topk_w + ((size_t)l * SEQ_LEN + t) * 2;
+        float *dxn_t = trow(dxn, t, D);
+        memset(dxn_t, 0, D * sizeof(float));
+
+        /* ---- router path ----
+           grad on selection weights: gw_s = dout . slot_out[s] ;
+           through renormalize w = p/S and aux loss -> dprobs -> softmax_bwd */
+        int a = ids[0], b = ids[1];
+        const float *so0 = slot_out + (((size_t)l * SEQ_LEN + t) * 2 + 0) * D;
+        const float *so1 = slot_out + (((size_t)l * SEQ_LEN + t) * 2 + 1) * D;
+        float gw0 = 0.0f, gw1 = 0.0f;
+        for (int d = 0; d < D; d++) { gw0 += dout[d] * so0[d]; gw1 += dout[d] * so1[d]; }
+        float S = rp[a] + rp[b];
+        memset(dprobs, 0, N * sizeof(float));
+        dprobs[a] = (gw0 - gw1) * rp[b] / (S * S);
+        dprobs[b] = (gw1 - gw0) * rp[a] / (S * S);
+        for (int e = 0; e < N; e++) dprobs[e] += AUX_ALPHA * N * fe[e] / T;
+        softmax_bwd(drlog, dprobs, rp, N);
+        /* dWr += xn2 outer drlog ; dbr += drlog ; dxn2 += drlog @ Wr^T */
+        for (int d = 0; d < D; d++) {
+            float xv = xn2_t[d];
+            float *gw = gWr + (size_t)d * N;
+            for (int e = 0; e < N; e++) {
+                gw[e] += xv * drlog[e];
+                dxn_t[d] += Wr[(size_t)d * N + e] * drlog[e];
+            }
+        }
+        for (int e = 0; e < N; e++) gbr[e] += drlog[e];
+
+        /* ---- routed experts backward (per slot) ---- */
+        for (int s = 0; s < 2; s++) {
+            int e = ids[s];
+            const float *hp = slot_hpre + (((size_t)l * SEQ_LEN + t) * 2 + s) * EH;
+            const float *w1 = W1e + (size_t)e * D * EH;
+            const float *w2 = W2e + (size_t)e * EH * D;
+            float *gw1 = gW1e + (size_t)e * D * EH, *gb1 = gb1e + (size_t)e * EH;
+            float *gw2 = gW2e + (size_t)e * EH * D, *gb2 = gb2e + (size_t)e * D;
+            /* dout_e = ws[s] * dout */
+            for (int i = 0; i < EH; i++) {
+                float acc = 0.0f;
+                for (int d = 0; d < D; d++) acc += w2[(size_t)i * D + d] * (ws[s] * dout[d]);
+                dh[t * EXP_HID + i] = acc * gelu_grad(hp[i]); /* dhpre */
+            }
+            for (int i = 0; i < EH; i++) {
+                float ha = slot_hact[(((size_t)l * SEQ_LEN + t) * 2 + s) * EH + i];
+                if (ha != 0.0f) {
+                    float *gw = gw2 + (size_t)i * D;
+                    for (int d = 0; d < D; d++) gw[d] += ha * ws[s] * dout[d];
+                }
+                gb1[i] += dh[t * EXP_HID + i];
+            }
+            for (int d = 0; d < D; d++) {
+                float xv = xn2_t[d];
+                float *gw = gw1 + (size_t)d * EH;
+                float acc = 0.0f;
+                for (int i = 0; i < EH; i++) {
+                    gw[i] += xv * dh[t * EXP_HID + i];
+                    acc += w1[(size_t)d * EH + i] * dh[t * EXP_HID + i];
+                }
+                dxn_t[d] += acc;
+                gb2[d] += ws[s] * dout[d];
+            }
+        }
+
+        /* ---- shared expert backward (full dout) ---- */
+        const float *shp = sh_hpre + ((size_t)l * SEQ_LEN + t) * D;
+        const float *sha = sh_hact + ((size_t)l * SEQ_LEN + t) * D;
+        /* dh_s reuses rowbuf's slot for this t — consumed before the
+           layernorm_bwd call below overwrites it */
+        float *dh_s = rowbuf + (size_t)t * D;
+        for (int d = 0; d < D; d++) {
+            float acc = 0.0f;
+            for (int e = 0; e < D; e++) acc += W2s[(size_t)d * D + e] * dout[e];
+            dh_s[d] = acc * gelu_grad(shp[d]);
+        }
+        for (int d = 0; d < D; d++) {
+            if (sha[d] != 0.0f) {
+                float *gw = gW2s + (size_t)d * D;
+                for (int e = 0; e < D; e++) gw[e] += sha[d] * dout[e];
+            }
+            gb1s[d] += dh_s[d];
+        }
+        for (int d1 = 0; d1 < D; d1++) {
+            float xv = xn2_t[d1];
+            float *gw = gW1s + (size_t)d1 * D;
+            float acc = 0.0f;
+            for (int d2 = 0; d2 < D; d2++) {
+                gw[d2] += xv * dh_s[d2];
+                acc += W1s[(size_t)d1 * D + d2] * dh_s[d2];
+            }
+            dxn_t[d1] += acc;
+            gb2s[d1] += dout[d1];
+        }
+
+        /* d(xmid) = dout + ln2_bwd(dxn2) */
+        layernorm_bwd(rowbuf + (size_t)t * D, dxn_t, arow(xmid, l, t, D),
+                      ln2_g, gln2_g, gln2_b, D);
+        for (int e = 0; e < D; e++)
+            trow(dxmid, t, D)[e] = dout[e] + rowbuf[(size_t)t * D + e];
+    }
 }
 
 /* ---------------- backward (per-layer, all positions) ---------------- */
@@ -271,9 +584,11 @@ static void backward(const int *tokens, const int *targets, int T) {
         float *gb1 = G.b1 + l * F, *gb2 = G.b2 + l * D;
         float *attl = att + (size_t)l * H * SEQ_LEN * SEQ_LEN;
 
-        /* ===== FFN backward (per position; x_in[l+1] = xmid + proj2) ===== */
+        /* ===== FFN/MoE backward (x_in[l+1] = xmid + ffn_out) ===== */
         float *dxmid = dx_cur; /* alias: we build d(xmid) into dx_cur first */
-        for (int t = 0; t < T; t++) {
+        if (moe_layer(l)) {
+            moe_ffn_backward(l, T, dxmid, dx_next);
+        } else for (int t = 0; t < T; t++) {
             const float *dproj2 = trow(dx_next, t, D);
             const float *hact_t = arow(hact, l, t, F);
             const float *hpre_t = arow(hpre, l, t, F);
@@ -411,39 +726,54 @@ static void backward(const int *tokens, const int *targets, int T) {
 
 /* ---------------- gradient check ---------------- */
 
-static int gradcheck(void) {
+static void check_buffer(float *p, const float *g, long n,
+                         const int *tokens, const int *targets,
+                         double *max_abs, double *max_rel, long *worst, long base) {
+    for (long i = 0; i < n; i++) {
+        float save = p[i];
+        p[i] = save + GRADCHECK_EPS;
+        float lp = forward_loss(tokens, targets, 3);
+        p[i] = save - GRADCHECK_EPS;
+        float lm = forward_loss(tokens, targets, 3);
+        p[i] = save;
+        float num = (lp - lm) / (2.0f * GRADCHECK_EPS);
+        float ana = g[i];
+        double abs_err = fabs((double)ana - num);
+        /* rel err with clamped denominator — near-zero gradients would
+           otherwise blow up the ratio on finite-difference noise alone */
+        double rel_err = abs_err / fmax(fabs((double)ana) + fabs((double)num), 1e-2);
+        if (abs_err > *max_abs) { *max_abs = abs_err; *worst = base + i; }
+        if (rel_err > *max_rel) *max_rel = rel_err;
+    }
+}
+
+static int gradcheck(int with_moe) {
+    MOE = with_moe;
+    if (MOE) { N_EXP = 4; EXP_HID = 2; }
     set_toy_config();
     model_alloc();
+    moe_alloc();
     buffers_alloc();
     srand(42);
     model_init();
+    moe_init();
 
     int tokens[] = {5, 1, 7};
     int targets[] = {1, 7, 2};
 
     float loss0 = forward_loss(tokens, targets, 3);
     memset(grads, 0, N_PARAMS * sizeof(float));
+    if (MOE) memset(moe_grads, 0, N_MOE * sizeof(float));
     backward(tokens, targets, 3);
 
     double max_abs = 0.0, max_rel = 0.0;
     long worst = -1;
-    for (long i = 0; i < N_PARAMS; i++) {
-        float save = params[i];
-        params[i] = save + GRADCHECK_EPS;
-        float lp = forward_loss(tokens, targets, 3);
-        params[i] = save - GRADCHECK_EPS;
-        float lm = forward_loss(tokens, targets, 3);
-        params[i] = save;
-        float num = (lp - lm) / (2.0f * GRADCHECK_EPS);
-        float ana = grads[i];
-        double abs_err = fabs((double)ana - num);
-        /* rel err with clamped denominator — near-zero gradients would
-           otherwise blow up the ratio on finite-difference noise alone */
-        double rel_err = abs_err / fmax(fabs((double)ana) + fabs((double)num), 1e-2);
-        if (abs_err > max_abs) { max_abs = abs_err; worst = i; }
-        if (rel_err > max_rel) max_rel = rel_err;
-    }
-    printf("gradcheck: loss=%.6f params=%ld\n", loss0, N_PARAMS);
+    check_buffer(params, grads, N_PARAMS, tokens, targets, &max_abs, &max_rel, &worst, 0);
+    if (MOE)
+        check_buffer(moe_params, moe_grads, N_MOE, tokens, targets, &max_abs, &max_rel, &worst, N_PARAMS);
+
+    printf("gradcheck%s: loss=%.6f params=%ld+%ld\n", MOE ? " (MoE)" : "",
+           loss0, N_PARAMS, MOE ? N_MOE : 0);
     printf("  max abs err: %.3e (param %ld) | max rel err: %.3e\n", max_abs, worst, max_rel);
     int pass = max_abs < 5e-3 && max_rel < 5e-2;
     printf("  %s\n", pass ? "PASS — analytic gradients match finite differences"
@@ -495,20 +825,38 @@ static double now_s(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+static float *opt_m2, *opt_v2; /* MoE optimizer state */
+
+static void adamw_update(float *p, float *g, float *m, float *v, long n, int step) {
+    for (long i = 0; i < n; i++) {
+        float gi = g[i];
+        m[i] = 0.9f * m[i] + 0.1f * gi;
+        v[i] = 0.999f * v[i] + 0.001f * gi * gi;
+        float mhat = m[i] / (1.0f - powf(0.9f, step));
+        float vhat = v[i] / (1.0f - powf(0.999f, step));
+        p[i] -= LR * mhat / (sqrtf(vhat) + 1e-8f);
+    }
+}
+
 static int train_run(int steps) {
     set_dense_config();
     model_alloc();
+    moe_alloc();
+    if (MOE) { opt_m2 = calloc(N_MOE, sizeof(float)); opt_v2 = calloc(N_MOE, sizeof(float)); }
     buffers_alloc();
     srand(1337);
     model_init();
+    moe_init();
     data_open("data/tinystories_train.bin");
-    fprintf(stderr, "dense sanity: %ld params, %ld train tokens, %d steps (B=%d T=%d lr=%g)\n",
-            N_PARAMS, train_tokens, steps, BATCH, SEQ_LEN, LR);
+    fprintf(stderr, "%s: %ld+%ld params, %ld train tokens, %d steps (B=%d T=%d lr=%g lambda=%g)\n",
+            MOE ? "moe sanity" : "dense sanity", N_PARAMS, MOE ? N_MOE : 0,
+            train_tokens, steps, BATCH, SEQ_LEN, LR, MOE ? LAMBDA : 0.0f);
 
     int inputs[SEQ_LEN], targets[SEQ_LEN];
     for (int step = 1; step <= steps; step++) {
         double t0 = now_s();
         memset(grads, 0, N_PARAMS * sizeof(float));
+        if (MOE) memset(moe_grads, 0, N_MOE * sizeof(float));
         float loss = 0.0f;
         for (int b = 0; b < BATCH; b++) {
             data_window(inputs, targets, SEQ_LEN);
@@ -517,27 +865,48 @@ static int train_run(int steps) {
         }
         loss /= BATCH;
         for (long i = 0; i < N_PARAMS; i++) grads[i] /= BATCH;
+        if (MOE) for (long i = 0; i < N_MOE; i++) moe_grads[i] /= BATCH;
 
-        /* AdamW */
-        for (long i = 0; i < N_PARAMS; i++) {
-            float g = grads[i];
-            opt_m[i] = 0.9f * opt_m[i] + 0.1f * g;
-            opt_v[i] = 0.999f * opt_v[i] + 0.001f * g * g;
-            float mhat = opt_m[i] / (1.0f - powf(0.9f, step));
-            float vhat = opt_v[i] / (1.0f - powf(0.999f, step));
-            params[i] -= LR * mhat / (sqrtf(vhat) + 1e-8f);
+        adamw_update(params, grads, opt_m, opt_v, N_PARAMS, step);
+        if (MOE) adamw_update(moe_params, moe_grads, opt_m2, opt_v2, N_MOE, step);
+
+        if (step == 1 || step % 20 == 0) {
+            fprintf(stderr, "step %4d | loss %.4f", step, loss);
+            if (MOE) {
+                /* collapse watch: max expert share per MoE layer (spec: >25% sustained = collapse) */
+                for (int l = 0; l < HDR.n_layer; l++) {
+                    if (!moe_layer(l)) continue;
+                    long mx = 0, tot = 0;
+                    for (int e = 0; e < N_EXP; e++) {
+                        if (util[(size_t)l * N_EXP + e] > mx) mx = util[(size_t)l * N_EXP + e];
+                        tot += util[(size_t)l * N_EXP + e];
+                    }
+                    fprintf(stderr, " | L%d maxshare %.2f", l, tot ? (double)mx / tot : 0.0);
+                }
+            }
+            fprintf(stderr, " | %.2fs/step\n", now_s() - t0);
         }
-
-        if (step == 1 || step % 20 == 0)
-            fprintf(stderr, "step %4d | loss %.4f | %.2fs/step\n",
-                    step, loss, now_s() - t0);
     }
     fclose(train_bin);
+    if (MOE) {
+        fprintf(stderr, "MoE checkpoint saving deferred (CPW1 v3 is Phase 7) — run was for the loss-curve milestone\n");
+        return 0;
+    }
     return save_checkpoint("weights/tinystories_dense.bin");
 }
 
 int main(int argc, char **argv) {
-    if (argc > 1 && strcmp(argv[1], "--gradcheck") == 0)
-        return gradcheck();
-    return train_run(argc > 1 ? atoi(argv[1]) : T_STEPS);
+    int steps = T_STEPS, do_gradcheck = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--gradcheck") == 0) do_gradcheck = 1;
+        else if (strcmp(argv[i], "--moe") == 0) MOE = 1;
+        else if (strcmp(argv[i], "--lambda") == 0 && i + 1 < argc) LAMBDA = atof(argv[++i]);
+        else steps = atoi(argv[i]);
+    }
+    if (do_gradcheck) {
+        int rc = gradcheck(0);   /* dense gate must pass first */
+        if (rc) return rc;
+        return gradcheck(1);     /* then the MoE gate */
+    }
+    return train_run(steps);
 }

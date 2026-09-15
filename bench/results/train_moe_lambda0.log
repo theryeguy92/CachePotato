@@ -1,0 +1,3 @@
+moe sanity: 7259008+403488 params, 25538189 train tokens, 300 steps (B=4 T=64 lr=0.001 lambda=0)
+step    1 | loss 10.8635 | L1 maxshare 0.26 | L2 maxshare 0.21 | 3.94s/step
+step   20 | loss 8.1466 | L1 maxshare 0.14 | L2 maxshare 0.14 | 3.62s/step

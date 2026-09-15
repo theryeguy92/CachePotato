@@ -1,0 +1,18 @@
+moe sanity: 7259008+403488 params, 25538189 train tokens, 300 steps (B=4 T=64 lr=0.001 lambda=0.5)
+step    1 | loss 10.8713 | L1 maxshare 0.50 | L2 maxshare 0.43 | 3.51s/step
+step   20 | loss 8.1387 | L1 maxshare 0.15 | L2 maxshare 0.16 | 3.48s/step
+step   40 | loss 6.4080 | L1 maxshare 0.13 | L2 maxshare 0.14 | 3.56s/step
+step   60 | loss 6.7076 | L1 maxshare 0.14 | L2 maxshare 0.13 | 3.48s/step
+step   80 | loss 6.5690 | L1 maxshare 0.14 | L2 maxshare 0.14 | 3.66s/step
+step  100 | loss 6.5849 | L1 maxshare 0.13 | L2 maxshare 0.13 | 3.31s/step
+step  120 | loss 6.3157 | L1 maxshare 0.13 | L2 maxshare 0.13 | 4.07s/step
+step  140 | loss 5.8289 | L1 maxshare 0.13 | L2 maxshare 0.13 | 3.44s/step
+step  160 | loss 5.9008 | L1 maxshare 0.14 | L2 maxshare 0.13 | 3.44s/step
+step  180 | loss 6.1307 | L1 maxshare 0.14 | L2 maxshare 0.13 | 3.30s/step
+step  200 | loss 5.7205 | L1 maxshare 0.14 | L2 maxshare 0.13 | 3.36s/step
+step  220 | loss 6.4015 | L1 maxshare 0.15 | L2 maxshare 0.13 | 3.72s/step
+step  240 | loss 5.5733 | L1 maxshare 0.15 | L2 maxshare 0.13 | 3.68s/step
+step  260 | loss 5.2486 | L1 maxshare 0.15 | L2 maxshare 0.13 | 3.53s/step
+step  280 | loss 5.8306 | L1 maxshare 0.15 | L2 maxshare 0.13 | 3.64s/step
+step  300 | loss 5.9037 | L1 maxshare 0.15 | L2 maxshare 0.13 | 3.38s/step
+MoE checkpoint saving deferred (CPW1 v3 is Phase 7) — run was for the loss-curve milestone
