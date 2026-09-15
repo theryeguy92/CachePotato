@@ -214,7 +214,7 @@ static float aux_loss_total; /* accumulated per forward_loss call */
 
 static void moe_ffn_forward(int l, int T) {
     const int D = HDR.d_model, N = N_EXP, EH = EXP_HID;
-    float *Wr = MW.Wr + (size_t)l * D * N;
+    float *Wr = MW.Wr + (size_t)l * D * N, *br = MW.br + (size_t)l * N;
     float *W1s = MW.W1s + (size_t)l * D * D, *b1s = MW.b1s + (size_t)l * D;
     float *W2s = MW.W2s + (size_t)l * D * D, *b2s = MW.b2s + (size_t)l * D;
     float *W1e = MW.W1e + (size_t)l * N * D * EH;
@@ -895,11 +895,49 @@ static int train_run(int steps) {
     return save_checkpoint("weights/tinystories_dense.bin");
 }
 
+/* --export-moe <path>: dump the sanity-scale MoE model (fixed seed) + a
+   fixed-window forward's logits, for the PyTorch bridge test (G1).
+   Layout: 9 ints {vocab,d_model,n_heads,d_ff,n_layer,n_ctx,N_EXP,EXP_HID,T}
+   then longs {n_params,n_moe}, float loss, params, moe_params, logits (T*V). */
+static int export_moe(const char *path) {
+    MOE = 1; N_EXP = 8; EXP_HID = 32; LAMBDA = 0.5f;
+    set_dense_config();
+    model_alloc();
+    moe_alloc();
+    buffers_alloc();
+    srand(99);
+    model_init();
+    moe_init();
+
+    int tokens[] = {464, 3139, 286, 4881, 318};
+    int targets[] = {3139, 286, 4881, 318, 262};
+    int T = 5;
+    float loss = forward_loss(tokens, targets, T);
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror("export"); return 1; }
+    int hd[9] = {HDR.vocab, HDR.d_model, HDR.n_heads, HDR.d_ff,
+                 HDR.n_layer, HDR.n_ctx, N_EXP, EXP_HID, T};
+    long ld[2] = {N_PARAMS, N_MOE};
+    fwrite(hd, sizeof(int), 9, f);
+    fwrite(ld, sizeof(long), 2, f);
+    fwrite(&loss, sizeof(float), 1, f);
+    fwrite(params, sizeof(float), N_PARAMS, f);
+    fwrite(moe_params, sizeof(float), N_MOE, f);
+    fwrite(logits, sizeof(float), (size_t)T * HDR.vocab, f);
+    fclose(f);
+    fprintf(stderr, "exported %s: loss=%.6f params=%ld+%ld T=%d\n",
+            path, loss, N_PARAMS, N_MOE, T);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int steps = T_STEPS, do_gradcheck = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--gradcheck") == 0) do_gradcheck = 1;
         else if (strcmp(argv[i], "--moe") == 0) MOE = 1;
+        else if (strcmp(argv[i], "--export-moe") == 0 && i + 1 < argc)
+            return export_moe(argv[++i]);
         else if (strcmp(argv[i], "--lambda") == 0 && i + 1 < argc) LAMBDA = atof(argv[++i]);
         else steps = atoi(argv[i]);
     }
