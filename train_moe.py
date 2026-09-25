@@ -27,6 +27,13 @@ import torch.nn.functional as F
 EOS = 50256
 EPS = 1e-5
 
+# Optional instrumentation hook (added 2026-09-25, AFTER the Phase 6 scale run).
+# When an external driver sets this to a dict, moe_ffn records the top-k expert
+# indices it selected at each position. Strictly opt-in: while it is None the
+# selection loop below is the training path unchanged. The scale run itself used
+# train_moe.py md5 b9e3c31ff8f58aa74d64575506b3f60a (no hook).
+TRACE = None
+
 
 def gelu_tanh(x):
     return F.gelu(x, approximate="tanh")
@@ -142,6 +149,8 @@ class MoEModel(torch.nn.Module):
                 probs_all[:, t] = p
                 v2, i2 = p.topk(K, dim=-1)
                 sel_idx[:, t] = i2
+                if TRACE is not None:
+                    TRACE.setdefault(l, []).append(i2.detach().to("cpu", torch.int16))
                 sel_w[:, t] = v2 / v2.sum(dim=-1, keepdim=True)
                 onehot = torch.zeros_like(prev)
                 onehot.scatter_(1, i2, 1.0)
