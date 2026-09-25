@@ -36,6 +36,15 @@ static void set_dense_config(void) { HDR = (Header){0, 0, 50257, 128, 4, 512, 4,
 
 /* ---------------- MoE config (Model-Architecture-Spec, scaled for CPU sanity) ----------------
    Dense early/late, MoE middle: moe_layer(l) = 0 < l < L-1.
+   NOTE (2026-09-25): this is the AS-BUILT layout -- MoE on layers 1..L-2, dense
+   on 0 and L-1 -- which does NOT match Model-Architecture-Spec, which asks for
+   MoE on 2..L-2 with dense on 0-1 and L-1. Both trainers share the deviation,
+   which is exactly why the G1 bridge and G2 smoke gates passed and nothing
+   caught it: they test implementation-vs-implementation, not spec conformance.
+   train_moe.py now carries moe_from (default 1 = as-built, 2 = spec) and
+   tools/check_spec_conformance.py checks against the spec. If you change the
+   layout here, change it there too, or the bridge compares nothing meaningful.
+   See vault Decision-Log 2026-09-25.
    Per MoE layer: 1 shared expert (hidden = d_model) + N_EXP routed (top-2).
    Router: linear D->N_EXP + softmax(biased logits), top-2, renormalize.
    Locality bias: score += LAMBDA if expert was selected by the previous

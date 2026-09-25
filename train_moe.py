@@ -43,23 +43,39 @@ def gelu_tanh(x):
 
 class Config:
     def __init__(self, vocab, d_model, n_heads, d_ff, n_layer, n_ctx,
-                 n_exp, exp_hid, lam, aux_alpha=0.01, topk=2):
+                 n_exp, exp_hid, lam, aux_alpha=0.01, topk=2, moe_from=1):
         self.vocab, self.d_model, self.n_heads = vocab, d_model, n_heads
         self.d_ff, self.n_layer, self.n_ctx = d_ff, n_layer, n_ctx
         self.n_exp, self.exp_hid, self.topk = n_exp, exp_hid, topk
         self.lam, self.aux_alpha = lam, aux_alpha
+        # First layer whose FFN is sparse; MoE on moe_from .. n_layer-2.
+        #   1 = AS BUILT by the Phase 6 scale run (MoE on 1..10, dense on 0 and 11)
+        #   2 = what Model-Architecture-Spec asks for (MoE on 2..10, dense 0-1,11)
+        # The default MUST stay 1: the existing checkpoints were trained with 1,
+        # and layer 1's dense FFN weights are at random init (never trained), so
+        # loading them under moe_from=2 would silently emit garbage.
+        # See Decision-Log 2026-09-25. Set 2 only for a fresh training run.
+        self.moe_from = moe_from
 
     @staticmethod
-    def sanity(lam=0.5):
-        return Config(50257, 128, 4, 512, 4, 256, 8, 32, lam)
+    def sanity(lam=0.5, moe_from=1):
+        return Config(50257, 128, 4, 512, 4, 256, 8, 32, lam, moe_from=moe_from)
 
     @staticmethod
-    def spec(lam=0.5):
-        return Config(50257, 768, 12, 3072, 12, 1024, 32, 192, lam)
+    def spec(lam=0.5, moe_from=1):
+        return Config(50257, 768, 12, 3072, 12, 1024, 32, 192, lam,
+                      moe_from=moe_from)
+
+    def moe_layers(self):
+        return [l for l in range(self.n_layer)
+                if self.moe_from <= l < self.n_layer - 1]
+
+    def dense_layers(self):
+        return [l for l in range(self.n_layer) if l not in self.moe_layers()]
 
 
 class MoEModel(torch.nn.Module):
-    """All weights in C layout (in, out). MoE layers: 0 < l < n_layer-1."""
+    """All weights in C layout (in, out). MoE layers: moe_from <= l < n_layer-1."""
 
     def __init__(self, cfg):
         super().__init__()
@@ -96,7 +112,7 @@ class MoEModel(torch.nn.Module):
                 getattr(self, n).zero_()
 
     def moe_layer(self, l):
-        return 0 < l < self.cfg.n_layer - 1
+        return self.cfg.moe_from <= l < self.cfg.n_layer - 1
 
     def ln(self, x, g, b):
         return F.layer_norm(x, (x.shape[-1],), g, b, EPS)
@@ -307,6 +323,7 @@ def run_train(args, cfg):
     stream = TokenStream(args.data, args.T, args.seed)
     print(f"stream hash: {stream.stream_hash()}  (must match across lambda variants)",
           flush=True)
+    print(f"layout: MoE {cfg.moe_layers()}  dense {cfg.dense_layers()}", flush=True)
     val_ids = np.memmap(args.val, dtype=np.uint16, mode="r") if args.val else None
 
     decay, no_decay = [], []
@@ -422,6 +439,8 @@ def main():
     ap.add_argument("--ckpt-dir", default="ckpt")
     ap.add_argument("--resume", default="")
     ap.add_argument("--spec", action="store_true", help="use the spec (12L/768d/32exp) config")
+    ap.add_argument("--moe-from", type=int, default=1,
+                    help="first sparse-FFN layer (1=as-built Phase 6, 2=spec)")
     ap.add_argument("--lambda", dest="lam", type=float, default=0.5)
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--B", type=int, default=4)
@@ -436,7 +455,8 @@ def main():
 
     if args.mode == "bridge":
         return bridge(args)
-    cfg = Config.spec(args.lam) if args.spec else Config.sanity(args.lam)
+    cfg = (Config.spec(args.lam, args.moe_from) if args.spec
+           else Config.sanity(args.lam, args.moe_from))
     return run_train(args, cfg)
 
 
