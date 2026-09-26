@@ -119,6 +119,14 @@ void layout_weights_v3(Weights *w, const HeaderV3 *h, float *ptr) {
         w->is_moe = 0;
         return;
     }
+    if (h->topk != 2) {
+        /* the router scan in moe_ffn/moe_ffn_step is written for top-2; refuse
+           loudly rather than silently dispatch the wrong number of experts */
+        fprintf(stderr, "v3 file has topk=%d; the engine implements top-2 only\n",
+                h->topk);
+        w->is_moe = 0;
+        return;
+    }
 
     w->token_emb = ptr;  ptr += v * d;
     w->pos_emb = ptr;    ptr += c * d;

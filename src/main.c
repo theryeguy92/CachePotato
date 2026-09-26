@@ -123,14 +123,6 @@ static int repl(const char *path) {
     Model m;
     if (model_load(&m, path) != 0)
         return 1;
-    if (m.is_v3 && m.w.is_moe) {
-        fprintf(stderr,
-                "this is a CPW1 v3 MoE model, and the incremental (KV-cached) "
-                "path does not implement MoE yet.\n"
-                "Use --moe-sel <tokens.bin> <start> <T> <out.bin> for the routing "
-                "check; sampled MoE generation is the next Phase 7 step.\n");
-        return 1;
-    }
     const char *b = getenv("CP_BUDGET");
     if (b)
         pager_init(&m, atol(b) * 1024L * 1024L);
@@ -162,6 +154,9 @@ static int repl(const char *path) {
         int cold = getenv("CP_COLD") != NULL;
         long io0 = disk_read_kb();
         double t0 = now_s();
+        /* new sequence: clear the locality set (the KV cache needs no clearing,
+           attention only reads j <= pos) */
+        runstate_reset_sequence(&rs, &m);
         for (int i = 0; i < n; i++) {        /* warm the KV cache on the prompt */
             forward_step(&m, &rs, ids[i], i);
             if (cold) model_evict_all(&m);
@@ -247,6 +242,187 @@ static int moe_sel_mode(const char *path, const char *tokbin, long start, int T,
     return 0;
 }
 
+/* --- Gate 1: incremental (KV-cached) vs full-sequence equivalence -----------
+   The two paths use different attention implementations. A gate comparing only
+   final logits would pass while ROUTING diverged — which is exactly how the
+   EOS-reset bug escaped. So this compares the per-token top-k selections too. */
+static int step_check_mode(const char *path, const char *tokbin, long start, int T) {
+    Model m;
+    if (model_load(&m, path) != 0) return 1;
+    if (!m.is_v3 || !m.w.is_moe) {
+        fprintf(stderr, "%s is not a CPW1 v3 MoE file\n", path);
+        return 1;
+    }
+    const int V = m.hdr.vocab, nm = m.w.n_moe, K = m.w.topk;
+
+    FILE *f = fopen(tokbin, "rb");
+    if (!f) { perror("tokens"); return 1; }
+    if (fseek(f, start * 2L, SEEK_SET) != 0) { perror("seek"); return 1; }
+    uint16_t *raw = malloc((size_t)T * sizeof(uint16_t));
+    int *toks = malloc((size_t)T * sizeof(int));
+    if (fread(raw, sizeof(uint16_t), (size_t)T, f) != (size_t)T) {
+        fprintf(stderr, "short read from %s\n", tokbin);
+        return 1;
+    }
+    fclose(f);
+    for (int i = 0; i < T; i++) toks[i] = raw[i];
+
+    size_t nsel = (size_t)nm * T * K;
+    int *selA = malloc(nsel * sizeof(int));
+    int *selB = calloc(nsel, sizeof(int));
+    float *logA = malloc((size_t)T * V * sizeof(float));
+    float *logB = malloc((size_t)T * V * sizeof(float));
+    if (!raw || !toks || !selA || !selB || !logA || !logB) {
+        fprintf(stderr, "oom\n"); return 1;
+    }
+
+    forward_moe(&m, toks, T, logA, selA, m.h3.lam);
+
+    RunState rs;
+    runstate_alloc(&rs, &m);
+    runstate_reset_sequence(&rs, &m);
+    rs.moe_sel_out = selB;
+    rs.moe_sel_stride = T;
+    double t0 = now_s();
+    for (int i = 0; i < T; i++) {
+        forward_step(&m, &rs, toks[i], i);
+        memcpy(logB + (size_t)i * V, rs.logits, (size_t)V * sizeof(float));
+    }
+    double dt = now_s() - t0;
+    rs.moe_sel_out = NULL;
+
+    double dmax = 0.0;
+    for (size_t i = 0; i < (size_t)T * V; i++) {
+        double d = fabs((double)logA[i] - (double)logB[i]);
+        if (d > dmax) dmax = d;
+    }
+    int am = 0;
+    for (int t = 0; t < T; t++) {
+        int a = 0, b = 0;
+        for (int j = 1; j < V; j++) {
+            if (logA[(size_t)t * V + j] > logA[(size_t)t * V + a]) a = j;
+            if (logB[(size_t)t * V + j] > logB[(size_t)t * V + b]) b = j;
+        }
+        if (a != b) am++;
+    }
+    int sm = 0;
+    for (size_t i = 0; i < nsel; i++) if (selA[i] != selB[i]) sm++;
+    if (sm) {
+        int shown = 0;
+        for (size_t i = 0; i < nsel && shown < 6; i++)
+            if (selA[i] != selB[i]) {
+                size_t slot = i / ((size_t)T * K), rem = i % ((size_t)T * K);
+                fprintf(stderr, "  moe slot %zu pos %zu k %zu: full=%d step=%d\n",
+                        slot, rem / K, rem % K, selA[i], selB[i]);
+                shown++;
+            }
+    }
+
+    printf("step-check: T=%d  moe_layers=%d  top-%d  lam=%.3f\n", T, nm, K, m.h3.lam);
+    printf("  logits  : max|delta| = %.3e   argmax mismatches %d/%d\n", dmax, am, T);
+    printf("  routing : %d / %zu selections differ\n", sm, nsel);
+    printf("  speed   : %.1f tok/s (%.1fs for %d tokens, incremental)\n",
+           dt > 0 ? T / dt : 0.0, dt, T);
+    int ok = (sm == 0) && (dmax < 1e-5);
+    printf("GATE 1: %s\n", ok ? "PASS (incremental == full-sequence)" : "FAIL");
+
+    runstate_free(&rs, &m);
+    free(raw); free(toks); free(selA); free(selB); free(logA); free(logB);
+    model_free(&m);
+    return ok ? 0 : 1;
+}
+
+/* --- Gate 2: generation equivalence -----------------------------------------
+   A single window cannot catch state-carry bugs: the locality set persists
+   across forward_step calls and every generated token feeds back. So generate
+   greedily with the incremental path and, independently, re-run the
+   full-sequence forward over the growing prefix at each step. Token ids and
+   last-position routing must match at every step, including across an EOS. */
+static int gen_check_mode(const char *path, const char *tokbin, long start,
+                          int prompt_T, int N) {
+    Model m;
+    if (model_load(&m, path) != 0) return 1;
+    if (!m.is_v3 || !m.w.is_moe) {
+        fprintf(stderr, "%s is not a CPW1 v3 MoE file\n", path);
+        return 1;
+    }
+    const int V = m.hdr.vocab, nm = m.w.n_moe, K = m.w.topk;
+    const int Lmax = prompt_T + N;
+
+    int *seq = malloc((size_t)Lmax * sizeof(int));
+    uint16_t *raw = malloc((size_t)prompt_T * sizeof(uint16_t));
+    FILE *f = fopen(tokbin, "rb");
+    if (!f) { perror("tokens"); return 1; }
+    if (fseek(f, start * 2L, SEEK_SET) != 0) { perror("seek"); return 1; }
+    if (fread(raw, sizeof(uint16_t), (size_t)prompt_T, f) != (size_t)prompt_T) {
+        fprintf(stderr, "short read\n"); return 1;
+    }
+    fclose(f);
+    for (int i = 0; i < prompt_T; i++) seq[i] = raw[i];
+
+    /* ---- path A: incremental */
+    int *selA = calloc((size_t)nm * Lmax * K, sizeof(int));
+    int *idsA = malloc((size_t)N * sizeof(int));
+    RunState rs;
+    runstate_alloc(&rs, &m);
+    runstate_reset_sequence(&rs, &m);
+    rs.moe_sel_out = selA;
+    rs.moe_sel_stride = Lmax;
+    for (int i = 0; i < prompt_T; i++) forward_step(&m, &rs, seq[i], i);
+    double t0 = now_s();
+    for (int i = 0; i < N; i++) {
+        int best = 0;
+        for (int j = 1; j < V; j++) if (rs.logits[j] > rs.logits[best]) best = j;
+        idsA[i] = best;
+        seq[prompt_T + i] = best;
+        forward_step(&m, &rs, best, prompt_T + i);
+    }
+    double dt_gen = now_s() - t0;
+    rs.moe_sel_out = NULL;
+
+    /* ---- path B: full sequence re-run over the growing prefix */
+    int *selB = malloc((size_t)nm * Lmax * K * sizeof(int));
+    float *logits = malloc((size_t)Lmax * V * sizeof(float));
+    int id_mm = 0, sel_mm = 0, first_bad = -1;
+    for (int i = 0; i < N; i++) {
+        int P = prompt_T + i;
+        forward_moe(&m, seq, P, logits, selB, m.h3.lam);
+        const float *row = logits + (size_t)(P - 1) * V;
+        int best = 0;
+        for (int j = 1; j < V; j++) if (row[j] > row[best]) best = j;
+        if (best != idsA[i]) { id_mm++; if (first_bad < 0) first_bad = i; }
+        for (int slot = 0; slot < nm; slot++)
+            for (int k = 0; k < K; k++)
+                if (selA[((size_t)slot * Lmax + (P - 1)) * K + k]
+                        != selB[((size_t)slot * P + (P - 1)) * K + k])
+                    sel_mm++;
+    }
+
+    int eos_seen = 0;
+    for (int i = 0; i < N; i++) if (idsA[i] == EOS_TOKEN) eos_seen++;
+    int eos_prompt = 0;
+    for (int i = 0; i < prompt_T; i++) if (seq[i] == EOS_TOKEN) eos_prompt++;
+
+    printf("gen-check: prompt %d tokens, %d generated greedily, lam=%.3f\n",
+           prompt_T, N, m.h3.lam);
+    printf("  generated ids    : %d / %d differ from full-sequence%s\n",
+           id_mm, N, id_mm ? "   <-- DIVERGENCE" : "");
+    printf("  last-pos routing : %d / %d selections differ\n", sel_mm, nm * N * K);
+    printf("  EOS              : %d in prompt, %d generated%s\n",
+           eos_prompt, eos_seen,
+           eos_prompt ? "  (reset covered here + by Gate 1)"
+                      : "  (no reset exercised)");
+    printf("  speed            : %.1f tok/s incremental\n",
+           dt_gen > 0 ? N / dt_gen : 0.0);
+    int ok = (id_mm == 0 && sel_mm == 0);
+    printf("GATE 2: %s\n", ok ? "PASS (generation matches step for step)" : "FAIL");
+
+    runstate_free(&rs, &m);
+    free(raw); free(seq); free(selA); free(idsA); free(selB); free(logits);
+    model_free(&m);
+    return ok ? 0 : 1;
+}
+
 /* usage:
    cachepotato [weights.bin] tok0 tok1 ...   forward on raw token ids
    cachepotato [weights.bin] -p "prompt"     encode -> forward -> next token
@@ -266,6 +442,14 @@ int main(int argc, char **argv) {
     const char *ms_bin = NULL, *ms_out = NULL;
     long ms_start = 0;
     int ms_T = 0;
+    int step_check = 0;
+    const char *sc_bin = NULL;
+    long sc_start = 0;
+    int sc_T = 0;
+    int gen_check = 0;
+    const char *gc_bin = NULL;
+    long gc_start = 0;
+    int gc_prompt = 0, gc_N = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc)
@@ -278,6 +462,19 @@ int main(int argc, char **argv) {
             rng_seed(strtoull(argv[++i], NULL, 10));
         else if (strcmp(argv[i], "--greedy") == 0)
             g_temp = 0.0;
+        else if (strcmp(argv[i], "--gen-check") == 0 && i + 4 < argc) {
+            gc_bin = argv[++i];
+            gc_start = atol(argv[++i]);
+            gc_prompt = atoi(argv[++i]);
+            gc_N = atoi(argv[++i]);
+            gen_check = 1;
+        }
+        else if (strcmp(argv[i], "--step-check") == 0 && i + 3 < argc) {
+            sc_bin = argv[++i];
+            sc_start = atol(argv[++i]);
+            sc_T = atoi(argv[++i]);
+            step_check = 1;
+        }
         else if (strcmp(argv[i], "--moe-sel") == 0 && i + 4 < argc) {
             ms_bin = argv[++i];
             ms_start = atol(argv[++i]);
@@ -294,6 +491,12 @@ int main(int argc, char **argv) {
         else if (T < 256)
             tokens[T++] = atoi(argv[i]);
     }
+
+    if (gen_check)
+        return gen_check_mode(path, gc_bin, gc_start, gc_prompt, gc_N);
+
+    if (step_check)
+        return step_check_mode(path, sc_bin, sc_start, sc_T);
 
     if (moe_sel)
         return moe_sel_mode(path, ms_bin, ms_start, ms_T, ms_out);

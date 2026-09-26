@@ -198,6 +198,7 @@ void forward(const Model *m, const int *tokens, int T, float *logits_out) {
 
 void runstate_alloc(RunState *s, const Model *m) {
     int D = m->hdr.d_model, F = m->hdr.d_ff, V = m->hdr.vocab;
+    int L = m->hdr.n_layer, N = m->w.n_exp, K = m->w.topk;
     size_t cache = (size_t)m->hdr.n_layer * m->hdr.n_ctx * D;
     s->x = malloc(D * sizeof(float));
     s->xn = malloc(D * sizeof(float));
@@ -209,6 +210,15 @@ void runstate_alloc(RunState *s, const Model *m) {
     s->logits = malloc(V * sizeof(float));
     s->key_cache = calloc(cache, sizeof(float));
     s->value_cache = calloc(cache, sizeof(float));
+    /* MoE state (NULL/0 for dense v2 files) */
+    s->moe_prev = (L > 0 && N > 0) ? calloc((size_t)L * N, sizeof(int)) : NULL;
+    s->moe_p = N > 0 ? malloc((size_t)N * sizeof(float)) : NULL;
+    s->moe_idx = K > 0 ? malloc((size_t)K * sizeof(int)) : NULL;
+    s->moe_wt = K > 0 ? malloc((size_t)K * sizeof(float)) : NULL;
+    /* MUST be initialised: forward_step dereferences this if non-NULL. Gates 1
+       and 2 set it explicitly, so neither could catch it — the REPL did. */
+    s->moe_sel_out = NULL;
+    s->moe_sel_stride = 0;
 }
 
 void runstate_free(RunState *s, const Model *m) {
@@ -216,6 +226,72 @@ void runstate_free(RunState *s, const Model *m) {
     free(s->x); free(s->xn); free(s->q); free(s->ao); free(s->att);
     free(s->h); free(s->proj); free(s->logits);
     free(s->key_cache); free(s->value_cache);
+    free(s->moe_prev); free(s->moe_p); free(s->moe_idx); free(s->moe_wt);
+}
+
+void runstate_reset_sequence(RunState *s, const Model *m) {
+    if (s->moe_prev && m->w.n_exp > 0)
+        memset(s->moe_prev, 0, (size_t)m->hdr.n_layer * m->w.n_exp * sizeof(int));
+}
+
+/* Single-token MoE FFN for the KV-cached path. Identical maths and the same
+   top-k scan as moe_ffn() — the only difference is that the locality set lives
+   in RunState because it must persist across calls. Cleared at EOS. */
+static void moe_ffn_step(const Model *m, RunState *s, int slot, int layer,
+                         const float *xn, float *x, int token, int pos) {
+    const int D = m->hdr.d_model, N = m->w.n_exp, EH = m->w.exp_hid, K = m->w.topk;
+    const Weights *w = &m->w;
+    const float *Wr = w->Wr + (size_t)slot * D * N;
+    const float *br = w->br + (size_t)slot * N;
+    const float *W1s = w->W1s + (size_t)slot * D * D;
+    const float *b1s = w->b1s + (size_t)slot * D;
+    const float *W2s = w->W2s + (size_t)slot * D * D;
+    const float *b2s = w->b2s + (size_t)slot * D;
+    int *prev = s->moe_prev + (size_t)layer * N;
+    float *p = s->moe_p;
+
+    matmul_xw(p, xn, Wr, br, D, N);
+    const float lam = m->h3.lam;
+    for (int e = 0; e < N; e++) p[e] += prev[e] ? lam : 0.0f;
+    softmax(p, N);
+
+    /* same strict-> scan as moe_ffn(): lower id wins ties, slot 0 = larger */
+    int a = 0, b = 1;
+    if (p[b] > p[a]) { a = 1; b = 0; }
+    for (int e = 2; e < N; e++)
+        if (p[e] > p[a]) { b = a; a = e; }
+        else if (p[e] > p[b]) b = e;
+    s->moe_idx[0] = a; s->moe_idx[1] = b;
+    float S = p[a] + p[b];
+    s->moe_wt[0] = p[a] / S; s->moe_wt[1] = p[b] / S;
+
+    /* shared expert */
+    matmul_xw(s->h, xn, W1s, b1s, D, D);
+    for (int e = 0; e < D; e++) s->h[e] = gelu(s->h[e]);
+    matmul_xw(s->proj, s->h, W2s, b2s, D, D);
+    for (int e = 0; e < D; e++) x[e] += s->proj[e];
+
+    /* routed experts */
+    for (int k = 0; k < K; k++) {
+        float *blk = expert_block(w, slot, s->moe_idx[k]);
+        const float *b1e = blk + (size_t)D * EH;
+        const float *W2e = b1e + EH;
+        const float *b2e = W2e + (size_t)EH * D;
+        matmul_xw(s->h, xn, blk, b1e, D, EH);
+        for (int e = 0; e < EH; e++) s->h[e] = gelu(s->h[e]);
+        matmul_xw(s->proj, s->h, W2e, b2e, EH, D);
+        for (int e = 0; e < D; e++) x[e] += s->moe_wt[k] * s->proj[e];
+    }
+
+    /* locality set for the NEXT token; cleared at EOS */
+    memset(prev, 0, N * sizeof(int));
+    if (token != EOS_TOKEN)
+        for (int k = 0; k < K; k++) prev[s->moe_idx[k]] = 1;
+
+    if (s->moe_sel_out)
+        for (int k = 0; k < K; k++)
+            s->moe_sel_out[((size_t)slot * s->moe_sel_stride + pos) * K + k] =
+                s->moe_idx[k];
 }
 
 void forward_step(const Model *m, RunState *s, int token, int pos) {
@@ -236,8 +312,6 @@ void forward_step(const Model *m, RunState *s, int token, int pos) {
         const float *Wv = w->Wv + l * D * D, *bv = w->bv + l * D;
         const float *Wo = w->Wo + l * D * D, *bo = w->bo + l * D;
         const float *ln2_g = w->ln2_g + l * D, *ln2_b = w->ln2_b + l * D;
-        const float *W1 = w->W1 + l * D * F, *b1 = w->b1 + l * F;
-        const float *W2 = w->W2 + l * F * D, *b2 = w->b2 + l * D;
         float *kc = s->key_cache + (size_t)l * C * D;
         float *vc = s->value_cache + (size_t)l * C * D;
 
@@ -276,12 +350,20 @@ void forward_step(const Model *m, RunState *s, int token, int pos) {
 
         instr_touch("ln2", l, pos, 2 * D * sizeof(float));
         layernorm(s->xn, s->x, ln2_g, ln2_b, D);
-        instr_touch("W1", l, pos, (D * F + F) * sizeof(float));
-        instr_touch("W2", l, pos, (F * D + D) * sizeof(float));
-        matmul_xw(s->h, s->xn, W1, b1, D, F);
-        for (int e = 0; e < F; e++) s->h[e] = gelu(s->h[e]);
-        matmul_xw(s->proj, s->h, W2, b2, F, D);
-        for (int e = 0; e < D; e++) s->x[e] += s->proj[e];
+        if (moe_layer_at(m, l)) {
+            moe_ffn_step(m, s, m->w.moe_slot[l], l, s->xn, s->x, token, pos);
+        } else {
+            /* dense slots are compacted in v3 (see forward_moe) */
+            const int ds = m->is_v3 ? m->w.dense_slot[l] : l;
+            const float *W1 = w->W1 + (size_t)ds * D * F, *b1 = w->b1 + (size_t)ds * F;
+            const float *W2 = w->W2 + (size_t)ds * F * D, *b2 = w->b2 + (size_t)ds * D;
+            instr_touch("W1", l, pos, (D * F + F) * sizeof(float));
+            instr_touch("W2", l, pos, (F * D + D) * sizeof(float));
+            matmul_xw(s->h, s->xn, W1, b1, D, F);
+            for (int e = 0; e < F; e++) s->h[e] = gelu(s->h[e]);
+            matmul_xw(s->proj, s->h, W2, b2, F, D);
+            for (int e = 0; e < D; e++) s->x[e] += s->proj[e];
+        }
     }
 
     instr_touch("lnf", -1, pos, 2 * D * sizeof(float));
