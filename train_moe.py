@@ -33,6 +33,9 @@ EPS = 1e-5
 # selection loop below is the training path unchanged. The scale run itself used
 # train_moe.py md5 b9e3c31ff8f58aa74d64575506b3f60a (no hook).
 TRACE = None
+# Optional second hook: records the FULL router softmax per (layer, t) so a probe
+# can measure how confident the router is at all. Also strictly opt-in.
+TRACE_P = None
 
 
 def gelu_tanh(x):
@@ -167,6 +170,8 @@ class MoEModel(torch.nn.Module):
                 sel_idx[:, t] = i2
                 if TRACE is not None:
                     TRACE.setdefault(l, []).append(i2.detach().to("cpu", torch.int16))
+                if TRACE_P is not None:
+                    TRACE_P.setdefault(l, []).append(p.detach().to("cpu"))
                 sel_w[:, t] = v2 / v2.sum(dim=-1, keepdim=True)
                 onehot = torch.zeros_like(prev)
                 onehot.scatter_(1, i2, 1.0)
