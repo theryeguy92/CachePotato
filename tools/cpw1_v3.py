@@ -7,10 +7,13 @@ parameters. The PyTorch trainer allocates dense-FFN weights on all 12 layers
 while only the dense ones use them, so every checkpoint carries ~68.6M dead
 params; those are not written.
 
-Header (56 bytes):
+Header (60 bytes):
     u32 magic 'CPW1' | u32 version=3
     i32 vocab, d_model, n_heads, d_ff, n_layer, n_ctx,
         n_exp, exp_hid, topk, moe_from, n_moe_layers, n_dense_layers
+    f32 lambda                       <- the locality bias is part of the model:
+                                        serving it at a different lambda routes
+                                        differently from what was trained
 
 Payload (float32, this exact order):
     token_emb (v,d) | pos_emb (c,d)
@@ -40,7 +43,8 @@ VERSION = 3
 HDR_INT_FIELDS = ("vocab", "d_model", "n_heads", "d_ff", "n_layer", "n_ctx",
                   "n_exp", "exp_hid", "topk", "moe_from",
                   "n_moe_layers", "n_dense_layers")
-HDR_SIZE = 8 + 4 * len(HDR_INT_FIELDS)
+HDR_INT_BYTES = 4 * len(HDR_INT_FIELDS)
+HDR_SIZE = 8 + HDR_INT_BYTES + 4      # + f32 lambda
 
 _MOE_GROUP = ("Wr", "br", "W1s", "b1s", "W2s", "b2s")
 _DENSE_GROUP = ("W1", "b1", "W2", "b2")
@@ -126,6 +130,7 @@ def write(path, sd, cfg):
     with open(path, "wb") as f:
         f.write(struct.pack("<II", MAGIC, VERSION))
         f.write(struct.pack("<%di" % len(HDR_INT_FIELDS), *header_ints(cfg)))
+        f.write(struct.pack("<f", float(cfg.lam)))
         for name, _shape in payload_layout(cfg):
             f.write(np.ascontiguousarray(arrays[name], dtype="<f4").tobytes())
     return arrays
@@ -143,7 +148,10 @@ def read_header(path):
     if version != VERSION:
         raise ValueError("CPW1 v%d, expected v%d" % (version, VERSION))
     vals = struct.unpack_from("<%di" % len(HDR_INT_FIELDS), raw, 8)
-    return dict(zip(HDR_INT_FIELDS, vals))
+    lam = struct.unpack_from("<f", raw, 8 + HDR_INT_BYTES)[0]
+    hdr = dict(zip(HDR_INT_FIELDS, vals))
+    hdr["lam"] = lam
+    return hdr
 
 
 def read_arrays(path, cfg):
