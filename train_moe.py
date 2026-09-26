@@ -221,16 +221,31 @@ class MoEModel(torch.nn.Module):
 # ---------------------------------------------------------------- bridge (G1)
 
 def load_c_export(path):
+    """Read a CPBRIDG2 export. Magic-checked, so a stale file from the old
+    format fails loudly instead of being silently misparsed."""
     with open(path, "rb") as f:
-        hd = np.fromfile(f, dtype=np.int32, count=9)
-        vocab, d_model, n_heads, d_ff, n_layer, n_ctx, n_exp, exp_hid, T = hd
+        magic = f.read(8)
+        if magic != b"CPBRIDG2":
+            raise SystemExit(
+                f"bad bridge magic {magic!r}: expected b'CPBRIDG2'. "
+                "Regenerate with: build/train --export-moe <path>")
+        hd = np.fromfile(f, dtype=np.int32, count=11)
+        (vocab, d_model, n_heads, d_ff, n_layer, n_ctx,
+         n_exp, exp_hid, T, n_moe_layers, moe_from) = (int(x) for x in hd)
         n_params, n_moe = np.fromfile(f, dtype=np.int64, count=2)
         loss = float(np.fromfile(f, dtype=np.float32, count=1)[0])
+        eos = int(np.fromfile(f, dtype=np.int32, count=1)[0])
+        toks = np.fromfile(f, dtype=np.int32, count=T + 1).astype(np.int64)
         params = np.fromfile(f, dtype=np.float32, count=n_params)
         moe = np.fromfile(f, dtype=np.float32, count=n_moe)
         logits = np.fromfile(f, dtype=np.float32, count=T * vocab).reshape(T, vocab)
-    cfg = Config(vocab, d_model, n_heads, d_ff, n_layer, n_ctx, n_exp, exp_hid, 0.5)
-    return cfg, loss, params, moe, logits, T
+        sel = np.fromfile(f, dtype=np.int32,
+                          count=n_moe_layers * T * 2).reshape(n_moe_layers, T, 2)
+    cfg = Config(vocab, d_model, n_heads, d_ff, n_layer, n_ctx,
+                 n_exp, exp_hid, 0.5, moe_from=moe_from)
+    return dict(cfg=cfg, loss=loss, params=params, moe=moe, logits=logits,
+                tokens=toks, sel=sel, eos=eos, n_moe=n_moe_layers,
+                moe_layers=cfg.moe_layers())
 
 
 def c_layout_slices(cfg):
@@ -252,31 +267,59 @@ def c_layout_slices(cfg):
 
 
 def bridge(args):
-    cfg, ref_loss, params, moe, ref_logits, T = load_c_export(args.export)
+    """G1 gate, extended 2026-09-25: compare ROUTING (per-token top-2 expert
+    selections through the locality bias + EOS reset) as well as the forward
+    pass. The forward check alone passed while both trainers shared a layout
+    divergence from the spec — routing agreement is the stronger statement."""
+    global TRACE
+    ex = load_c_export(args.export)
+    cfg = ex["cfg"]
     model = MoEModel(cfg).eval()
     dense_names, moe_names = c_layout_slices(cfg)
     off = 0
     with torch.no_grad():
         for name, size in dense_names:
-            getattr(model, name).copy_(torch.from_numpy(params[off:off + size].reshape(getattr(model, name).shape)))
+            getattr(model, name).copy_(torch.from_numpy(ex["params"][off:off + size].reshape(getattr(model, name).shape)))
             off += size
         off = 0
         for name, size in moe_names:
-            getattr(model, name).copy_(torch.from_numpy(moe[off:off + size].reshape(getattr(model, name).shape)))
+            getattr(model, name).copy_(torch.from_numpy(ex["moe"][off:off + size].reshape(getattr(model, name).shape)))
             off += size
 
-    tokens = torch.tensor([[464, 3139, 286, 4881, 318]])
-    targets = torch.tensor([[3139, 286, 4881, 318, 262]])
+    toks = torch.from_numpy(ex["tokens"])
+    inputs, targets = toks[:-1].unsqueeze(0), toks[1:].unsqueeze(0)
+    saved, TRACE = TRACE, {}
     with torch.no_grad():
-        logits, loss, _ = model(tokens, targets)
+        logits, loss, _ = model(inputs, targets)
+    trace, TRACE = TRACE, saved
+
     # NOTE: the C export's "logits" are actually softmax PROBABILITIES —
     # forward_loss() softmaxes the buffer in place. Compare probabilities.
-    ref = torch.from_numpy(ref_logits).unsqueeze(0)
+    ref = torch.from_numpy(ex["logits"]).unsqueeze(0)
     dlog = (F.softmax(logits, dim=-1) - ref).abs().max().item()
-    dloss = abs(loss.item() - ref_loss)
-    print(f"bridge: max abs prob diff {dlog:.3e} | loss {loss.item():.6f} vs C {ref_loss:.6f} (diff {dloss:.3e})")
-    ok = dlog < 1e-3 and dloss < 1e-3
-    print("G1 PASS" if ok else "G1 FAIL")
+    dloss = abs(loss.item() - ex["loss"])
+
+    py_sel = np.stack([torch.stack(trace[l]).squeeze(1).numpy()
+                       for l in ex["moe_layers"]])
+    sel_same = bool((py_sel == ex["sel"]).all())
+    n_diff = int((py_sel != ex["sel"]).sum())
+    eos_pos = int(np.nonzero(ex["tokens"] == ex["eos"])[0][0]) \
+        if (ex["tokens"] == ex["eos"]).any() else -1
+
+    print(f"bridge: T={inputs.shape[1]} tokens={len(ex['tokens'])} eos@{eos_pos} "
+          f"moe_layers={ex['moe_layers']} moe_from={cfg.moe_from} "
+          f"lam={cfg.lam}")
+    print(f"  forward : max abs prob diff {dlog:.3e} | loss {loss.item():.6f} "
+          f"vs C {ex['loss']:.6f} (diff {dloss:.3e})")
+    print(f"  routing : {ex['n_moe']} layers x {inputs.shape[1]} positions x "
+          f"{cfg.topk} selections -> "
+          + ("IDENTICAL" if sel_same else f"{n_diff} MISMATCHES"))
+    if not sel_same:
+        for li, ti, ki in np.argwhere(py_sel != ex["sel"])[:8]:
+            print(f"    layer {ex['moe_layers'][li]} pos {ti} slot {ki}: "
+                  f"py={py_sel[li, ti, ki]} c={ex['sel'][li, ti, ki]}")
+    ok = dlog < 1e-3 and dloss < 1e-3 and sel_same
+    print("G1 PASS (forward + routing)" if ok else "G1 FAIL")
     return 0 if ok else 1
 
 

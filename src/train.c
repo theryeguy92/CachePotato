@@ -28,6 +28,7 @@ static long N_PARAMS;
 #define T_STEPS   300
 #define BATCH     4
 #define SEQ_LEN   64
+#define EOS_TOKEN 50256   /* GPT-2 <|endoftext|>; also resets the locality set */
 #define LR        1e-3f
 #define GRADCHECK_EPS 1e-3f
 
@@ -252,7 +253,7 @@ static void buffers_alloc(void) {
 
 static float aux_loss_total; /* accumulated per forward_loss call */
 
-static void moe_ffn_forward(int l, int T) {
+static void moe_ffn_forward(int l, int T, const int *tokens) {
     const int D = HDR.d_model, N = N_EXP, EH = EXP_HID;
     float *Wr = MW.Wr + (size_t)l * D * N, *br = MW.br + (size_t)l * N;
     float *W1s = MW.W1s + (size_t)l * D * D, *b1s = MW.b1s + (size_t)l * D;
@@ -293,7 +294,15 @@ static void moe_ffn_forward(int l, int T) {
         fe[a] += 1.0f / (T * 2); fe[b] += 1.0f / (T * 2);
         util[(size_t)l * N + a]++; util[(size_t)l * N + b]++;
         memset(prev, 0, N * sizeof(int));
-        prev[a] = 1; prev[b] = 1; /* next token's locality set */
+        /* Locality set for the NEXT token. Spec (2026-09-15): it resets at
+           window start AND at every EOS token — cross-document stickiness is
+           meaningless. This check was MISSING until 2026-09-25, so the C
+           trainer carried routing across document boundaries; the extended G1
+           bridge caught it because the old 5-token fixture contained no EOS. */
+        if (tokens[t] != EOS_TOKEN) {
+            prev[a] = 1;
+            prev[b] = 1;
+        }
 
         /* shared expert (always active) */
         float *shp = sh_hpre + ((size_t)l * SEQ_LEN + t) * D;
@@ -390,7 +399,7 @@ static float forward_loss(const int *tokens, const int *targets, int T) {
         if (moe_layer(l)) {
             for (int t = 0; t < T; t++)
                 layernorm(arow(xn2, l, t, D), arow(xmid, l, t, D), ln2_g, ln2_b, D);
-            moe_ffn_forward(l, T);
+            moe_ffn_forward(l, T, tokens);
         } else {
             for (int t = 0; t < T; t++) {
                 layernorm(arow(xn2, l, t, D), arow(xmid, l, t, D), ln2_g, ln2_b, D);
@@ -949,25 +958,47 @@ static int export_moe(const char *path) {
     model_init();
     moe_init();
 
-    int tokens[] = {464, 3139, 286, 4881, 318};
-    int targets[] = {3139, 286, 4881, 318, 262};
-    int T = 5;
-    float loss = forward_loss(tokens, targets, T);
+    /* Bridge fixture (format CPBRIDG2, 2026-09-25). Real corpus text with an
+       EOS at index 8, so the locality reset is actually exercised — the old
+       5-token fixture had no EOS and could not test it. The export carries the
+       tokens, so the Python side cannot drift from what C actually ran. */
+    int toks[] = {262, 2071, 318, 17764, 351, 6868, 18366, 737, 50256, 14906,
+                  314, 25, 1041, 3145, 896, 2422, 3842, 11, 355, 564, 250,
+                  13217, 283, 28914};
+    int ntok = (int)(sizeof(toks) / sizeof(toks[0]));
+    int T = ntok - 1;                      /* next-token setup */
+    int targets[SEQ_LEN];
+    for (int t = 0; t < T; t++) targets[t] = toks[t + 1];
+    float loss = forward_loss(toks, targets, T);
+
+    int n_moe_layers = 0;
+    for (int l = 0; l < HDR.n_layer; l++) if (moe_layer(l)) n_moe_layers++;
 
     FILE *f = fopen(path, "wb");
     if (!f) { perror("export"); return 1; }
-    int hd[9] = {HDR.vocab, HDR.d_model, HDR.n_heads, HDR.d_ff,
-                 HDR.n_layer, HDR.n_ctx, N_EXP, EXP_HID, T};
+    fwrite("CPBRIDG2", 1, 8, f);
+    int hd[11] = {HDR.vocab, HDR.d_model, HDR.n_heads, HDR.d_ff,
+                  HDR.n_layer, HDR.n_ctx, N_EXP, EXP_HID, T,
+                  n_moe_layers, MOE_FROM};
     long ld[2] = {N_PARAMS, N_MOE};
-    fwrite(hd, sizeof(int), 9, f);
+    int eos = 50256;
+    fwrite(hd, sizeof(int), 11, f);
     fwrite(ld, sizeof(long), 2, f);
     fwrite(&loss, sizeof(float), 1, f);
+    fwrite(&eos, sizeof(int), 1, f);
+    fwrite(toks, sizeof(int), ntok, f);
     fwrite(params, sizeof(float), N_PARAMS, f);
     fwrite(moe_params, sizeof(float), N_MOE, f);
     fwrite(logits, sizeof(float), (size_t)T * HDR.vocab, f);
+    for (int l = 0; l < HDR.n_layer; l++) {
+        if (!moe_layer(l)) continue;
+        for (int t = 0; t < T; t++)
+            fwrite(topk_id + ((size_t)l * SEQ_LEN + t) * 2, sizeof(int), 2, f);
+    }
     fclose(f);
-    fprintf(stderr, "exported %s: loss=%.6f params=%ld+%ld T=%d\n",
-            path, loss, N_PARAMS, N_MOE, T);
+    fprintf(stderr, "exported %s: loss=%.6f params=%ld+%ld T=%d tokens=%d "
+                    "moe_layers=%d moe_from=%d (CPBRIDG2)\n",
+            path, loss, N_PARAMS, N_MOE, T, ntok, n_moe_layers, MOE_FROM);
     return 0;
 }
 
