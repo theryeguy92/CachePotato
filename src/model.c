@@ -17,7 +17,7 @@
    EOS: cross-document stickiness is meaningless (spec decision 2026-09-15).
    Mirrors train_moe.py's moe_ffn and the bridge-verified src/train.c: the top-k
    scan below is the same strict-> form, so lower id wins ties. */
-static void moe_ffn(const Model *m, int slot, const float *xn, float *x,
+static void moe_ffn(const Model *m, int slot, int layer, const float *xn, float *x,
                     const int *tokens, int T, float *h, float *proj,
                     int *sel_out, float lambda) {
     const int D = m->hdr.d_model, N = m->w.n_exp, EH = m->w.exp_hid, K = m->w.topk;
@@ -52,6 +52,13 @@ static void moe_ffn(const Model *m, int slot, const float *xn, float *x,
         idx[0] = a; idx[1] = b;
         float S = p[a] + p[b];
         wt[0] = p[a] / S; wt[1] = p[b] / S;
+
+        /* pager: demand-touch these experts, record them, and prefetch the
+           previous W tokens' sets (issued before the expert matmuls so the
+           WILLNEED hint precedes the use) */
+        instr_touch("Wr", layer, t, ((size_t)D * N + N) * sizeof(float));
+        instr_touch("W1s", layer, t, 2 * ((size_t)D * D) * sizeof(float));
+        pager_moe_access(slot, idx, K, t);
 
         /* shared expert */
         matmul_xw(h, xt, W1s, b1s, D, D);
@@ -159,7 +166,7 @@ void forward_moe(const Model *m, const int *tokens, int T, float *logits_out,
             layernorm(xn + t * D, x + t * D, ln2_g, ln2_b, D);
         }
         if (moe_layer_at(m, l)) {
-            moe_ffn(m, m->w.moe_slot[l], xn, x, tokens, T, h, proj, sel_out, lambda);
+            moe_ffn(m, m->w.moe_slot[l], l, xn, x, tokens, T, h, proj, sel_out, lambda);
         } else {
             /* dense slots are compacted in v3 (dead dense FFNs are not in the
                file), so layer -> slot; v2 has one dense FFN per layer */
@@ -264,6 +271,10 @@ static void moe_ffn_step(const Model *m, RunState *s, int slot, int layer,
     s->moe_idx[0] = a; s->moe_idx[1] = b;
     float S = p[a] + p[b];
     s->moe_wt[0] = p[a] / S; s->moe_wt[1] = p[b] / S;
+
+    instr_touch("Wr", layer, pos, ((size_t)D * N + N) * sizeof(float));
+    instr_touch("W1s", layer, pos, 2 * ((size_t)D * D) * sizeof(float));
+    pager_moe_access(slot, s->moe_idx, K, pos);
 
     /* shared expert */
     matmul_xw(s->h, xn, W1s, b1s, D, D);
