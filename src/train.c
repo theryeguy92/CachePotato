@@ -51,11 +51,42 @@ static void set_dense_config(void) { HDR = (Header){0, 0, 50257, 128, 4, 512, 4,
    token at this layer (spec mechanism; LAMBDA=0 = ablation baseline).
    Aux loss: Switch-style alpha * N * sum_e f_e * P_e per MoE layer. */
 static int MOE = 0;
+static int MOE_FROM = 1;       /* first sparse-FFN layer; 1 = as-built, 2 = spec */
 static int N_EXP = 8;          /* routed experts per MoE layer (sanity scale) */
 static int EXP_HID = 32;       /* routed expert hidden dim (sanity scale) */
 static float LAMBDA = 0.5f;    /* locality bias strength; 0 = ablation */
 static float AUX_ALPHA = 0.01f;
-static int moe_layer(int l) { return MOE && l > 0 && l < HDR.n_layer - 1; }
+static int moe_layer(int l) {
+    return MOE && l >= MOE_FROM && l < HDR.n_layer - 1;
+}
+
+/* --- spec-conformance check (2026-09-25) -----------------------------------
+   G1 (bridge) and G2 (smoke) compare the two implementations to EACH OTHER;
+   neither compares either one to Model-Architecture-Spec. That is how the
+   Phase 6 checkpoints ended up with MoE on layers 1..L-2 while the spec asks for
+   2..L-2, with every gate green. This makes the layout explicit and loud.
+   Mirrors tools/check_spec_conformance.py.
+     moe_from 1 = AS-BUILT Phase 6 layout (dense on 0 and L-1)
+     moe_from 2 = spec layout (dense on 0-1 and L-1)
+   Returns 0 if conformant, 1 if divergent. */
+static int check_spec(void) {
+    printf("layout: moe_from=%d  n_layer=%d  (sanity-scale rule check)\n",
+           MOE_FROM, HDR.n_layer);
+    printf("  MoE layers  :");
+    for (int l = 0; l < HDR.n_layer; l++) if (moe_layer(l)) printf(" %d", l);
+    printf("\n  dense layers:");
+    for (int l = 0; l < HDR.n_layer; l++) if (!moe_layer(l)) printf(" %d", l);
+    printf("\n  spec rule   : MoE on 2..L-2, dense on 0-1 and L-1\n");
+    int conformant = (MOE_FROM == 2);
+    printf("\nSPEC CONFORMANCE: %s\n", conformant ? "PASS" : "DIVERGENT");
+    if (!conformant)
+        fprintf(stderr,
+                "  -> moe_from=%d is the AS-BUILT Phase 6 deviation, NOT the spec.\n"
+                "     Use --moe-from 2 for a conformant run. See Decision-Log 2026-09-25.\n",
+                MOE_FROM);
+    return conformant ? 0 : 1;
+}
+
 static float frand(void);
 
 typedef struct {
@@ -941,14 +972,26 @@ static int export_moe(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    int steps = T_STEPS, do_gradcheck = 0;
+    int steps = T_STEPS, do_gradcheck = 0, do_check_spec = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--gradcheck") == 0) do_gradcheck = 1;
         else if (strcmp(argv[i], "--moe") == 0) MOE = 1;
+        else if (strcmp(argv[i], "--moe-from") == 0 && i + 1 < argc)
+            MOE_FROM = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--check-spec") == 0) do_check_spec = 1;
         else if (strcmp(argv[i], "--export-moe") == 0 && i + 1 < argc)
             return export_moe(argv[++i]);
         else if (strcmp(argv[i], "--lambda") == 0 && i + 1 < argc) LAMBDA = atof(argv[++i]);
         else steps = atoi(argv[i]);
+    }
+    if (do_check_spec) {
+        if (!MOE) {
+            fprintf(stderr, "check-spec: pass --moe (the spec's sparse layout is "
+                            "the only conformant configuration)\n");
+            return 1;
+        }
+        set_dense_config();
+        return check_spec();
     }
     if (do_gradcheck) {
         int rc = gradcheck(0);   /* dense gate must pass first */
