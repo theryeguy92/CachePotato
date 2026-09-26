@@ -73,6 +73,34 @@ transition-matrix difference ‖Δ‖_F averages **1.748** (0 would mean inert),
 uniform across depth (1.44–1.91). **λ reshapes the routing distribution, not just
 its marginals.**
 
+## 3b. Prefetch coverage — the number the engine actually gets
+
+Token-level reuse **overstates** what a prefetcher can use: a token with a partial
+overlap counts as a "reuse" but only covers part of its accesses. The metric that
+matters is *access-level coverage* — the share of the 2 expert accesses per token
+per layer already covered by prefetching the union of the previous W tokens' sets
+at that layer. `W=1` is the spec's stated contract ("same experts as the previous
+token at this layer").
+
+| W | l00 (λ=0) | l05 (λ=0.5) | Δ (pp) |
+|---|---|---|---|
+| 1 (spec contract) | 0.130 | **0.249** | +11.94 |
+| 2 | 0.200 | 0.303 | +10.36 |
+| 3 | 0.260 | 0.351 | +9.15 |
+| 4 | 0.313 | 0.393 | +8.01 |
+
+Two design consequences, both load-bearing for Phase 7:
+
+1. **`W=1` leaves most of the benefit on the table.** Widening to `W≈3–4` lifts
+   λ=0.5 coverage from 0.249 to ~0.35–0.39 (and λ=0 from 0.130 to ~0.31). The
+   `[P7-axis]` recency window is not a refinement — it is worth roughly 1.5× the
+   coverage of the spec's contract.
+2. **A wider serving-time window substitutes for part of the training-time
+   bias.** The λ advantage shrinks as W grows (+11.94 pp → +8.01 pp), because the
+   window captures more of the natural locality λ was amplifying. **Any Phase 7
+   comparison must give both arms the same W**, or the thesis overstates λ by
+   handing the control a deliberately weak prefetcher.
+
 ## 4. LRU replay (global (layer, expert) budget, 20 accesses/token)
 
 | capacity | l00 hit | l05 hit | Δ (pp) | l00 B/tok | l05 B/tok | Δ bytes |

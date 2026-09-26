@@ -108,6 +108,37 @@ def boot_ci(x, n=2000, seed=0):
     return float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
 
+def prefetch_coverage(sel, tokens, eos, K, W):
+    """Access-level coverage of prefetching the union of the previous W tokens'
+    expert sets at the same layer.
+
+    W=1 is the spec's stated contract ("same experts as the previous token at
+    this layer"). This is the number the engine's prefetcher actually gets: it
+    can be much lower than the token-level reuse rate, because a token with a
+    partial overlap scores as a "reuse" but only covers part of its accesses.
+
+    A pair contributes only if none of the W preceding tokens is an EOS, since
+    the locality set is cleared there.
+    """
+    L, Wn, T, _ = sel.shape
+    cur = sel[:, :, W:, :]                                  # (L, Wn, T-W, K)
+    hist = [sel[:, :, W - w:-w, :] for w in range(1, W + 1)]  # W x (L,Wn,T-W,K)
+    valid = np.ones((Wn, T - W), dtype=bool)
+    for w in range(1, W + 1):
+        valid &= (tokens[:, W - w:T - w] != eos)
+
+    covered = np.zeros((L, Wn, T - W), dtype=np.int32)
+    for j in range(K):                                      # each needed expert
+        hit = np.zeros((L, Wn, T - W), dtype=bool)
+        for h in hist:
+            hit |= (h[:, :, :, 0] == cur[:, :, :, j])
+            if K > 1:
+                hit |= (h[:, :, :, 1] == cur[:, :, :, j])
+        covered += hit
+    v = np.broadcast_to(valid, covered.shape)
+    return (covered * v).sum() / (v.sum() * K)
+
+
 def marginal(sel):
     L = sel.shape[0]
     out = np.zeros(L)
@@ -200,6 +231,18 @@ def main():
           + " ".join("%.2f" % f for f in fro))
     print("  mean ||Δ||_F = %.3f  (0 would mean λ is inert)\n"
           % float(np.mean(fro)))
+
+    # ---- 3b. prefetch coverage: what a prefetcher actually buys
+    print("-- 3b. PREFETCH COVERAGE (access-level: share of the K expert "
+          "accesses per token\n        already covered by prefetching the union "
+          "of the previous W tokens' sets) --")
+    print("     W |   l00  |   l05  |   Δ (pp)")
+    for W in (1, 2, 3, 4):
+        c0 = prefetch_coverage(sel0, tokens, eos, K, W)
+        c5 = prefetch_coverage(sel5, tokens, eos, K, W)
+        print("  %4d | %6.3f | %6.3f | %+7.2f" % (W, c0, c5, 100 * (c5 - c0)))
+    print("  W=1 is the spec's stated contract ('same experts as the previous")
+    print("  token at this layer'). Token-level reuse OVERSTATES this number.\n")
 
     # ---- 4. LRU replay
     def accesses(sel):
