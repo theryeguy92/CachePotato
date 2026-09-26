@@ -857,7 +857,7 @@ static int save_checkpoint(const char *path) {
     if (!f) { perror("save checkpoint"); return -1; }
     Header out = HDR;
     out.magic = CP_MAGIC;
-    out.version = CP_VERSION;
+    out.version = CP_VERSION_V2;
     fwrite(&out, sizeof(out), 1, f);
     fwrite(params, sizeof(float), N_PARAMS, f);
     fclose(f);

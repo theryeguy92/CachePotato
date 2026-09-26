@@ -4,10 +4,87 @@
 #include "pager.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-void forward(const Model *m, const int *tokens, int T, float *logits_out) {
+#define EOS_TOKEN 50256 /* GPT-2 <|endoftext|>; also resets the locality set */
+
+/* --- MoE FFN (CPW1 v3) -----------------------------------------------------
+   router -> +lambda locality bias -> softmax -> top-k, then one shared expert
+   (always active, hot by architecture) plus the k routed experts. The locality
+   set is the previous token's selection at THIS layer and is CLEARED at every
+   EOS: cross-document stickiness is meaningless (spec decision 2026-09-15).
+   Mirrors train_moe.py's moe_ffn and the bridge-verified src/train.c: the top-k
+   scan below is the same strict-> form, so lower id wins ties. */
+static void moe_ffn(const Model *m, int slot, const float *xn, float *x,
+                    const int *tokens, int T, float *h, float *proj,
+                    int *sel_out, float lambda) {
+    const int D = m->hdr.d_model, N = m->w.n_exp, EH = m->w.exp_hid, K = m->w.topk;
+    const Weights *w = &m->w;
+    const float *Wr = w->Wr + (size_t)slot * D * N;
+    const float *br = w->br + (size_t)slot * N;
+    const float *W1s = w->W1s + (size_t)slot * D * D;
+    const float *b1s = w->b1s + (size_t)slot * D;
+    const float *W2s = w->W2s + (size_t)slot * D * D;
+    const float *b2s = w->b2s + (size_t)slot * D;
+
+    float *rlog = malloc(N * sizeof(float));
+    float *p = malloc(N * sizeof(float));
+    int *prev = calloc(N, sizeof(int));
+    int *idx = malloc(K * sizeof(int));
+    float *wt = malloc(K * sizeof(float));
+    if (!rlog || !p || !prev || !idx || !wt) { fprintf(stderr, "moe_ffn: oom\n"); exit(1); }
+
+    for (int t = 0; t < T; t++) {
+        const float *xt = xn + (size_t)t * D;
+        float *out = x + (size_t)t * D;
+
+        matmul_xw(rlog, xt, Wr, br, D, N);
+        for (int e = 0; e < N; e++) p[e] = rlog[e] + (prev[e] ? lambda : 0.0f);
+        softmax(p, N);
+
+        int a = 0, b = 1;
+        if (p[b] > p[a]) { a = 1; b = 0; }
+        for (int e = 2; e < N; e++)
+            if (p[e] > p[a]) { b = a; a = e; }
+            else if (p[e] > p[b]) b = e;
+        idx[0] = a; idx[1] = b;
+        float S = p[a] + p[b];
+        wt[0] = p[a] / S; wt[1] = p[b] / S;
+
+        /* shared expert */
+        matmul_xw(h, xt, W1s, b1s, D, D);
+        for (int e = 0; e < D; e++) h[e] = gelu(h[e]);
+        matmul_xw(proj, h, W2s, b2s, D, D);
+        for (int e = 0; e < D; e++) out[e] += proj[e];
+
+        /* routed experts: one contiguous block per expert = one pager region */
+        for (int s = 0; s < K; s++) {
+            float *blk = expert_block(w, slot, idx[s]);
+            const float *b1e = blk + (size_t)D * EH;
+            const float *W2e = b1e + EH;
+            const float *b2e = W2e + (size_t)EH * D;
+            matmul_xw(h, xt, blk, b1e, D, EH);
+            for (int e = 0; e < EH; e++) h[e] = gelu(h[e]);
+            matmul_xw(proj, h, W2e, b2e, EH, D);
+            for (int e = 0; e < D; e++) out[e] += wt[s] * proj[e];
+        }
+
+        if (sel_out)
+            for (int s = 0; s < K; s++)
+                sel_out[((size_t)slot * T + t) * K + s] = idx[s];
+
+        /* locality set for the NEXT token; cleared at EOS */
+        memset(prev, 0, N * sizeof(int));
+        if (tokens[t] != EOS_TOKEN)
+            for (int s = 0; s < K; s++) prev[idx[s]] = 1;
+    }
+    free(rlog); free(p); free(prev); free(idx); free(wt);
+}
+
+void forward_moe(const Model *m, const int *tokens, int T, float *logits_out,
+                 int *sel_out, float lambda) {
     const int D = m->hdr.d_model, H = m->hdr.n_heads, L = m->hdr.n_layer;
     const int F = m->hdr.d_ff, V = m->hdr.vocab;
     const int HD = D / H;
@@ -38,8 +115,6 @@ void forward(const Model *m, const int *tokens, int T, float *logits_out) {
         const float *Wv = w->Wv + l * D * D, *bv = w->bv + l * D;
         const float *Wo = w->Wo + l * D * D, *bo = w->bo + l * D;
         const float *ln2_g = w->ln2_g + l * D, *ln2_b = w->ln2_b + l * D;
-        const float *W1 = w->W1 + l * D * F, *b1 = w->b1 + l * F;
-        const float *W2 = w->W2 + l * F * D, *b2 = w->b2 + l * D;
 
         /* attention half: norm -> qkv -> per-head masked attention -> Wo -> +res */
         for (int t = 0; t < T; t++) {
@@ -78,18 +153,27 @@ void forward(const Model *m, const int *tokens, int T, float *logits_out) {
             for (int e = 0; e < D; e++) x[t * D + e] += proj[e];
         }
 
-        /* FFN half: norm -> W1 -> gelu -> W2 -> +res */
+        /* FFN half: dense on the outer layers, sparse (MoE) in the middle */
         for (int t = 0; t < T; t++) {
             instr_touch("ln2", l, t, 2 * D * sizeof(float));
             layernorm(xn + t * D, x + t * D, ln2_g, ln2_b, D);
         }
-        for (int t = 0; t < T; t++) {
-            instr_touch("W1", l, t, (D * F + F) * sizeof(float));
-            instr_touch("W2", l, t, (F * D + D) * sizeof(float));
-            matmul_xw(h + t * F, xn + t * D, W1, b1, D, F);
-            for (int e = 0; e < F; e++) h[t * F + e] = gelu(h[t * F + e]);
-            matmul_xw(proj, h + t * F, W2, b2, F, D);
-            for (int e = 0; e < D; e++) x[t * D + e] += proj[e];
+        if (moe_layer_at(m, l)) {
+            moe_ffn(m, m->w.moe_slot[l], xn, x, tokens, T, h, proj, sel_out, lambda);
+        } else {
+            /* dense slots are compacted in v3 (dead dense FFNs are not in the
+               file), so layer -> slot; v2 has one dense FFN per layer */
+            const int ds = m->is_v3 ? m->w.dense_slot[l] : l;
+            const float *W1 = w->W1 + (size_t)ds * D * F, *b1 = w->b1 + (size_t)ds * F;
+            const float *W2 = w->W2 + (size_t)ds * F * D, *b2 = w->b2 + (size_t)ds * D;
+            for (int t = 0; t < T; t++) {
+                instr_touch("W1", l, t, (D * F + F) * sizeof(float));
+                instr_touch("W2", l, t, (F * D + D) * sizeof(float));
+                matmul_xw(h + t * F, xn + t * D, W1, b1, D, F);
+                for (int e = 0; e < F; e++) h[t * F + e] = gelu(h[t * F + e]);
+                matmul_xw(proj, h + t * F, W2, b2, F, D);
+                for (int e = 0; e < D; e++) x[t * D + e] += proj[e];
+            }
         }
     }
 
@@ -103,6 +187,11 @@ void forward(const Model *m, const int *tokens, int T, float *logits_out) {
 
     free(x); free(xn); free(q); free(k); free(vv);
     free(ao); free(att); free(h); free(proj);
+}
+
+/* v2-compatible entry point (dense): no routing trace, no locality bias. */
+void forward(const Model *m, const int *tokens, int T, float *logits_out) {
+    forward_moe(m, tokens, T, logits_out, NULL, 0.0f);
 }
 
 /* ---- incremental generation mode (KV-cached, one token per call) ------- */

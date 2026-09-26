@@ -22,7 +22,10 @@ Usage:
 """
 import argparse
 import os
+import struct
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -57,6 +60,10 @@ def main():
     ap.add_argument("--cpw", required=True)
     ap.add_argument("--trace", default="")
     ap.add_argument("--windows", type=int, default=2)
+    ap.add_argument("--engine", default="",
+                    help="path to the C engine binary; adds check D")
+    ap.add_argument("--tokens-bin", default="data/fineweb_edu_valid.bin",
+                    help="token bin the traces were recorded from")
     args = ap.parse_args()
 
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
@@ -73,12 +80,14 @@ def main():
     # ---- A. structure
     hdr = v3.read_header(args.cpw)
     exp_ints = dict(zip(v3.HDR_INT_FIELDS, v3.header_ints(cfg)))
-    hdr_ok = all(hdr[k] == exp_ints[k] for k in v3.HDR_INT_FIELDS)
+    hdr_ok = (all(hdr[k] == exp_ints[k] for k in v3.HDR_INT_FIELDS)
+              and abs(hdr["lam"] - cfg.lam) < 1e-9)
     live = v3.payload_floats(cfg)
     exp_size = v3.HDR_SIZE + live * 4
     got_size = os.path.getsize(args.cpw)
     print("A. STRUCTURE")
     print("   header     : %s" % ("matches config" if hdr_ok else "MISMATCH"))
+    print("   lambda     : file=%.3f config=%.3f" % (hdr["lam"], cfg.lam))
     if not hdr_ok:
         for k in v3.HDR_INT_FIELDS:
             if hdr[k] != exp_ints[k]:
@@ -134,12 +143,47 @@ def main():
         if rate < 99.9:
             fails.append("traces %.2f%%" % rate)
 
+    # ---- D. the C engine, if a binary was given
+    if args.engine and args.trace:
+        z = np.load(args.trace, allow_pickle=False)
+        trace_T = int(z["tokens"].shape[1])
+        sel_all = z["sel"]
+        n = min(args.windows, sel_all.shape[0])
+        tmp = Path(tempfile.mkdtemp())
+        print("\nD. C ENGINE (%s)" % args.engine)
+        tot = mism = 0
+        for w in range(n):
+            outp = tmp / ("c_w%d.bin" % w)
+            r = subprocess.run(
+                [args.engine, args.cpw, "--moe-sel", args.tokens_bin,
+                 str(w * trace_T), str(trace_T), str(outp)],
+                capture_output=True, text=True)
+            if r.returncode != 0:
+                print("   window %d: engine FAILED: %s" % (w, r.stderr.strip()))
+                fails.append("engine window %d" % w)
+                continue
+            raw = outp.read_bytes()
+            nm, T2, K = struct.unpack_from("<iii", raw, 0)
+            got = np.frombuffer(raw, dtype="<i4", count=nm * T2 * K,
+                                offset=12).reshape(nm, T2, K)
+            exp = sel_all[:, w, :, :]
+            mism += int((got != exp).sum())
+            tot += exp.size
+            print("   window %d: %s" % (w, r.stderr.strip().splitlines()[0]))
+        if tot:
+            crate = 100.0 * (1 - mism / tot)
+            print("   C engine vs recorded routing: %.4f%%  (%d/%d selections differ)"
+                  % (crate, mism, tot))
+            if crate < 99.9:
+                fails.append("C engine %.2f%%" % crate)
+
     print("\n" + "=" * 78)
     if fails:
         print("CPW1 v3 GATE: FAIL — %s" % ", ".join(fails))
         return 1
     print("CPW1 v3 GATE: PASS (structure + exact round-trip%s)"
-          % (" + recorded traces" if args.trace else ""))
+          % (" + recorded traces" if args.trace else "")
+          + (" + C engine" if args.engine else ""))
     return 0
 
 

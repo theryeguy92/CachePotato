@@ -123,6 +123,14 @@ static int repl(const char *path) {
     Model m;
     if (model_load(&m, path) != 0)
         return 1;
+    if (m.is_v3 && m.w.is_moe) {
+        fprintf(stderr,
+                "this is a CPW1 v3 MoE model, and the incremental (KV-cached) "
+                "path does not implement MoE yet.\n"
+                "Use --moe-sel <tokens.bin> <start> <T> <out.bin> for the routing "
+                "check; sampled MoE generation is the next Phase 7 step.\n");
+        return 1;
+    }
     const char *b = getenv("CP_BUDGET");
     if (b)
         pager_init(&m, atol(b) * 1024L * 1024L);
@@ -183,6 +191,62 @@ static int repl(const char *path) {
 }
 
 
+/* --- MoE routing gate (CPW1 v3) --------------------------------------------
+   Run the trained model over a token window and dump the per-token top-k expert
+   selections, so tools/verify_cpw1_v3.py can require the C engine to reproduce
+   what was recorded from the PyTorch model. This is the check that a weight
+   export is faithful AT THE ROUTING LEVEL, not merely loadable. */
+static int moe_sel_mode(const char *path, const char *tokbin, long start, int T,
+                        const char *out_path) {
+    Model m;
+    if (model_load(&m, path) != 0)
+        return 1;
+    if (!m.is_v3 || !m.w.is_moe) {
+        fprintf(stderr, "%s is not a CPW1 v3 MoE file\n", path);
+        return 1;
+    }
+    FILE *f = fopen(tokbin, "rb");
+    if (!f) { perror("tokens"); return 1; }
+    if (fseek(f, start * 2L, SEEK_SET) != 0) { perror("seek"); return 1; }
+    uint16_t *raw = malloc((size_t)T * sizeof(uint16_t));
+    int *toks = malloc((size_t)T * sizeof(int));
+    if (fread(raw, sizeof(uint16_t), (size_t)T, f) != (size_t)T) {
+        fprintf(stderr, "short read from %s\n", tokbin);
+        return 1;
+    }
+    fclose(f);
+    for (int i = 0; i < T; i++) toks[i] = raw[i];
+
+    int nm = m.w.n_moe, K = m.w.topk;
+    int *sel = malloc((size_t)nm * T * K * sizeof(int));
+    float *logits = malloc((size_t)T * m.hdr.vocab * sizeof(float));
+    if (!raw || !toks || !sel || !logits) { fprintf(stderr, "oom\n"); return 1; }
+
+    double t0 = now_s();
+    forward_moe(&m, toks, T, logits, sel, m.h3.lam);
+    double dt = now_s() - t0;
+
+    FILE *o = fopen(out_path, "wb");
+    if (!o) { perror("out"); return 1; }
+    fwrite(&nm, sizeof(int), 1, o);
+    fwrite(&T, sizeof(int), 1, o);
+    fwrite(&K, sizeof(int), 1, o);
+    fwrite(sel, sizeof(int), (size_t)nm * T * K, o);
+    fclose(o);
+
+    int best = 0;
+    const float *row = logits + (size_t)(T - 1) * m.hdr.vocab;
+    for (int j = 1; j < m.hdr.vocab; j++) if (row[j] > row[best]) best = j;
+    fprintf(stderr,
+            "moe-sel: %d MoE layers x %d tokens x top-%d, lam=%.3f, %.1fs "
+            "(%.0f tok/s) | next-argmax %d -> %s\n",
+            nm, T, K, m.h3.lam, dt, dt > 0 ? T / dt : 0.0, best, out_path);
+
+    free(raw); free(toks); free(sel); free(logits);
+    model_free(&m);
+    return 0;
+}
+
 /* usage:
    cachepotato [weights.bin] tok0 tok1 ...   forward on raw token ids
    cachepotato [weights.bin] -p "prompt"     encode -> forward -> next token
@@ -198,6 +262,10 @@ int main(int argc, char **argv) {
     int interactive = 0;
     int tokens[256];
     int T = 0;
+    int moe_sel = 0;
+    const char *ms_bin = NULL, *ms_out = NULL;
+    long ms_start = 0;
+    int ms_T = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc)
@@ -210,6 +278,13 @@ int main(int argc, char **argv) {
             rng_seed(strtoull(argv[++i], NULL, 10));
         else if (strcmp(argv[i], "--greedy") == 0)
             g_temp = 0.0;
+        else if (strcmp(argv[i], "--moe-sel") == 0 && i + 4 < argc) {
+            ms_bin = argv[++i];
+            ms_start = atol(argv[++i]);
+            ms_T = atoi(argv[++i]);
+            ms_out = argv[++i];
+            moe_sel = 1;
+        }
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc)
             prompt = argv[++i];
         else if (strcmp(argv[i], "-i") == 0)
@@ -219,6 +294,9 @@ int main(int argc, char **argv) {
         else if (T < 256)
             tokens[T++] = atoi(argv[i]);
     }
+
+    if (moe_sel)
+        return moe_sel_mode(path, ms_bin, ms_start, ms_T, ms_out);
 
     if (interactive)
         return repl(path);
