@@ -4,6 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "instr.h"
 #include "model.h"
@@ -423,6 +427,115 @@ static int gen_check_mode(const char *path, const char *tokbin, long start,
     return ok ? 0 : 1;
 }
 
+/* --- Q3 benchmark (protocol pre-registered in Phase-7-Integration § Part 3) --
+   Steady-state GENERATION throughput, prompt warm-up excluded. Greedy, because
+   sampling injects token-choice randomness -> different routing -> different
+   I/O, on a margin of ~0.2 tok/s. Per-prompt timings are kept so the CI is taken
+   across prompts (the independent unit), and prompt 1 is discarded as warm-up. */
+static double t95(int df) {
+    static const double tab[] = {12.706, 4.303, 3.182, 2.776, 2.571, 2.447,
+        2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160, 2.145, 2.131, 2.120,
+        2.110, 2.101, 2.093, 2.086};
+    if (df < 1) return 12.706;
+    if (df <= 20) return tab[df - 1];
+    if (df <= 30) return 2.042;
+    if (df <= 40) return 2.021;
+    if (df <= 60) return 2.000;
+    if (df <= 120) return 1.980;
+    return 1.960;
+}
+
+static int bench_mode(const char *path, const char *tokbin, long start,
+                      int prompt_T, int gen_N, int n_prompts) {
+    Model m;
+    if (model_load(&m, path) != 0) return 1;
+    const int V = m.hdr.vocab;
+
+    int fd = open(tokbin, O_RDONLY);
+    if (fd < 0) { perror("tokens"); return 1; }
+    struct stat st;
+    if (fstat(fd, &st) < 0) { perror("fstat"); return 1; }
+    size_t nbytes = (size_t)st.st_size;
+    long n_tok = (long)(nbytes / 2);
+    uint16_t *ids = mmap(NULL, nbytes, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (ids == MAP_FAILED) { perror("mmap"); return 1; }
+
+    /* deterministic document-start prompts spread across the whole bin */
+    long stride = n_tok / (n_prompts + 1);
+    long *offs = malloc((size_t)n_prompts * sizeof(long));
+    for (int i = 0; i < n_prompts; i++) {
+        long p = start + (long)i * stride;
+        while (p < n_tok - prompt_T - 2 && ids[p] != EOS_TOKEN) p++;
+        offs[i] = p + 1;
+    }
+
+    RunState rs;
+    runstate_alloc(&rs, &m);
+    double *tps = malloc((size_t)n_prompts * sizeof(double));
+
+    /* Prime the page cache before any timing. Without this, run-to-run drift —
+       whatever the PREVIOUS run happened to leave cached — dwarfs the effect
+       being measured (three identical runs measured 8.13 / 8.78 / 10.67 tok/s).
+       After priming, every run starts from the same defined state and the only
+       cold pages are the ones the pager itself evicted, which is the regime the
+       simulated budget is meant to represent. CP_BENCH_NOPRIME=1 disables it. */
+    if (!getenv("CP_BENCH_NOPRIME")) {
+        volatile unsigned char sink = 0;
+        const unsigned char *pg = (const unsigned char *)m.data;
+        for (size_t i = 0; i < m.file_size; i += 4096) sink ^= pg[i];
+        (void)sink;
+        fprintf(stderr, "  primed %zu MB of page cache\n", m.file_size >> 20);
+    }
+
+    fprintf(stderr, "bench: %s\n  prompt_T=%d gen_N=%d n_prompts=%d lam=%.3f\n",
+            path, prompt_T, gen_N, n_prompts, m.h3.lam);
+    for (int i = 0; i < n_prompts; i++) {
+        runstate_reset_sequence(&rs, &m);
+        long o = offs[i];
+        for (int t = 0; t < prompt_T; t++)
+            forward_step(&m, &rs, ids[o + t], t);
+        double t0 = now_s();
+        int pos = prompt_T;
+        for (int g = 0; g < gen_N && pos < m.hdr.n_ctx; g++, pos++) {
+            int best = 0;
+            for (int j = 1; j < V; j++)
+                if (rs.logits[j] > rs.logits[best]) best = j;
+            forward_step(&m, &rs, best, pos);
+        }
+        double dt = now_s() - t0;
+        int ng = pos - prompt_T;
+        tps[i] = dt > 0 ? ng / dt : 0.0;
+        printf("  prompt %2d: %6.1fs  %7.3f tok/s%s\n", i, dt, tps[i],
+               i == 0 ? "   (warm-up, excluded)" : "");
+        fflush(stdout);
+    }
+
+    int n = n_prompts - 1;
+    double sum = 0.0;
+    for (int i = 1; i < n_prompts; i++) sum += tps[i];
+    double mean = n > 0 ? sum / n : 0.0;
+    double var = 0.0;
+    for (int i = 1; i < n_prompts; i++) var += (tps[i] - mean) * (tps[i] - mean);
+    var = n > 1 ? var / (n - 1) : 0.0;
+    double sd = sqrt(var), se = n > 0 ? sd / sqrt((double)n) : 0.0;
+    double tv = t95(n - 1);
+    double lo = mean - tv * se, hi = mean + tv * se;
+
+    printf("\nbench summary: n=%d (prompt 0 discarded)  mean=%.3f tok/s  "
+           "sd=%.3f  se=%.3f  t=%.3f\n", n, mean, sd, se, tv);
+    printf("  95%% CI [%.3f, %.3f]   bar is >=7.0 at CP_BUDGET=512MB\n", lo, hi);
+    printf("BENCH_RESULT mean=%.4f sd=%.4f ci_lo=%.4f ci_hi=%.4f n=%d file=%s\n",
+           mean, sd, lo, hi, n, path);
+    pager_report();
+
+    runstate_free(&rs, &m);
+    free(tps); free(offs);
+    munmap(ids, nbytes);
+    close(fd);
+    model_free(&m);
+    return 0;
+}
+
 /* usage:
    cachepotato [weights.bin] tok0 tok1 ...   forward on raw token ids
    cachepotato [weights.bin] -p "prompt"     encode -> forward -> next token
@@ -450,6 +563,10 @@ int main(int argc, char **argv) {
     const char *gc_bin = NULL;
     long gc_start = 0;
     int gc_prompt = 0, gc_N = 0;
+    int bench = 0;
+    const char *bn_bin = NULL;
+    long bn_start = 0;
+    int bn_prompt = 0, bn_gen = 0, bn_prompts = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc)
@@ -462,6 +579,14 @@ int main(int argc, char **argv) {
             rng_seed(strtoull(argv[++i], NULL, 10));
         else if (strcmp(argv[i], "--greedy") == 0)
             g_temp = 0.0;
+        else if (strcmp(argv[i], "--bench") == 0 && i + 5 < argc) {
+            bn_bin = argv[++i];
+            bn_start = atol(argv[++i]);
+            bn_prompt = atoi(argv[++i]);
+            bn_gen = atoi(argv[++i]);
+            bn_prompts = atoi(argv[++i]);
+            bench = 1;
+        }
         else if (strcmp(argv[i], "--gen-check") == 0 && i + 4 < argc) {
             gc_bin = argv[++i];
             gc_start = atol(argv[++i]);
@@ -491,6 +616,9 @@ int main(int argc, char **argv) {
         else if (T < 256)
             tokens[T++] = atoi(argv[i]);
     }
+
+    if (bench)
+        return bench_mode(path, bn_bin, bn_start, bn_prompt, bn_gen, bn_prompts);
 
     if (gen_check)
         return gen_check_mode(path, gc_bin, gc_start, gc_prompt, gc_N);
