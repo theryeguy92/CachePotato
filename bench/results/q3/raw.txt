@@ -1,0 +1,44 @@
+=== Q3 benchmark 2026-09-27T08:51:09-04:00 — RUN 2 (pager_init fix) ===
+git: 15c1ade30acccaf5afa98864faa3a0a0bfa28c32
+fc55c1cc8ad0818ebabab3990e5df48c  weights/moe-scale-run/l05.cpw1v3
+fd5390385bfeec8cc2a8add491a9783a  weights/moe-scale-run/l00.cpw1v3
+79a560e7f8f2e554ceb02ad2c80972fb  weights/gpt2.bin
+protocol: Part 3 + Amendment 1 (primed primary, SYS=1 mandatory)
+NOTE: run 1 was discarded — pager_init was never called in bench_mode, so CP_BUDGET had no effect (no pager output, flat curve).
+
+=== HEADLINE l05 B=512 W=4 ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l05.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.500
+  prompt  0:   76.8s    6.665 tok/s   (warm-up, excluded)
+  prompt  1:   61.3s    8.346 tok/s
+  prompt  2:   57.6s    8.888 tok/s
+  prompt  3:   54.7s    9.353 tok/s
+  prompt  4:   54.5s    9.402 tok/s
+  prompt  5:   64.2s    7.979 tok/s
+  prompt  6:   55.8s    9.182 tok/s
+  prompt  7:   57.8s    8.860 tok/s
+  prompt  8:   54.5s    9.400 tok/s
+  prompt  9:   72.6s    7.052 tok/s
+  prompt 10:   59.7s    8.583 tok/s
+  prompt 11:   88.9s    5.756 tok/s
+  prompt 12:   63.2s    8.101 tok/s
+  prompt 13:   64.1s    7.989 tok/s
+  prompt 14:   74.2s    6.900 tok/s
+  prompt 15:   83.2s    6.153 tok/s
+pager: 404 regions | budget 512 MB | prefetch W=4
+  all     : 851200 accesses, 830719 hits (97.59%), 23350.3 MB fetched
+  experts : 179200 accesses, 158793 hits (88.61%), 23032.6 MB fetched | prefetch: 0 fetches, 714016 already resident
+  20235 evictions, 22838 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=8.130 tok/s  sd=1.179  se=0.304  t=2.145
+  95% CI [7.477, 8.782]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=8.1296 sd=1.1788 ci_lo=7.4767 ci_hi=8.7824 n=15 file=weights/moe-scale-run/l05.cpw1v3
+=== CONTROL l00 B=512 W=4 ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l00.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.000
+  prompt  0:   63.6s    8.054 tok/s   (warm-up, excluded)
+  prompt  1:   66.1s    7.747 tok/s
