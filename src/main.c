@@ -451,6 +451,16 @@ static int bench_mode(const char *path, const char *tokbin, long start,
     if (model_load(&m, path) != 0) return 1;
     const int V = m.hdr.vocab;
 
+    /* The pager must be enabled here too. Without this, CP_BUDGET has no effect
+       and the benchmark silently measures a fully-resident model — which is
+       exactly what happened on the first run (no pager output, flat curve). */
+    const char *pb = getenv("CP_BUDGET");
+    if (pb)
+        pager_init(&m, atol(pb) * 1024L * 1024L);
+    else
+        fprintf(stderr, "WARNING: CP_BUDGET unset — pager disabled, this is a "
+                        "fully-resident measurement, not a paged one\n");
+
     int fd = open(tokbin, O_RDONLY);
     if (fd < 0) { perror("tokens"); return 1; }
     struct stat st;
