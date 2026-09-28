@@ -445,6 +445,22 @@ static double t95(int df) {
     return 1.960;
 }
 
+/* Machine-state telemetry, sampled once per prompt boundary — never inside the
+   generation loop, so it cannot perturb the timing it reports. The 2026-09-28
+   sweep showed a discrete ~13.1 vs ~11.0 tok/s regime switch across runs with
+   the same binary and byte-identical pager statistics; logging this per prompt
+   makes such a switch observed rather than inferred from the tok/s spread. */
+static void read_sysfs(const char *path, char *out, size_t n) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { snprintf(out, n, "?"); return; }
+    ssize_t r = read(fd, out, n - 1);
+    close(fd);
+    if (r <= 0) { snprintf(out, n, "?"); return; }
+    out[r] = '\0';
+    char *nl = strchr(out, '\n');
+    if (nl) *nl = '\0';
+}
+
 static int bench_mode(const char *path, const char *tokbin, long start,
                       int prompt_T, int gen_N, int n_prompts) {
     Model m;
@@ -515,7 +531,14 @@ static int bench_mode(const char *path, const char *tokbin, long start,
         double dt = now_s() - t0;
         int ng = pos - prompt_T;
         tps[i] = dt > 0 ? ng / dt : 0.0;
-        printf("  prompt %2d: %6.1fs  %7.3f tok/s%s\n", i, dt, tps[i],
+        /* Sampled AFTER dt is taken, at the prompt boundary only: telemetry
+           must never sit between the clock start and the clock stop. */
+        char khz[24], ttemp[24];
+        read_sysfs("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq",
+                   khz, sizeof khz);
+        read_sysfs("/sys/class/thermal/thermal_zone6/temp", ttemp, sizeof ttemp);
+        printf("  prompt %2d: %6.1fs  %7.3f tok/s  [cpu_khz=%s pkg_temp_mC=%s]%s\n",
+               i, dt, tps[i], khz, ttemp,
                i == 0 ? "   (warm-up, excluded)" : "");
         fflush(stdout);
     }

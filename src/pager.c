@@ -224,11 +224,21 @@ void pager_report(void) {
         return;
     long access = n_hits + n_misses;
     long eaccess = n_ehits + n_emisses;
+    /* Core = the hot tier (token_emb, pos_emb, attention, shared experts, dense
+       FFN, router). touch_expert() increments the all-counters as well as the
+       expert ones, so core is the difference and needs no separate accounting.
+       Reported because at a tight CP_BUDGET the pager can begin evicting
+       weights that every token needs; that "anchor thrash" would otherwise be
+       indistinguishable from a routing effect. */
+    long caccess = access - eaccess;
+    long chits = n_hits - n_ehits;
+    double cbytes = (double)(bytes_missed - bytes_emissed);
     fprintf(stderr,
             "pager: %d regions | budget %ld MB | prefetch W=%d\n"
             "  all     : %ld accesses, %ld hits (%.2f%%), %.1f MB fetched\n"
             "  experts : %ld accesses, %ld hits (%.2f%%), %.1f MB fetched | "
             "prefetch: %ld fetches, %ld already resident\n"
+            "  core    : %ld accesses, %ld hits (%.2f%%), %.1f MB fetched\n"
             "  %ld evictions, %ld MB evicted\n",
             n_regions, budget / (1024 * 1024), pf_w,
             access, n_hits,
@@ -237,5 +247,8 @@ void pager_report(void) {
             eaccess, n_ehits,
             eaccess ? 100.0 * (double)n_ehits / (double)eaccess : 0.0,
             (double)bytes_emissed / (1024 * 1024), n_prefetch, n_pf_resident,
+            caccess, chits,
+            caccess ? 100.0 * (double)chits / (double)caccess : 0.0,
+            cbytes / (1024 * 1024),
             n_evictions, bytes_evicted / (1024 * 1024));
 }

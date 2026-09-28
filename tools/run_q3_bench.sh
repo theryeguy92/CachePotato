@@ -31,19 +31,58 @@ completed() {
     ' "$RAW"
 }
 
+state() {
+    ac=$(cat /sys/class/power_supply/AC/online 2>/dev/null)
+    bs=$(awk -F= '/POWER_SUPPLY_STATUS/{print $2}' \
+         /sys/class/power_supply/BAT1/uevent 2>/dev/null)
+    f=$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq 2>/dev/null)
+    t=$(cat /sys/class/thermal/thermal_zone6/temp 2>/dev/null)
+    echo "  state: ac=$ac bat=$bs cpu_khz=$f pkg_temp_mC=$t"
+}
+
 run() {
     f="$1"; b="$2"; w="$3"; lbl="$4"; shift 4
     if completed "$lbl"; then
         echo "SKIP (already done): $lbl"
         return 0
     fi
+    # AC is a precondition, not a note in a log. Battery costs ~24% on this
+    # machine (identical config: 8.13 tok/s on battery vs 10.71 on AC), so a
+    # config measured on battery is not comparable with one measured on AC.
+    # Refuse loudly rather than silently record an incomparable number.
+    ac=$(cat /sys/class/power_supply/AC/online 2>/dev/null)
+    if [ "$ac" != "1" ]; then
+        echo "ABORT: AC offline (ac=$ac) before '$lbl' — refusing to measure on battery"
+        echo "ABORT: AC offline before $lbl" >> "$RAW"
+        exit 1
+    fi
     echo "=== $lbl ==="
-    echo "=== $lbl ===" >> "$RAW"
+    { echo "=== $lbl ==="; state; } >> "$RAW"
     tmp="$OUT/.tmp.$$"
+    t0=$(date +%s)
     env CP_BUDGET="$b" CP_PAGER_SYS=1 CP_PREFETCH_W="$w" "$@" \
         "$BIN" "$f" --bench "$TOK" 0 48 512 16 > "$tmp" 2>&1
+    t1=$(date +%s)
+
+    # Integrity check. A suspend freezes the process, but CLOCK_MONOTONIC does
+    # not advance during S3, so the per-prompt times come out looking perfectly
+    # normal while the wall clock runs on. Three suspends hit the 2026-09-28
+    # sweep and nothing in the output revealed them. Wall time vs the sum of the
+    # measured prompt times makes it visible; >60s is treated as suspect.
+    wall=$(( t1 - t0 ))
+    psum=$(awk '/^  prompt/{ v=$3; sub(/s$/,"",v); s+=v } END{ printf "%d", s+0 }' "$tmp")
+    drift=$(( wall - psum ))
+    note="ok"
+    if [ "$drift" -gt 60 ]; then
+        note="SUSPECT: wall exceeds measured prompt time by ${drift}s — suspend or interference"
+    fi
+    {
+        echo "  wall=${wall}s  prompt_sum=${psum}s  drift=${drift}s  $note"
+        state
+    } | tee -a "$RAW"
+
     cat "$tmp" >> "$RAW"
-    grep -E "BENCH_RESULT|experts |evictions," "$tmp"
+    grep -E "BENCH_RESULT|experts |core |evictions," "$tmp"
     rm -f "$tmp"
 }
 

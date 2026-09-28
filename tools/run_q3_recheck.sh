@@ -27,7 +27,7 @@ set -u
 cd "$(dirname "$0")/.."
 
 OUT=bench/results/q3
-RAW="$OUT/recheck.txt"
+RAW=${RAW:-"$OUT/recheck.txt"}
 BIN=./build/cachepotato
 TOK=data/fineweb_edu_valid.bin
 REPS=${REPS:-3}
@@ -38,9 +38,9 @@ if [ ! -s "$RAW" ]; then
     {
         echo "=== Q3 arm recheck $(date -Is) — paired/interleaved, single session ==="
         echo "git: $(git rev-parse HEAD)"
-        echo "binary: $(TZ=UTC stat -c '%y' "$BIN")"
-        echo "design: $REPS reps x (l05 then l00), $N prompts/block, prompt 0 discarded"
-        echo "flags: CP_BUDGET=512 CP_PAGER_SYS=1 CP_PREFETCH_W=4"
+        echo "binary: $(TZ=UTC stat -c '%y' "$BIN")  md5: $(md5sum "$BIN" | cut -d' ' -f1)"
+        echo "design: $REPS reps, arm order counterbalanced across reps, $N prompts/block, prompt 0 discarded"
+        echo "budgets: $BUDGETS   flags: CP_PAGER_SYS=1 CP_PREFETCH_W=4"
         echo
     } | tee "$RAW"
 fi
@@ -72,10 +72,14 @@ state() {
 #
 # Bounds: the highest offset probed is start + (N-1)*stride, and bench_mode only
 # guards `p < n_tok - prompt_T - 2` — if start is too large the guard never fires
-# and offs[i] lands out of bounds. n_tok/8 per rep keeps the max near 0.96*n_tok.
+# and offs[i] lands out of bounds. The rep stride must satisfy
+#     (REPS-1)/NSTART_DIV + (N-1)/(N+1) < 1
+# so div=8 permits at most 3 reps and div=16 permits at most 5. Counterbalancing
+# the arm order needs an EVEN rep count, which is why div=16 (REPS=4) exists.
+NSTART_DIV=${NSTART_DIV:-8}
 NTOK=$(( $(stat -c '%s' "$TOK") / 2 ))
 STRIDE=$(( NTOK / (N + 1) ))
-NSTART=$(( NTOK / 8 ))
+NSTART=$(( NTOK / NSTART_DIV ))
 MAXIDX=$(( (REPS - 1) * NSTART + (N - 1) * STRIDE ))
 if [ "$MAXIDX" -ge "$NTOK" ]; then
     echo "FATAL: prompt offsets would run past the end of $TOK" >&2
@@ -97,9 +101,28 @@ BUDGETS=${BUDGETS:-"512"}
 rep=0
 while [ "$rep" -lt "$REPS" ]; do
     start=$(( rep * NSTART ))
+    # Counterbalance the arm order across reps. The measured machine noise floor
+    # (8-17%: three l05@512 runs with byte-identical pager stats spanned
+    # 8.13/10.17/11.60 tok/s) is the same size as the effect under test, so a
+    # FIXED order lets any within-rep drift accumulate as an apparent arm
+    # advantage instead of cancelling it. Even reps run l05 first, odd reps l00
+    # first; the pooled paired difference then has order bias removed.
+    if [ $(( rep % 2 )) -eq 0 ]; then arms="l05 l00"; else arms="l00 l05"; fi
+    echo "  rep$rep arm order: $arms"
     for budget in $BUDGETS; do
-      for arm in l05 l00; do
+      for arm in $arms; do
         lbl="RECHECK rep$rep $arm B=$budget W=4 start=$start"
+        # AC is a precondition, checked per block, not per run. Battery costs
+        # ~24% on this machine (identical config: 8.13 tok/s battery vs 10.71 AC)
+        # and battery state can change mid-session — on 2026-09-28 the machine
+        # was unplugged between the header and the first block. Refuse before
+        # writing anything, so an aborted block leaves no partial record.
+        ac=$(cat /sys/class/power_supply/AC/online 2>/dev/null)
+        if [ "$ac" != "1" ]; then
+            echo "ABORT: AC offline (ac=$ac) before '$lbl' — refusing to measure on battery" >&2
+            echo "ABORT: AC offline before $lbl" >> "$RAW"
+            exit 1
+        fi
         echo "=== $lbl ==="
         {
             echo "=== $lbl ==="
