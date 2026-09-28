@@ -9,3 +9,5 @@ __pycache__/
 experiments/mmap_basics
 experiments/madvise_hints
 experiments/ssd_latency
+bench/results/q3/.tmp.*
+bench/results/q3/.recheck.*

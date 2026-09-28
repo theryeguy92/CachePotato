@@ -42,3 +42,521 @@ bench: weights/moe-scale-run/l00.cpw1v3
   prompt_T=48 gen_N=512 n_prompts=16 lam=0.000
   prompt  0:   63.6s    8.054 tok/s   (warm-up, excluded)
   prompt  1:   66.1s    7.747 tok/s
+=== CONTROL l00 B=512 W=4 ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l00.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.000
+  prompt  0:   39.8s   12.854 tok/s   (warm-up, excluded)
+  prompt  1:   41.8s   12.258 tok/s
+  prompt  2:   40.9s   12.507 tok/s
+  prompt  3:   41.8s   12.254 tok/s
+  prompt  4:   54.2s    9.446 tok/s
+  prompt  5:   78.3s    6.540 tok/s
+  prompt  6:   71.5s    7.164 tok/s
+  prompt  7:   58.7s    8.725 tok/s
+  prompt  8:   52.0s    9.839 tok/s
+  prompt  9:   64.9s    7.886 tok/s
+  prompt 10:   41.1s   12.450 tok/s
+  prompt 11:   40.3s   12.707 tok/s
+  prompt 12:   40.6s   12.616 tok/s
+  prompt 13:   57.9s    8.845 tok/s
+  prompt 14:   52.7s    9.711 tok/s
+  prompt 15:   66.5s    7.700 tok/s
+pager: 404 regions | budget 512 MB | prefetch W=4
+  all     : 851200 accesses, 815440 hits (95.80%), 40595.1 MB fetched
+  experts : 179200 accesses, 143514 hits (80.09%), 40277.4 MB fetched | prefetch: 0 fetches, 714016 already resident
+  35514 evictions, 40083 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=10.043 tok/s  sd=2.232  se=0.576  t=2.145
+  95% CI [8.807, 11.279]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=10.0432 sd=2.2322 ci_lo=8.8069 ci_hi=11.2795 n=15 file=weights/moe-scale-run/l00.cpw1v3
+=== l05 B=384 W=4 ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l05.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.500
+  prompt  0:   68.1s    7.515 tok/s   (warm-up, excluded)
+  prompt  1:   55.3s    9.267 tok/s
+  prompt  2:   79.5s    6.439 tok/s
+  prompt  3:   85.7s    5.976 tok/s
+  prompt  4:   47.8s   10.719 tok/s
+  prompt  5:   74.9s    6.838 tok/s
+  prompt  6:   67.4s    7.596 tok/s
+  prompt  7:   75.7s    6.766 tok/s
+  prompt  8:   75.5s    6.780 tok/s
+  prompt  9:   71.7s    7.142 tok/s
+  prompt 10:   86.2s    5.937 tok/s
+  prompt 11:   70.5s    7.265 tok/s
+  prompt 12:   70.4s    7.269 tok/s
+  prompt 13:   94.1s    5.440 tok/s
+  prompt 14:   72.5s    7.061 tok/s
+  prompt 15:   70.0s    7.319 tok/s
+pager: 404 regions | budget 384 MB | prefetch W=4
+  all     : 851200 accesses, 738334 hits (86.74%), 152767.1 MB fetched
+  experts : 179200 accesses, 82542 hits (46.06%), 109094.2 MB fetched | prefetch: 0 fetches, 714016 already resident
+  112734 evictions, 152385 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=7.188 tok/s  sd=1.313  se=0.339  t=2.145
+  95% CI [6.460, 7.915]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=7.1875 sd=1.3127 ci_lo=6.4605 ci_hi=7.9145 n=15 file=weights/moe-scale-run/l05.cpw1v3
+=== l00 B=384 W=4 ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l00.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.000
+  prompt  0:   88.4s    5.790 tok/s   (warm-up, excluded)
+  prompt  1:  138.4s    3.700 tok/s
+  prompt  2:  116.5s    4.396 tok/s
+  prompt  3:   60.3s    8.496 tok/s
+  prompt  4:   94.0s    5.448 tok/s
+  prompt  5:  102.6s    4.992 tok/s
+  prompt  6:  100.3s    5.104 tok/s
+  prompt  7:   96.8s    5.291 tok/s
+  prompt  8:   42.1s   12.160 tok/s
+  prompt  9:   98.2s    5.216 tok/s
+  prompt 10:  106.5s    4.805 tok/s
+  prompt 11:   98.1s    5.217 tok/s
+  prompt 12:   93.9s    5.454 tok/s
+  prompt 13:   99.3s    5.154 tok/s
+  prompt 14:   94.7s    5.405 tok/s
+  prompt 15:   93.8s    5.456 tok/s
+pager: 404 regions | budget 384 MB | prefetch W=4
+  all     : 851200 accesses, 697788 hits (81.98%), 251318.9 MB fetched
+  experts : 179200 accesses, 63620 hits (35.50%), 130450.8 MB fetched | prefetch: 0 fetches, 714016 already resident
+  153271 evictions, 250939 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=5.753 tok/s  sd=2.037  se=0.526  t=2.145
+  95% CI [4.625, 6.881]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=5.7530 sd=2.0367 ci_lo=4.6250 ci_hi=6.8810 n=15 file=weights/moe-scale-run/l00.cpw1v3
+=== l05 B=448 W=4 ===
+=== l05 B=448 W=4 ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l05.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.500
+  prompt  0:   66.5s    7.702 tok/s   (warm-up, excluded)
+  prompt  1:   47.5s   10.772 tok/s
+  prompt  2:   62.4s    8.209 tok/s
+  prompt  3:   43.5s   11.766 tok/s
+  prompt  4:   43.9s   11.655 tok/s
+  prompt  5:   65.3s    7.837 tok/s
+  prompt  6:   65.6s    7.805 tok/s
+  prompt  7:   47.0s   10.896 tok/s
+  prompt  8:   66.8s    7.667 tok/s
+  prompt  9:   57.9s    8.844 tok/s
+  prompt 10:   39.8s   12.855 tok/s
+  prompt 11:   59.5s    8.601 tok/s
+  prompt 12:   63.5s    8.069 tok/s
+  prompt 13:   42.9s   11.934 tok/s
+  prompt 14:   58.9s    8.696 tok/s
+  prompt 15:   57.3s    8.937 tok/s
+pager: 404 regions | budget 448 MB | prefetch W=4
+  all     : 851200 accesses, 794598 hits (93.35%), 64118.7 MB fetched
+  experts : 179200 accesses, 122672 hits (68.46%), 63801.0 MB fetched | prefetch: 0 fetches, 714016 already resident
+  56413 evictions, 63671 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=9.636 tok/s  sd=1.796  se=0.464  t=2.145
+  95% CI [8.641, 10.631]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=9.6362 sd=1.7961 ci_lo=8.6414 ci_hi=10.6309 n=15 file=weights/moe-scale-run/l05.cpw1v3
+=== l00 B=448 W=4 ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l00.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.000
+  prompt  0:   62.1s    8.248 tok/s   (warm-up, excluded)
+  prompt  1:   45.8s   11.175 tok/s
+  prompt  2:   69.2s    7.403 tok/s
+  prompt  3:   50.6s   10.112 tok/s
+  prompt  4:   66.6s    7.693 tok/s
+  prompt  5:   69.6s    7.355 tok/s
+  prompt  6:   67.7s    7.566 tok/s
+  prompt  7:   68.0s    7.533 tok/s
+  prompt  8:   46.4s   11.025 tok/s
+  prompt  9:   68.1s    7.523 tok/s
+  prompt 10:   66.5s    7.703 tok/s
+  prompt 11:   47.4s   10.806 tok/s
+  prompt 12:   69.3s    7.388 tok/s
+  prompt 13:   64.1s    7.992 tok/s
+  prompt 14:   64.3s    7.968 tok/s
+  prompt 15:   67.2s    7.624 tok/s
+pager: 404 regions | budget 448 MB | prefetch W=4
+  all     : 851200 accesses, 773022 hits (90.82%), 88470.7 MB fetched
+  experts : 179200 accesses, 101096 hits (56.42%), 88153.0 MB fetched | prefetch: 0 fetches, 714016 already resident
+  77989 evictions, 88023 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=8.458 tok/s  sd=1.477  se=0.381  t=2.145
+  95% CI [7.640, 9.275]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=8.4576 sd=1.4767 ci_lo=7.6398 ci_hi=9.2755 n=15 file=weights/moe-scale-run/l00.cpw1v3
+=== l05 B=576 W=4 ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l05.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.500
+  prompt  0:   39.8s   12.875 tok/s   (warm-up, excluded)
+  prompt  1:   41.2s   12.424 tok/s
+  prompt  2:   39.6s   12.925 tok/s
+  prompt  3:   41.8s   12.255 tok/s
+  prompt  4:   39.2s   13.065 tok/s
+  prompt  5:   39.3s   13.013 tok/s
+  prompt  6:   39.7s   12.900 tok/s
+  prompt  7:   39.5s   12.964 tok/s
+  prompt  8:   39.9s   12.827 tok/s
+  prompt  9:   47.0s   10.886 tok/s
+  prompt 10:   39.2s   13.062 tok/s
+  prompt 11:   44.4s   11.528 tok/s
+  prompt 12:   48.4s   10.568 tok/s
+  prompt 13:   44.5s   11.505 tok/s
+  prompt 14:   40.3s   12.695 tok/s
+  prompt 15:   40.2s   12.739 tok/s
+pager: 404 regions | budget 576 MB | prefetch W=4
+  all     : 851200 accesses, 845526 hits (99.33%), 6638.2 MB fetched
+  experts : 179200 accesses, 173600 hits (96.88%), 6320.5 MB fetched | prefetch: 0 fetches, 714016 already resident
+  5372 evictions, 6063 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=12.357 tok/s  sd=0.832  se=0.215  t=2.145
+  95% CI [11.896, 12.818]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=12.3571 sd=0.8318 ci_lo=11.8963 ci_hi=12.8178 n=15 file=weights/moe-scale-run/l05.cpw1v3
+=== l00 B=576 W=4 ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l00.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.000
+  prompt  0:   39.5s   12.972 tok/s   (warm-up, excluded)
+  prompt  1:   41.0s   12.485 tok/s
+  prompt  2:   39.6s   12.940 tok/s
+  prompt  3:   41.3s   12.406 tok/s
+  prompt  4:   47.0s   10.901 tok/s
+  prompt  5:   41.4s   12.353 tok/s
+  prompt  6:   40.1s   12.769 tok/s
+  prompt  7:   44.0s   11.644 tok/s
+  prompt  8:   39.0s   13.118 tok/s
+  prompt  9:   51.5s    9.934 tok/s
+  prompt 10:   40.9s   12.526 tok/s
+  prompt 11:   40.2s   12.746 tok/s
+  prompt 12:   39.6s   12.939 tok/s
+  prompt 13:   39.9s   12.847 tok/s
+  prompt 14:   40.5s   12.651 tok/s
+  prompt 15:   39.9s   12.833 tok/s
+pager: 404 regions | budget 576 MB | prefetch W=4
+  all     : 851200 accesses, 841980 hits (98.92%), 10640.4 MB fetched
+  experts : 179200 accesses, 170054 hits (94.90%), 10322.7 MB fetched | prefetch: 0 fetches, 714016 already resident
+  8918 evictions, 10065 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=12.339 tok/s  sd=0.873  se=0.225  t=2.145
+  95% CI [11.856, 12.823]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=12.3395 sd=0.8731 ci_lo=11.8559 ci_hi=12.8230 n=15 file=weights/moe-scale-run/l00.cpw1v3
+=== l05 B=640 W=4 ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l05.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.500
+  prompt  0:   39.0s   13.118 tok/s   (warm-up, excluded)
+  prompt  1:   39.7s   12.910 tok/s
+  prompt  2:   39.0s   13.118 tok/s
+  prompt  3:   39.1s   13.081 tok/s
+  prompt  4:   39.2s   13.058 tok/s
+  prompt  5:   39.1s   13.107 tok/s
+  prompt  6:   39.4s   12.991 tok/s
+  prompt  7:   39.8s   12.864 tok/s
+  prompt  8:   39.1s   13.089 tok/s
+  prompt  9:   39.5s   12.972 tok/s
+  prompt 10:   38.8s   13.197 tok/s
+  prompt 11:   39.1s   13.092 tok/s
+  prompt 12:   39.3s   13.043 tok/s
+  prompt 13:   39.1s   13.079 tok/s
+  prompt 14:   38.9s   13.164 tok/s
+  prompt 15:   39.4s   12.990 tok/s
+pager: 404 regions | budget 640 MB | prefetch W=4
+  all     : 851200 accesses, 849398 hits (99.79%), 2268.0 MB fetched
+  experts : 179200 accesses, 177472 hits (99.04%), 1950.3 MB fetched | prefetch: 0 fetches, 714016 already resident
+  1443 evictions, 1628 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=13.050 tok/s  sd=0.091  se=0.023  t=2.145
+  95% CI [13.000, 13.100]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=13.0502 sd=0.0907 ci_lo=13.0000 ci_hi=13.1004 n=15 file=weights/moe-scale-run/l05.cpw1v3
+=== l00 B=640 W=4 ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l00.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.000
+  prompt  0:   38.9s   13.150 tok/s   (warm-up, excluded)
+  prompt  1:   39.9s   12.842 tok/s
+  prompt  2:   39.0s   13.134 tok/s
+  prompt  3:   39.9s   12.840 tok/s
+  prompt  4:   39.7s   12.892 tok/s
+  prompt  5:   46.2s   11.075 tok/s
+  prompt  6:   46.6s   10.981 tok/s
+  prompt  7:   46.7s   10.966 tok/s
+  prompt  8:   46.3s   11.047 tok/s
+  prompt  9:   46.8s   10.929 tok/s
+  prompt 10:   45.2s   11.338 tok/s
+  prompt 11:   40.3s   12.711 tok/s
+  prompt 12:   39.2s   13.062 tok/s
+  prompt 13:   39.2s   13.063 tok/s
+  prompt 14:   40.3s   12.718 tok/s
+  prompt 15:   40.8s   12.555 tok/s
+pager: 404 regions | budget 640 MB | prefetch W=4
+  all     : 851200 accesses, 848918 hits (99.73%), 2809.8 MB fetched
+  experts : 179200 accesses, 176992 hits (98.77%), 2492.1 MB fetched | prefetch: 0 fetches, 714016 already resident
+  1923 evictions, 2170 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=12.144 tok/s  sd=0.935  se=0.241  t=2.145
+  95% CI [11.626, 12.661]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=12.1436 sd=0.9346 ci_lo=11.6259 ci_hi=12.6612 n=15 file=weights/moe-scale-run/l00.cpw1v3
+=== l05 B=736 W=4 ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l05.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.500
+  prompt  0:   38.9s   13.155 tok/s   (warm-up, excluded)
+  prompt  1:   38.6s   13.247 tok/s
+  prompt  2:   38.9s   13.167 tok/s
+  prompt  3:   39.0s   13.118 tok/s
+  prompt  4:   39.0s   13.139 tok/s
+  prompt  5:   38.8s   13.182 tok/s
+  prompt  6:   38.7s   13.214 tok/s
+  prompt  7:   38.9s   13.154 tok/s
+  prompt  8:   39.0s   13.122 tok/s
+  prompt  9:   38.8s   13.193 tok/s
+  prompt 10:   38.8s   13.198 tok/s
+  prompt 11:   38.9s   13.158 tok/s
+  prompt 12:   38.9s   13.157 tok/s
+  prompt 13:   39.0s   13.130 tok/s
+  prompt 14:   45.1s   11.348 tok/s
+  prompt 15:   46.0s   11.123 tok/s
+pager: 404 regions | budget 736 MB | prefetch W=4
+  all     : 851200 accesses, 850806 hits (99.95%), 678.8 MB fetched
+  experts : 179200 accesses, 178880 hits (99.82%), 361.2 MB fetched | prefetch: 0 fetches, 714016 already resident
+  0 evictions, 0 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=12.910 tok/s  sd=0.682  se=0.176  t=2.145
+  95% CI [12.532, 13.288]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=12.9101 sd=0.6821 ci_lo=12.5323 ci_hi=13.2878 n=15 file=weights/moe-scale-run/l05.cpw1v3
+=== l00 B=736 W=4 ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l00.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.000
+  prompt  0:   46.3s   11.067 tok/s   (warm-up, excluded)
+  prompt  1:   46.2s   11.090 tok/s
+  prompt  2:   46.0s   11.136 tok/s
+  prompt  3:   46.2s   11.079 tok/s
+  prompt  4:   46.1s   11.108 tok/s
+  prompt  5:   46.3s   11.057 tok/s
+  prompt  6:   46.3s   11.070 tok/s
+  prompt  7:   46.2s   11.089 tok/s
+  prompt  8:   46.2s   11.086 tok/s
+  prompt  9:   46.3s   11.052 tok/s
+  prompt 10:   46.3s   11.051 tok/s
+  prompt 11:   46.4s   11.042 tok/s
+  prompt 12:   46.4s   11.036 tok/s
+  prompt 13:   46.2s   11.075 tok/s
+  prompt 14:   46.2s   11.074 tok/s
+  prompt 15:   46.5s   11.022 tok/s
+pager: 404 regions | budget 736 MB | prefetch W=4
+  all     : 851200 accesses, 850806 hits (99.95%), 678.8 MB fetched
+  experts : 179200 accesses, 178880 hits (99.82%), 361.2 MB fetched | prefetch: 0 fetches, 714016 already resident
+  0 evictions, 0 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=11.071 tok/s  sd=0.029  se=0.008  t=2.145
+  95% CI [11.055, 11.087]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=11.0710 sd=0.0293 ci_lo=11.0548 ci_hi=11.0872 n=15 file=weights/moe-scale-run/l00.cpw1v3
+=== l05 B=512 W=1 spec-contract ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=1
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l05.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.500
+  prompt  0:   56.5s    9.061 tok/s   (warm-up, excluded)
+  prompt  1:   50.0s   10.240 tok/s
+  prompt  2:   48.9s   10.467 tok/s
+  prompt  3:   47.2s   10.843 tok/s
+  prompt  4:   47.0s   10.895 tok/s
+  prompt  5:   48.0s   10.657 tok/s
+  prompt  6:   48.0s   10.678 tok/s
+  prompt  7:   48.9s   10.476 tok/s
+  prompt  8:   47.5s   10.780 tok/s
+  prompt  9:   56.1s    9.134 tok/s
+  prompt 10:   46.9s   10.915 tok/s
+  prompt 11:   64.4s    7.951 tok/s
+  prompt 12:   47.0s   10.905 tok/s
+  prompt 13:   47.4s   10.796 tok/s
+  prompt 14:   54.9s    9.330 tok/s
+  prompt 15:   60.2s    8.504 tok/s
+pager: 404 regions | budget 512 MB | prefetch W=1
+  all     : 851200 accesses, 830723 hits (97.59%), 23345.8 MB fetched
+  experts : 179200 accesses, 158797 hits (88.61%), 23028.1 MB fetched | prefetch: 0 fetches, 179200 already resident
+  20231 evictions, 22833 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=10.171 tok/s  sd=0.964  se=0.249  t=2.145
+  95% CI [9.638, 10.705]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=10.1713 sd=0.9636 ci_lo=9.6376 ci_hi=10.7049 n=15 file=weights/moe-scale-run/l05.cpw1v3
+=== l00 B=512 W=1 spec-contract ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=1
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l00.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.000
+  prompt  0:   47.2s   10.844 tok/s   (warm-up, excluded)
+  prompt  1:   62.5s    8.197 tok/s
+  prompt  2:   44.5s   11.499 tok/s
+  prompt  3:   44.1s   11.607 tok/s
+  prompt  4:   49.8s   10.280 tok/s
+  prompt  5:   64.7s    7.919 tok/s
+  prompt  6:   60.1s    8.516 tok/s
+  prompt  7:   53.3s    9.613 tok/s
+  prompt  8:   39.3s   13.029 tok/s
+  prompt  9:   55.0s    9.316 tok/s
+  prompt 10:   41.0s   12.501 tok/s
+  prompt 11:   40.3s   12.710 tok/s
+  prompt 12:   40.6s   12.607 tok/s
+  prompt 13:   63.5s    8.069 tok/s
+  prompt 14:   57.3s    8.937 tok/s
+  prompt 15:   71.9s    7.124 tok/s
+pager: 404 regions | budget 512 MB | prefetch W=1
+  all     : 851200 accesses, 815442 hits (95.80%), 40592.9 MB fetched
+  experts : 179200 accesses, 143516 hits (80.09%), 40275.2 MB fetched | prefetch: 0 fetches, 179200 already resident
+  35512 evictions, 40081 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=10.128 tok/s  sd=2.031  se=0.524  t=2.145
+  95% CI [9.003, 11.253]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=10.1282 sd=2.0313 ci_lo=9.0032 ci_hi=11.2532 n=15 file=weights/moe-scale-run/l00.cpw1v3
+=== SENSITIVITY l05 B=512 W=4 UNPRIMED ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+bench: weights/moe-scale-run/l05.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.500
+  prompt  0:   55.4s    9.239 tok/s   (warm-up, excluded)
+  prompt  1:   44.2s   11.589 tok/s
+  prompt  2:   42.5s   12.044 tok/s
+  prompt  3:   40.1s   12.773 tok/s
+  prompt  4:   39.8s   12.859 tok/s
+  prompt  5:   41.6s   12.321 tok/s
+  prompt  6:   41.1s   12.471 tok/s
+  prompt  7:   42.2s   12.134 tok/s
+  prompt  8:   40.4s   12.670 tok/s
+  prompt  9:   50.8s   10.073 tok/s
+  prompt 10:   39.7s   12.887 tok/s
+  prompt 11:   58.5s    8.754 tok/s
+  prompt 12:   39.7s   12.886 tok/s
+  prompt 13:   40.3s   12.704 tok/s
+  prompt 14:   54.8s    9.342 tok/s
+  prompt 15:   60.1s    8.513 tok/s
+pager: 404 regions | budget 512 MB | prefetch W=4
+  all     : 851200 accesses, 830719 hits (97.59%), 23350.3 MB fetched
+  experts : 179200 accesses, 158793 hits (88.61%), 23032.6 MB fetched | prefetch: 0 fetches, 714016 already resident
+  20235 evictions, 22838 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=11.601 tok/s  sd=1.591  se=0.411  t=2.145
+  95% CI [10.720, 12.483]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=11.6015 sd=1.5914 ci_lo=10.7201 ci_hi=12.4828 n=15 file=weights/moe-scale-run/l05.cpw1v3
+=== SENSITIVITY l00 B=512 W=4 UNPRIMED ===
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+bench: weights/moe-scale-run/l00.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.000
+  prompt  0:   47.2s   10.838 tok/s   (warm-up, excluded)
+  prompt  1:   49.1s   10.437 tok/s
+  prompt  2:   48.2s   10.631 tok/s
+  prompt  3:   49.5s   10.349 tok/s
+  prompt  4:   55.2s    9.280 tok/s
+  prompt  5:   70.0s    7.312 tok/s
+  prompt  6:   65.4s    7.832 tok/s
+  prompt  7:   58.2s    8.804 tok/s
+  prompt  8:   46.8s   10.946 tok/s
+  prompt  9:   59.7s    8.572 tok/s
+  prompt 10:   47.8s   10.708 tok/s
+  prompt 11:   47.7s   10.737 tok/s
+  prompt 12:   47.6s   10.746 tok/s
+  prompt 13:   63.1s    8.111 tok/s
+  prompt 14:   57.3s    8.941 tok/s
+  prompt 15:   71.7s    7.144 tok/s
+pager: 404 regions | budget 512 MB | prefetch W=4
+  all     : 851200 accesses, 815440 hits (95.80%), 40595.1 MB fetched
+  experts : 179200 accesses, 143514 hits (80.09%), 40277.4 MB fetched | prefetch: 0 fetches, 714016 already resident
+  35514 evictions, 40083 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=9.370 tok/s  sd=1.363  se=0.352  t=2.145
+  95% CI [8.615, 10.125]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=9.3699 sd=1.3631 ci_lo=8.6150 ci_hi=10.1249 n=15 file=weights/moe-scale-run/l00.cpw1v3
+=== DENSE GPT-2 B=384 ===
+  primed 474 MB of page cache
+bench: weights/gpt2.bin
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.000
+  prompt  0:  192.3s    2.663 tok/s   (warm-up, excluded)
+  prompt  1:  177.1s    2.890 tok/s
+  prompt  2:  176.4s    2.903 tok/s
+  prompt  3:  176.7s    2.897 tok/s
+  prompt  4:  177.2s    2.890 tok/s
+  prompt  5:  177.7s    2.881 tok/s
+  prompt  6:  178.0s    2.877 tok/s
+  prompt  7:  181.4s    2.823 tok/s
+  prompt  8:  177.0s    2.892 tok/s
+  prompt  9:  177.9s    2.878 tok/s
+  prompt 10:  178.3s    2.872 tok/s
+  prompt 11:  177.9s    2.878 tok/s
+  prompt 12:  178.7s    2.865 tok/s
+  prompt 13:  177.9s    2.878 tok/s
+  prompt 14:  176.2s    2.906 tok/s
+  prompt 15:  175.7s    2.914 tok/s
+pager: 74 regions | budget 384 MB | prefetch W=4
+  all     : 672000 accesses, 474828 hits (70.66%), 813503.5 MB fetched
+  experts : 0 accesses, 0 hits (0.00%), 0.0 MB fetched | prefetch: 0 fetches, 0 already resident
+  197120 evictions, 813120 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=2.883 tok/s  sd=0.021  se=0.006  t=2.145
+  95% CI [2.871, 2.895]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=2.8829 sd=0.0214 ci_lo=2.8710 ci_hi=2.8948 n=15 file=weights/gpt2.bin
+=== DENSE GPT-2 B=512 ===
+  primed 474 MB of page cache
+bench: weights/gpt2.bin
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.000
+  prompt  0:   45.1s   11.356 tok/s   (warm-up, excluded)
+  prompt  1:   53.1s    9.639 tok/s
+  prompt  2:   47.6s   10.763 tok/s
+  prompt  3:   47.6s   10.745 tok/s
+  prompt  4:   52.9s    9.685 tok/s
+  prompt  5:   48.4s   10.569 tok/s
+  prompt  6:   43.5s   11.768 tok/s
+  prompt  7:   43.1s   11.866 tok/s
+  prompt  8:   43.6s   11.743 tok/s
+  prompt  9:   43.1s   11.873 tok/s
+  prompt 10:   48.3s   10.611 tok/s
+  prompt 11:   48.0s   10.656 tok/s
+  prompt 12:   47.7s   10.727 tok/s
+  prompt 13:   48.2s   10.627 tok/s
+  prompt 14:   50.9s   10.061 tok/s
+  prompt 15:   47.7s   10.739 tok/s
+pager: 74 regions | budget 512 MB | prefetch W=4
+  all     : 672000 accesses, 671926 hits (99.99%), 474.2 MB fetched
+  experts : 0 accesses, 0 hits (0.00%), 0.0 MB fetched | prefetch: 0 fetches, 0 already resident
+  0 evictions, 0 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=10.805 tok/s  sd=0.727  se=0.188  t=2.145
+  95% CI [10.402, 11.208]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=10.8049 sd=0.7272 ci_lo=10.4021 ci_hi=11.2077 n=15 file=weights/gpt2.bin
+=== DENSE GPT-2 B=736 ===
+  primed 474 MB of page cache
+bench: weights/gpt2.bin
+  prompt_T=48 gen_N=512 n_prompts=16 lam=0.000
+  prompt  0:   47.6s   10.753 tok/s   (warm-up, excluded)
+  prompt  1:   48.0s   10.659 tok/s
+  prompt  2:   51.8s    9.888 tok/s
+  prompt  3:   48.1s   10.634 tok/s
+  prompt  4:   47.4s   10.791 tok/s
+  prompt  5:   47.1s   10.867 tok/s
+  prompt  6:   47.8s   10.702 tok/s
+  prompt  7:   47.8s   10.717 tok/s
+  prompt  8:   47.3s   10.823 tok/s
+  prompt  9:   48.0s   10.670 tok/s
+  prompt 10:   47.1s   10.873 tok/s
+  prompt 11:   47.3s   10.826 tok/s
+  prompt 12:   49.8s   10.276 tok/s
+  prompt 13:   48.0s   10.678 tok/s
+  prompt 14:   50.1s   10.228 tok/s
+  prompt 15:   43.4s   11.788 tok/s
+pager: 74 regions | budget 736 MB | prefetch W=4
+  all     : 672000 accesses, 671926 hits (99.99%), 474.2 MB fetched
+  experts : 0 accesses, 0 hits (0.00%), 0.0 MB fetched | prefetch: 0 fetches, 0 already resident
+  0 evictions, 0 MB evicted
+
+bench summary: n=15 (prompt 0 discarded)  mean=10.695 tok/s  sd=0.410  se=0.106  t=2.145
+  95% CI [10.468, 10.921]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=10.6946 sd=0.4096 ci_lo=10.4677 ci_hi=10.9215 n=15 file=weights/gpt2.bin
