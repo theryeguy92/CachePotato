@@ -1,0 +1,191 @@
+=== Q3 arm recheck 2026-09-28T18:15:33-04:00 — paired/interleaved, single session ===
+git: f7367c23c902c3c50a49a566aafb853bae250073
+binary: 2026-09-28 22:00:40.878520966 +0000  md5: 208bd051d1ebd25f81c12db9037b5e10
+design: 4 reps, arm order counterbalanced across reps, 6 prompts/block, prompt 0 discarded
+budgets: 384   flags: CP_PAGER_SYS=1 CP_PREFETCH_W=4
+
+=== RECHECK rep0 l05 B=384 W=4 start=0 ===
+  state: ac=1 bat=Charging bat_uW=20834000 gov=powersave cpu_khz=2600067 pkg_temp_mC=55000 memavail_kb=9650148
+  wall=460s  prompt_sum=419s  drift=41s  ok
+  state: ac=1 bat=Charging bat_uW=14782000 gov=powersave cpu_khz=2400405 pkg_temp_mC=55000 memavail_kb=9785576
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l05.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=6 lam=0.500
+  prompt  0:   75.4s    6.787 tok/s  [cpu_khz=2999853 pkg_temp_mC=61000]   (warm-up, excluded)
+  prompt  1:   66.9s    7.648 tok/s  [cpu_khz=3100120 pkg_temp_mC=60000]
+  prompt  2:   69.6s    7.355 tok/s  [cpu_khz=3100551 pkg_temp_mC=59000]
+  prompt  3:   67.5s    7.591 tok/s  [cpu_khz=2999254 pkg_temp_mC=58000]
+  prompt  4:   66.7s    7.672 tok/s  [cpu_khz=3100180 pkg_temp_mC=60000]
+  prompt  5:   73.0s    7.018 tok/s  [cpu_khz=3000000 pkg_temp_mC=58000]
+pager: 404 regions | budget 384 MB | prefetch W=4
+  all     : 319200 accesses, 277621 hits (86.97%), 53484.8 MB fetched
+  experts : 67200 accesses, 29624 hits (44.08%), 42410.6 MB fetched | prefetch: 0 fetches, 267756 already resident
+  core    : 252000 accesses, 247997 hits (98.41%), 11074.2 MB fetched
+  41447 evictions, 53101 MB evicted
+
+bench summary: n=5 (prompt 0 discarded)  mean=7.457 tok/s  sd=0.275  se=0.123  t=2.776
+  95% CI [7.115, 7.799]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=7.4569 sd=0.2754 ci_lo=7.1149 ci_hi=7.7988 n=5 file=weights/moe-scale-run/l05.cpw1v3
+=== RECHECK rep0 l00 B=384 W=4 start=0 ===
+  state: ac=1 bat=Charging bat_uW=14782000 gov=powersave cpu_khz=2417869 pkg_temp_mC=57000 memavail_kb=9785340
+  wall=616s  prompt_sum=564s  drift=52s  ok
+  state: ac=1 bat=Charging bat_uW=8876000 gov=powersave cpu_khz=2893492 pkg_temp_mC=59000 memavail_kb=9585248
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l00.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=6 lam=0.000
+  prompt  0:   88.0s    5.818 tok/s  [cpu_khz=2999812 pkg_temp_mC=58000]   (warm-up, excluded)
+  prompt  1:   95.7s    5.349 tok/s  [cpu_khz=3098484 pkg_temp_mC=58000]
+  prompt  2:   93.7s    5.465 tok/s  [cpu_khz=3000969 pkg_temp_mC=60000]
+  prompt  3:  103.1s    4.964 tok/s  [cpu_khz=2999896 pkg_temp_mC=59000]
+  prompt  4:   92.0s    5.567 tok/s  [cpu_khz=3100382 pkg_temp_mC=61000]
+  prompt  5:   92.4s    5.539 tok/s  [cpu_khz=3099912 pkg_temp_mC=61000]
+pager: 404 regions | budget 384 MB | prefetch W=4
+  all     : 319200 accesses, 258858 hits (81.10%), 95702.0 MB fetched
+  experts : 67200 accesses, 21205 hits (31.56%), 51912.8 MB fetched | prefetch: 0 fetches, 267756 already resident
+  core    : 252000 accesses, 237653 hits (94.31%), 43789.2 MB fetched
+  60208 evictions, 95318 MB evicted
+
+bench summary: n=5 (prompt 0 discarded)  mean=5.377 tok/s  sd=0.246  se=0.110  t=2.776
+  95% CI [5.072, 5.682]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=5.3767 sd=0.2456 ci_lo=5.0718 ci_hi=5.6816 n=5 file=weights/moe-scale-run/l00.cpw1v3
+=== RECHECK rep1 l00 B=384 W=4 start=938050 ===
+  state: ac=1 bat=Charging bat_uW=8876000 gov=powersave cpu_khz=2700034 pkg_temp_mC=58000 memavail_kb=9584988
+  wall=657s  prompt_sum=608s  drift=49s  ok
+  state: ac=1 bat=Charging bat_uW=4496000 gov=powersave cpu_khz=2804585 pkg_temp_mC=55000 memavail_kb=10065952
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l00.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=6 lam=0.000
+  prompt  0:   91.2s    5.615 tok/s  [cpu_khz=3100260 pkg_temp_mC=61000]   (warm-up, excluded)
+  prompt  1:  100.4s    5.098 tok/s  [cpu_khz=3044509 pkg_temp_mC=61000]
+  prompt  2:  126.9s    4.034 tok/s  [cpu_khz=3099545 pkg_temp_mC=58000]
+  prompt  3:   93.4s    5.484 tok/s  [cpu_khz=3000343 pkg_temp_mC=61000]
+  prompt  4:  102.9s    4.977 tok/s  [cpu_khz=3000127 pkg_temp_mC=58000]
+  prompt  5:   93.5s    5.478 tok/s  [cpu_khz=3099209 pkg_temp_mC=57000]
+pager: 404 regions | budget 384 MB | prefetch W=4
+  all     : 319200 accesses, 256924 hits (80.49%), 102516.7 MB fetched
+  experts : 67200 accesses, 20852 hits (31.03%), 52311.2 MB fetched | prefetch: 0 fetches, 267756 already resident
+  core    : 252000 accesses, 236072 hits (93.68%), 50205.4 MB fetched
+  62132 evictions, 102134 MB evicted
+
+bench summary: n=5 (prompt 0 discarded)  mean=5.014 tok/s  sd=0.593  se=0.265  t=2.776
+  95% CI [4.278, 5.750]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=5.0141 sd=0.5928 ci_lo=4.2781 ci_hi=5.7501 n=5 file=weights/moe-scale-run/l00.cpw1v3
+=== RECHECK rep1 l05 B=384 W=4 start=938050 ===
+  state: ac=1 bat=Charging bat_uW=4496000 gov=powersave cpu_khz=2899964 pkg_temp_mC=55000 memavail_kb=10065432
+  wall=471s  prompt_sum=432s  drift=39s  ok
+  state: ac=1 bat=Charging bat_uW=2765000 gov=powersave cpu_khz=2499798 pkg_temp_mC=61000 memavail_kb=9996144
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l05.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=6 lam=0.500
+  prompt  0:   70.8s    7.232 tok/s  [cpu_khz=3101162 pkg_temp_mC=58000]   (warm-up, excluded)
+  prompt  1:   72.5s    7.061 tok/s  [cpu_khz=3030180 pkg_temp_mC=58000]
+  prompt  2:   71.2s    7.188 tok/s  [cpu_khz=3100046 pkg_temp_mC=61000]
+  prompt  3:   73.3s    6.988 tok/s  [cpu_khz=3099989 pkg_temp_mC=62000]
+  prompt  4:   80.5s    6.357 tok/s  [cpu_khz=3100229 pkg_temp_mC=63000]
+  prompt  5:   64.2s    7.978 tok/s  [cpu_khz=2969757 pkg_temp_mC=63000]
+pager: 404 regions | budget 384 MB | prefetch W=4
+  all     : 319200 accesses, 275082 hits (86.18%), 58375.3 MB fetched
+  experts : 67200 accesses, 28458 hits (42.35%), 43726.6 MB fetched | prefetch: 0 fetches, 267756 already resident
+  core    : 252000 accesses, 246624 hits (97.87%), 14648.7 MB fetched
+  43986 evictions, 57992 MB evicted
+
+bench summary: n=5 (prompt 0 discarded)  mean=7.114 tok/s  sd=0.579  se=0.259  t=2.776
+  95% CI [6.395, 7.834]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=7.1143 sd=0.5794 ci_lo=6.3949 ci_hi=7.8336 n=5 file=weights/moe-scale-run/l05.cpw1v3
+=== RECHECK rep2 l05 B=384 W=4 start=1876100 ===
+  state: ac=1 bat=Charging bat_uW=2765000 gov=powersave cpu_khz=2700196 pkg_temp_mC=61000 memavail_kb=9995884
+  wall=452s  prompt_sum=413s  drift=39s  ok
+  state: ac=1 bat=Full bat_uW=0 gov=powersave cpu_khz=2600087 pkg_temp_mC=59000 memavail_kb=10061512
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l05.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=6 lam=0.500
+  prompt  0:   65.9s    7.772 tok/s  [cpu_khz=3100992 pkg_temp_mC=60000]   (warm-up, excluded)
+  prompt  1:   75.5s    6.779 tok/s  [cpu_khz=3094415 pkg_temp_mC=60000]
+  prompt  2:   73.0s    7.009 tok/s  [cpu_khz=3077935 pkg_temp_mC=60000]
+  prompt  3:   66.6s    7.687 tok/s  [cpu_khz=3100302 pkg_temp_mC=62000]
+  prompt  4:   69.6s    7.353 tok/s  [cpu_khz=3102573 pkg_temp_mC=63000]
+  prompt  5:   62.6s    8.177 tok/s  [cpu_khz=3100483 pkg_temp_mC=60000]
+pager: 404 regions | budget 384 MB | prefetch W=4
+  all     : 319200 accesses, 278964 hits (87.39%), 51654.0 MB fetched
+  experts : 67200 accesses, 30769 hits (45.79%), 41118.3 MB fetched | prefetch: 0 fetches, 267756 already resident
+  core    : 252000 accesses, 248195 hits (98.49%), 10535.7 MB fetched
+  40104 evictions, 51270 MB evicted
+
+bench summary: n=5 (prompt 0 discarded)  mean=7.401 tok/s  sd=0.554  se=0.248  t=2.776
+  95% CI [6.714, 8.089]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=7.4011 sd=0.5538 ci_lo=6.7135 ci_hi=8.0887 n=5 file=weights/moe-scale-run/l05.cpw1v3
+=== RECHECK rep2 l00 B=384 W=4 start=1876100 ===
+  state: ac=1 bat=Full bat_uW=0 gov=powersave cpu_khz=2699823 pkg_temp_mC=59000 memavail_kb=10061512
+  wall=625s  prompt_sum=574s  drift=51s  ok
+  state: ac=1 bat=Full bat_uW=0 gov=powersave cpu_khz=2600058 pkg_temp_mC=57000 memavail_kb=9816400
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l00.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=6 lam=0.000
+  prompt  0:   93.5s    5.474 tok/s  [cpu_khz=2999898 pkg_temp_mC=61000]   (warm-up, excluded)
+  prompt  1:   94.0s    5.444 tok/s  [cpu_khz=3000103 pkg_temp_mC=61000]
+  prompt  2:  106.6s    4.802 tok/s  [cpu_khz=3002415 pkg_temp_mC=59000]
+  prompt  3:   86.9s    5.890 tok/s  [cpu_khz=3092241 pkg_temp_mC=57000]
+  prompt  4:  103.0s    4.971 tok/s  [cpu_khz=3098321 pkg_temp_mC=56000]
+  prompt  5:   90.1s    5.684 tok/s  [cpu_khz=3102105 pkg_temp_mC=61000]
+pager: 404 regions | budget 384 MB | prefetch W=4
+  all     : 319200 accesses, 258381 hits (80.95%), 97809.7 MB fetched
+  experts : 67200 accesses, 21238 hits (31.60%), 51875.6 MB fetched | prefetch: 0 fetches, 267756 already resident
+  core    : 252000 accesses, 237143 hits (94.10%), 45934.2 MB fetched
+  60675 evictions, 97427 MB evicted
+
+bench summary: n=5 (prompt 0 discarded)  mean=5.358 tok/s  sd=0.463  se=0.207  t=2.776
+  95% CI [4.784, 5.933]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=5.3583 sd=0.4626 ci_lo=4.7841 ci_hi=5.9326 n=5 file=weights/moe-scale-run/l00.cpw1v3
+=== RECHECK rep3 l00 B=384 W=4 start=2814150 ===
+  state: ac=1 bat=Full bat_uW=0 gov=powersave cpu_khz=2600335 pkg_temp_mC=56000 memavail_kb=9815924
+  wall=617s  prompt_sum=567s  drift=50s  ok
+  state: ac=1 bat=Full bat_uW=0 gov=powersave cpu_khz=2681506 pkg_temp_mC=58000 memavail_kb=9746576
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l00.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=6 lam=0.000
+  prompt  0:   92.6s    5.529 tok/s  [cpu_khz=3000850 pkg_temp_mC=57000]   (warm-up, excluded)
+  prompt  1:   97.7s    5.240 tok/s  [cpu_khz=3100472 pkg_temp_mC=57000]
+  prompt  2:   99.3s    5.156 tok/s  [cpu_khz=3100022 pkg_temp_mC=61000]
+  prompt  3:   96.7s    5.297 tok/s  [cpu_khz=3000147 pkg_temp_mC=60000]
+  prompt  4:   96.2s    5.322 tok/s  [cpu_khz=2907526 pkg_temp_mC=56000]
+  prompt  5:   84.8s    6.037 tok/s  [cpu_khz=3000005 pkg_temp_mC=59000]
+pager: 404 regions | budget 384 MB | prefetch W=4
+  all     : 319200 accesses, 257798 hits (80.76%), 97356.8 MB fetched
+  experts : 67200 accesses, 20501 hits (30.51%), 52707.4 MB fetched | prefetch: 0 fetches, 267756 already resident
+  core    : 252000 accesses, 237297 hits (94.17%), 44649.4 MB fetched
+  61267 evictions, 96973 MB evicted
+
+bench summary: n=5 (prompt 0 discarded)  mean=5.410 tok/s  sd=0.356  se=0.159  t=2.776
+  95% CI [4.968, 5.852]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=5.4105 sd=0.3561 ci_lo=4.9684 ci_hi=5.8525 n=5 file=weights/moe-scale-run/l00.cpw1v3
+=== RECHECK rep3 l05 B=384 W=4 start=2814150 ===
+  state: ac=1 bat=Full bat_uW=0 gov=powersave cpu_khz=2700647 pkg_temp_mC=57000 memavail_kb=9746576
+  wall=465s  prompt_sum=424s  drift=41s  ok
+  state: ac=1 bat=Full bat_uW=0 gov=powersave cpu_khz=2499927 pkg_temp_mC=56000 memavail_kb=9739320
+pager: 404 regions (320 experts x 1183488 bytes), prefetch W=4
+  primed 701 MB of page cache
+bench: weights/moe-scale-run/l05.cpw1v3
+  prompt_T=48 gen_N=512 n_prompts=6 lam=0.500
+  prompt  0:   71.9s    7.119 tok/s  [cpu_khz=3001891 pkg_temp_mC=60000]   (warm-up, excluded)
+  prompt  1:   75.3s    6.800 tok/s  [cpu_khz=2999820 pkg_temp_mC=64000]
+  prompt  2:   70.2s    7.298 tok/s  [cpu_khz=3000424 pkg_temp_mC=61000]
+  prompt  3:   71.5s    7.163 tok/s  [cpu_khz=3100059 pkg_temp_mC=57000]
+  prompt  4:   66.9s    7.655 tok/s  [cpu_khz=3000155 pkg_temp_mC=58000]
+  prompt  5:   69.0s    7.420 tok/s  [cpu_khz=3010011 pkg_temp_mC=58000]
+pager: 404 regions | budget 384 MB | prefetch W=4
+  all     : 319200 accesses, 276361 hits (86.58%), 56130.8 MB fetched
+  experts : 67200 accesses, 29198 hits (43.45%), 42891.4 MB fetched | prefetch: 0 fetches, 267756 already resident
+  core    : 252000 accesses, 247163 hits (98.08%), 13239.4 MB fetched
+  42703 evictions, 55747 MB evicted
+
+bench summary: n=5 (prompt 0 discarded)  mean=7.267 tok/s  sd=0.318  se=0.142  t=2.776
+  95% CI [6.873, 7.662]   bar is >=7.0 at CP_BUDGET=512MB
+BENCH_RESULT mean=7.2672 sd=0.3177 ci_lo=6.8727 ci_hi=7.6616 n=5 file=weights/moe-scale-run/l05.cpw1v3
+RECHECK DONE — results in bench/results/q3/recheck-384.txt
