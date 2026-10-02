@@ -188,4 +188,4 @@ pager: 404 regions | budget 384 MB | prefetch W=4
 bench summary: n=5 (prompt 0 discarded)  mean=7.267 tok/s  sd=0.318  se=0.142  t=2.776
   95% CI [6.873, 7.662]   bar is >=7.0 at CP_BUDGET=512MB
 BENCH_RESULT mean=7.2672 sd=0.3177 ci_lo=6.8727 ci_hi=7.6616 n=5 file=weights/moe-scale-run/l05.cpw1v3
-RECHECK DONE — results in bench/results/q3/recheck-384.txt
+RECHECK DONE — results in bench/results/sweeps/2026-09-28-q3-recheck-384.txt

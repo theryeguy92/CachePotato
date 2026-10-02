@@ -26,8 +26,8 @@
 set -u
 cd "$(dirname "$0")/.."
 
-OUT=bench/results/q3
-RAW=${RAW:-"$OUT/recheck.txt"}
+OUT=bench/results/sweeps
+RAW=${RAW:-"$OUT/2026-09-28-q3-recheck.txt"}
 BIN=./build/cachepotato
 TOK=data/fineweb_edu_valid.bin
 REPS=${REPS:-3}

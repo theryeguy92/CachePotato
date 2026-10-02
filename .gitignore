@@ -6,8 +6,13 @@ data/*
 __pycache__/
 .venv/
 *.o
+
+# experiments/ holds Phase 0 scratch programs. The sources are tracked; the
+# compiled binaries produced by experiments/Makefile are not. A blanket
+# experiments/ rule would ignore the sources too, so target the *binaries*.
 experiments/mmap_basics
 experiments/madvise_hints
 experiments/ssd_latency
-bench/results/q3/.tmp.*
-bench/results/q3/.recheck.*
+
+# bench drivers write scratch files next to their results
+bench/results/**/.*

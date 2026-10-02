@@ -14,8 +14,8 @@
 set -u
 cd "$(dirname "$0")/.."
 
-OUT=bench/results/q3
-RAW="$OUT/raw.txt"
+OUT=bench/results/sweeps
+RAW="$OUT/2026-09-28-q3-raw.txt"
 BIN=./build/cachepotato
 TOK=data/fineweb_edu_valid.bin
 mkdir -p "$OUT"

@@ -20,7 +20,7 @@
 
 /* --- decoding config -------------------------------------------------------
    Both Phase 6 arms degenerate into phrase loops under long GREEDY decoding
-   (bench/results/quality-q2-2026-09-25.md), so the REPL defaults to nucleus
+   (bench/results/routing/2026-09-25-quality-q2.md), so the REPL defaults to nucleus
    sampling. --greedy restores the previous behaviour. */
 static double g_temp = 0.8;
 static double g_top_p = 0.95;
