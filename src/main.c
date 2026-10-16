@@ -14,7 +14,7 @@
 #include "model.h"
 #include "pager.h"
 #include "replay.h"
-#include "tokenizer.h"
+#include "tokenizers/tokenizer.h"
 #include "weights.h"
 
 #define EOS_TOKEN 50256 /* GPT-2 <|endoftext|> */
