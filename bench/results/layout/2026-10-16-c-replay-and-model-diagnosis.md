@@ -1,3 +1,11 @@
+> **SUPERSEDED 2026-10-16 (later the same day).** This note called the model-vs-engine
+> gap "diagnosed but NOT closed". It is now closed: `2026-10-16-t2-validated.md` is the two bugs — the
+> pager does **not** reset at a sequence boundary (it is process-wide, which is why
+> the engine's miss count equals the distinct-region count), and the core footprint
+> actually charged is ~317.7 MiB, not 340.3. With both fixed the replay reproduces
+> the engine's hit rate to 0.00 points at 736 MB and -3.1 at 384 MB. Read
+> [`2026-10-16-t2-validated.md`](2026-10-16-t2-validated.md) instead. The measurements below remain valid.
+
 # C replay simulator: the traffic model was never wrong — the comparison was
 
 **Date:** 2026-10-16 · **Branch:** `feat/universal-ports-tier-b` · **Status: T2 instrument

@@ -49,36 +49,39 @@ FIDELITY, STATED UP FRONT
   - Bytes per expert are a parameter, so the same trace answers "what if the experts
     were quantized to N bits" without recording a new trace.
 
-STATUS: CORRECT BUT NOT YET COMPARABLE TO THE ENGINE'S NUMBERS
-  An earlier version of this docstring reported that this model "under-predicts the
-  engine by 5-26 points" and blamed the model. That verdict was WRONG. The model is
-  correct: it now agrees with the independent C replay simulator
-  (`cachepotato --pager-sim`, src/replay.c) to the decimal, on both arms --
+STATUS: VALIDATED AGAINST THE ENGINE (2026-10-16)
+  The model reproduces the engine's own expert hit rate across the whole budget curve
+  when run over a trace recorded from the same bench structure:
 
-      l05 384MB 29.60%   l05 512MB 62.48%   l05 736MB 95.37%   l00 512MB 55.83%
-      (C:         29.60%        62.48%          95.37%           55.83%)
+      budget   engine   model   delta
+      384 MB   44.38%   41.25%  -3.13
+      448 MB   68.46%   67.84%  -0.62
+      512 MB   88.61%   86.84%  -1.77
+      576 MB   96.88%   96.72%  -0.16
+      640 MB   99.04%   99.01%  -0.03
+      736 MB   99.82%   99.82%  +0.00
 
-  -- so the disagreement is in the COMPARISON, not the model. With no capacity
-  pressure at all (`--ps-budget 4000`) the replay still reports 95.37% and peak
-  resident = the whole 320-region pool, which means the ~4.6% of misses it reports
-  are not capacity misses: they are the cold touches implied by the TRACE's own reset
-  structure. The replay measures the trace, not the pager.
+  Two bugs had to be fixed to get here, and both are worth knowing about:
 
-  Concretely: at 736MB the engine records 323 expert misses (~one expert pool, 320),
-  while this model over the same routing data reports ~11,500. A ~35x difference in
-  reset frequency explains it -- the trace has 488 windows, the Q3 measurement has 16
-  prompts. Distinguishing the two candidate causes (contiguous trace windows vs a
-  different bench prompt structure) needs a trace recorded with the bench's exact
-  structure and replayed against that same run's counters.
+  1. THE PAGER DOES NOT RESET AT A SEQUENCE BOUNDARY. It is process-wide and persists
+     across prompts. Over the engine's 16-prompt bench its expert miss count equals the
+     DISTINCT region count (320), not 16x it. This model used to reset its LRU at every
+     window boundary, which made it over-report misses ~35x on the same routing data.
+     `--reset-on-eos` exists to test the EOS case; the default is off.
+  2. THE CORE FOOTPRINT THAT IS ACTUALLY CHARGED IS ~317.7 MiB, not the 340.3 MiB the
+     region list sums to. When the budget binds, not every non-expert region is resident;
+     the engine's own `pager_report` resident line shows core 317.7 MB + experts 65.5 MB
+     = 383.1 MB of a 384 MB budget. Using the computed 340.3 under-provisioned capacity
+     and made tight budgets read ~10 points too low.
 
-  Ruled out by measurement: prefetch is inert here (CP_PREFETCH_W=0 gives 44.38% at
-  384MB vs 44.08% at W=4, and 88.61% at 512MB identically), and core-footprint
-  arithmetic is not the issue.
+  The residual is 0 to -3.1 points, worst at the tightest budget where capacity is
+  ~58 regions for a 320-region pool. Use it for layout/budget comparisons; treat the
+  tightest point as approximate.
 
-  Until the trace/counter mismatch is resolved, use this model for WITHIN-TRACE
-  comparisons (layout A vs layout B at fixed budget) and never for absolute claims
-  about what the engine will achieve. Evidence:
-  bench/results/layout/2026-10-16-c-replay-and-model-diagnosis.md.
+  Caveat carried over: this validates the RESIDENCY model against the engine's hit
+  counters. It does not validate that a "miss" costs a real disk read — pager.c reports
+  its own tracking, and with CP_PAGER_SYS=1 the kernel page cache behaviour on btrfs is
+  still the open methodological question recorded in the vault.
 """
 
 import argparse
@@ -91,8 +94,11 @@ from cpw1_trace import LatencyModel, load_trace  # noqa: E402
 
 # Measured on l05.cpw1v3: expert_floats(768,192)*4 = 1,183,488 bytes.
 L05_EXPERT_BYTES = 1_183_488
-# l05's pager-tracked non-expert footprint, from the CPW1 v3 layout region by region.
-L05_CORE_BYTES = int(340.3 * 1024 * 1024)
+# l05's RESIDENT non-expert footprint (317.7 MiB), measured by the engine's pager_report
+# rather than computed from the region list (340.3 MiB). The computed sum over-counts:
+# when the budget binds, not every non-expert region is resident. Using 340.3 MB
+# under-provisioned expert capacity and made tight-budget hit rates ~10 points low.
+L05_CORE_BYTES = int(317.7 * 1024 * 1024)
 
 
 def _truncate(tr, n):
@@ -134,7 +140,8 @@ class Lru:
         self.res.clear()
 
 
-def simulate(trace, region_bytes, budget_bytes, expert_bytes, core_bytes=0):
+def simulate(trace, region_bytes, budget_bytes, expert_bytes, core_bytes=0,
+             reset_on_eos=False):
     """Run the residency model. Returns a metrics dict."""
     g = max(1, int(region_bytes // expert_bytes))       # experts per region
     n_slots, n_exp = trace.n_slots, trace.n_experts
@@ -148,7 +155,11 @@ def simulate(trace, region_bytes, budget_bytes, expert_bytes, core_bytes=0):
     acc = hits = loads = 0
     tokens = 0
     for w in range(trace.n_windows):
-        lru.reset()
+        # NO reset at the window boundary. The engine's pager is process-wide and
+        # persists across prompts: over a 16-prompt bench its miss count equals the
+        # DISTINCT region count (320), not 16x that. Resetting here made the model
+        # report ~35x the engine's misses on the same routing data — the single bug
+        # that made this model look wrong when it was not (see the evidence note).
         for t in range(trace.window_len):
             tokens += 1
             for s in range(n_slots):
@@ -159,7 +170,7 @@ def simulate(trace, region_bytes, budget_bytes, expert_bytes, core_bytes=0):
                         hits += 1
                     else:
                         loads += 1
-            if trace.tokens[w, t] == trace.eos:
+            if reset_on_eos and trace.tokens[w, t] == trace.eos:
                 lru.reset()
 
     per_tok = lambda x: x / tokens if tokens else 0.0       # noqa: E731
@@ -222,6 +233,9 @@ def main():
                     help="comma-separated region sizes (K/M suffixes ok)")
     ap.add_argument("--sweep-expert-bits", default="",
                     help="comma-separated expert bit-widths, e.g. 16,8,4,2")
+    ap.add_argument("--reset-on-eos", action="store_true",
+                    help="reset the LRU at EOS (the pager does NOT reset at a window "
+                         "boundary; see simulate()'s comment)")
     ap.add_argument("--limit-windows", type=int, default=0,
                     help="use only the first N trace windows (0 = all); the full 488 "
                          "windows take ~30 s per configuration in this pure-Python LRU")
@@ -249,6 +263,7 @@ def main():
         tr = _truncate(tr, args.limit_windows)
     lat = LatencyModel()
     core = args.core_bytes_mb * 1024 * 1024
+    reos = args.reset_on_eos
     print(f"trace   : {tr.summary()}")
     print(f"curve   : {lat.describe()}")
 
@@ -262,7 +277,7 @@ def main():
         print(f"  {'budget':>7} {'cap':>5} {'cap/slot':>9} {'model':>8} {'measured':>9} {'delta':>7}")
         rows = []
         for b, mh in meas.get(arm, {}).items():
-            mm = simulate(tr, args.region_bytes, b * 1024 * 1024, args.expert_bytes, core)
+            mm = simulate(tr, args.region_bytes, b * 1024 * 1024, args.expert_bytes, core, reos)
             d = mm["engine_hit_rate"] - mh
             rows.append({"budget_mb": b, "measured": mh, "model": mm["engine_hit_rate"], **mm})
             print(f"  {b:7d} {mm['capacity_total']:5d} {mm['capacity_per_slot']:9.1f} "
@@ -272,7 +287,7 @@ def main():
             print(f"\nwrote {args.json}")
         return 0
 
-    m = simulate(tr, args.region_bytes, args.budget_mb * 1024 * 1024, args.expert_bytes, core)
+    m = simulate(tr, args.region_bytes, args.budget_mb * 1024 * 1024, args.expert_bytes, core, reos)
     pr = predict(m, lat, m["region_bytes"], args.compute_ms)
     print(f"\nconfig  : expert {args.expert_bytes/1024:.0f} KB | region {m['region_bytes']/1024:.0f} KB "
           f"({m['experts_per_region']} expert(s)) | budget {args.budget_mb:.0f} MB "
@@ -297,7 +312,7 @@ def main():
         print(f"  {'budget':>8} {'cap':>6} {'cap/slot':>9} {'hit%':>7} {'loads/tok':>10} {'MB/tok':>8} {'tok/s':>8}")
         rows = []
         for b in [float(x) for x in args.sweep_budgets.split(",")]:
-            mm = simulate(tr, args.region_bytes, b * 1024 * 1024, args.expert_bytes, core)
+            mm = simulate(tr, args.region_bytes, b * 1024 * 1024, args.expert_bytes, core, reos)
             pp = predict(mm, lat, mm["region_bytes"], args.compute_ms)
             rows.append({"budget_mb": b, **mm, **pp})
             print(f"  {b:8.0f} {mm['capacity_total']:6d} {mm['capacity_per_slot']:9.1f} "
@@ -310,7 +325,7 @@ def main():
         print(f"  {'region':>9} {'exp/reg':>8} {'cap':>6} {'hit%':>7} {'loads/tok':>10} {'MB/tok':>8} {'tok/s':>8}")
         rows = []
         for rb in parse_sizes(args.sweep_regions):
-            mm = simulate(tr, rb, args.budget_mb * 1024 * 1024, args.expert_bytes, core)
+            mm = simulate(tr, rb, args.budget_mb * 1024 * 1024, args.expert_bytes, core, reos)
             pp = predict(mm, lat, mm["region_bytes"], args.compute_ms)
             rows.append({"region_bytes": rb, **mm, **pp})
             print(f"  {rb/1024:8.0f}K {mm['experts_per_region']:8d} {mm['capacity_total']:6d} "
@@ -324,7 +339,7 @@ def main():
         rows = []
         for bits in [float(x) for x in args.sweep_expert_bits.split(",")]:
             eb = int(L05_EXPERT_BYTES * bits / 16.0)
-            mm = simulate(tr, eb, args.budget_mb * 1024 * 1024, eb, core)
+            mm = simulate(tr, eb, args.budget_mb * 1024 * 1024, eb, core, reos)
             pp = predict(mm, lat, mm["region_bytes"], args.compute_ms)
             rows.append({"bits": bits, "expert_bytes": eb, **mm, **pp})
             print(f"  {bits:5.1f} {eb/1024:7.0f} {mm['capacity_total']:6d} "

@@ -39,17 +39,28 @@
 
 #define RPY_MAGIC 0x31505452u /* "RTP1" little-endian */
 
+/* The header is NINE 4-byte fields = 36 bytes, and it is written as a raw struct, so
+   its size is part of the file format. This constant existed wrong twice (32, then a
+   "packed" 32 with lam_bits reordered): the first version made tools/npz_to_rtp1.py
+   place the payload 4 bytes early, silently turning every expert id into garbage
+   (ids read back as hundreds, out of range). The static assert below makes the C side
+   fail to compile rather than write a file whose layout disagrees with its writer. */
+#define RPY_HDR_BYTES 36
+
 typedef struct {
     uint32_t magic;
     uint32_t version;
+    uint32_t lam_bits;   /* lambda, bit-cast f32 (provenance) */
     int32_t  n_slots;    /* MoE layers                        */
     int32_t  n_windows;  /* sequences                         */
     int32_t  window_len; /* tokens per sequence               */
     int32_t  topk;       /* experts selected per token        */
     int32_t  n_exp;      /* expert id space                   */
     int32_t  eos;        /* eos token id; resets the LRU      */
-    int32_t  lam_bits;   /* lambda, bit-cast f32 (provenance) */
 } ReplayHeader;
+
+_Static_assert(sizeof(ReplayHeader) == RPY_HDR_BYTES,
+               "ReplayHeader size changed — update tools/npz_to_rtp1.py and RPY_HDR_BYTES");
 
 typedef struct {
     ReplayHeader h;
@@ -76,8 +87,13 @@ typedef struct {
     long core_bytes;      /* non-expert regions charged against the budget */
     long region_bytes;    /* bytes per pageable region                     */
     long expert_bytes;    /* bytes per expert block                        */
-    int  limit_windows;   /* 0 = all                                       */
-    int  reset_windows;   /* 1 = reset LRU at each window boundary         */
+    int  limit_windows;   /* 0 = all                                                  */
+    int  reset_on_eos;    /* 1 = reset the LRU at EOS (default 0). NOTE: the pager does
+                             NOT reset at a sequence/prompt boundary — it is process-wide
+                             and persists across prompts, which is why the engine's miss
+                             count over 16 prompts equals the DISTINCT region count, not
+                             16x it. Modelling a per-window reset made every benchmark
+                             look ~35x worse than the engine it was modelling. */
 } ReplayConfig;
 
 /* Loads the RTP1 trace. Returns 0 on success, -1 with a message on stderr. */

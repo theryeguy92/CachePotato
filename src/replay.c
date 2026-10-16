@@ -122,7 +122,7 @@ int replay_run(const ReplayTrace *t, const ReplayConfig *cfg, ReplayStats *st) {
               ? cfg->limit_windows : t->h.n_windows;
 
     for (int w = 0; w < W; w++) {
-        if (cfg->reset_windows) { lru_reset(&lru); st->resets++; }
+        /* no reset at window boundaries: the pager is process-wide (see replay.h) */
         for (int p = 0; p < t->h.window_len; p++) {
             st->tokens++;
             for (int s = 0; s < t->h.n_slots; s++) {
@@ -137,7 +137,8 @@ int replay_run(const ReplayTrace *t, const ReplayConfig *cfg, ReplayStats *st) {
                 }
             }
             if (lru.used > st->max_resident) st->max_resident = lru.used;
-            if (t->tokens[(size_t)w * t->h.window_len + p] == t->h.eos) {
+            if (cfg->reset_on_eos &&
+                t->tokens[(size_t)w * t->h.window_len + p] == t->h.eos) {
                 lru_reset(&lru); st->resets++;
             }
         }

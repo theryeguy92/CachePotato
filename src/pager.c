@@ -219,9 +219,27 @@ void pager_enforce(void) {
     }
 }
 
+/* Resident-byte breakdown. Exists because the trace replay needs to know the
+   pager's REAL expert capacity, and the byte arithmetic (budget - core) did not
+   reproduce the measured hit rates at tight budgets. Prints the resident split so
+   the effective capacity is observed rather than inferred. */
+static void pager_report_resident(void) {
+    long core_b = 0, exp_b = 0, core_n = 0, exp_n = 0;
+    for (int i = 0; i < n_regions; i++) {
+        if (!regions[i].resident) continue;
+        if (expert_base >= 0 && i >= expert_base) { exp_b += (long)regions[i].bytes; exp_n++; }
+        else { core_b += (long)regions[i].bytes; core_n++; }
+    }
+    fprintf(stderr, "  resident  : core %ld regions/%.1f MB | experts %ld/%ld regions/%.1f MB"
+                    " | total %.1f MB of budget %ld MB\n",
+            core_n, core_b / 1048576.0, exp_n, (long)(n_regions - expert_base),
+            exp_b / 1048576.0, (core_b + exp_b) / 1048576.0, budget / 1048576);
+}
+
 void pager_report(void) {
     if (budget < 0)
         return;
+    pager_report_resident();
     long access = n_hits + n_misses;
     long eaccess = n_ehits + n_emisses;
     /* Core = the hot tier (token_emb, pos_emb, attention, shared experts, dense

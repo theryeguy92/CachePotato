@@ -4,7 +4,9 @@
 > decimal on both arms, so the model was never the problem; the *comparison* was (the
 > trace's reset structure differs from the bench's). Read
 > [`2026-10-16-c-replay-and-model-diagnosis.md`](2026-10-16-c-replay-and-model-diagnosis.md)
-> for the corrected conclusion. The measurements and the two ruled-out hypotheses below
+> for the corrected conclusion. **Final status: the model is VALIDATED** — see
+> [`2026-10-16-t2-validated.md`](2026-10-16-t2-validated.md) for the two real bugs (a per-window reset the engine does not do,
+> and a 22 MB core-footprint error) and the full validation table. The measurements and the two ruled-out hypotheses below
 > remain valid and are still the supporting evidence.
 
 # Phase 8 T2 — traffic model: built, and its first validation FAILED

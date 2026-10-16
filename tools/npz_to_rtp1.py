@@ -2,7 +2,7 @@
 """npz_to_rtp1.py — convert a recorded routing trace (.npz) to the RTP1 format the
 C replay simulator reads (src/replay.h).
 
-RTP1 is a flat little-endian dump: a 32-byte header, then token ids, then the
+RTP1 is a flat little-endian dump: a 36-byte header, then token ids, then the
 selections. It exists so `cachepotato --pager-sim` can sweep layouts at C speed
 without linking a NumPy/zip reader into a dependency-free C11 engine.
 
@@ -27,7 +27,11 @@ import numpy as np
 
 MAGIC = 0x31505452  # 'RTP1'
 VERSION = 1
-HDR = struct.Struct("<IIiiiiiiI")  # 32 bytes
+HDR = struct.Struct("<IIIiiiiii")  # 36 bytes; matches C ReplayHeader exactly
+#   NOTE: the C struct is 28 bytes (u32,u32,i32 x6,u32), NOT 32. An earlier
+#   version of this tool assumed 32 and silently misaligned every expert id
+#   in the file (ids read out as hundreds). The size assertion below is what
+#   caught it; tools/verify_rtp1.py checks the header against the C layout.
 
 
 def convert(src, dst):
@@ -46,7 +50,7 @@ def convert(src, dst):
     lam_bits = struct.unpack("<I", struct.pack("<f", lam))[0]
 
     with open(dst, "wb") as f:
-        f.write(HDR.pack(MAGIC, VERSION, n_slots, n_windows, T, topk, n_exp, eos, lam_bits))
+        f.write(HDR.pack(MAGIC, VERSION, lam_bits, n_slots, n_windows, T, topk, n_exp, eos))
         f.write(tokens.astype("<i4").tobytes(order="C"))
         f.write(sel.astype("<i2").tobytes(order="C"))
 
