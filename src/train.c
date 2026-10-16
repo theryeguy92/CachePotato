@@ -17,7 +17,7 @@
 #include <time.h>
 #include <stdint.h>
 
-#include "kernels.h"
+#include "kernels/kernels.h"
 #include "weights.h"
 
 /* ---------------- config ---------------- */

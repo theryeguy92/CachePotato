@@ -1,6 +1,6 @@
 #include "model.h"
 #include "instr.h"
-#include "kernels.h"
+#include "kernels/kernels.h"
 #include "pager.h"
 
 #include <math.h>
