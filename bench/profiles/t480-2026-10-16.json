@@ -1,0 +1,16 @@
+{
+  "schema": "cachepotato-machine-profile/1",
+  "measured_at": "Fri Oct 16 16:06:43 2026",
+  "note": "T480 i5-8250U, SanDisk SD8SB8U SATA SSD, btrfs; file 30GB > 16GB RAM",
+  "machine": {"host": "T480", "ram_bytes": 16506933248, "page_size": 4096, "logical_block_size": 512, "cpus": 8},
+  "read_latency": [
+    {"bytes": 4096, "fadvise": {"n": 300, "p50_us": 334.3, "p95_us": 441.2, "max_us": 790.0, "mb_per_s": 13.97}, "odirect": {"n": 300, "p50_us": 387.7, "p95_us": 492.8, "max_us": 885.0, "mb_per_s": 12.11}},
+    {"bytes": 16384, "fadvise": {"n": 300, "p50_us": 209.7, "p95_us": 489.6, "max_us": 607.0, "mb_per_s": 65.36}, "odirect": {"n": 300, "p50_us": 196.2, "p95_us": 259.8, "max_us": 401.1, "mb_per_s": 92.91}},
+    {"bytes": 65536, "fadvise": {"n": 60, "p50_us": 246.5, "p95_us": 290.5, "max_us": 433.2, "mb_per_s": 295.95}, "odirect": {"n": 60, "p50_us": 231.5, "p95_us": 353.4, "max_us": 483.0, "mb_per_s": 340.43}},
+    {"bytes": 262144, "fadvise": {"n": 60, "p50_us": 347.9, "p95_us": 401.8, "max_us": 542.6, "mb_per_s": 819.88}, "odirect": {"n": 60, "p50_us": 341.9, "p95_us": 447.5, "max_us": 568.2, "mb_per_s": 836.07}},
+    {"bytes": 1048576, "fadvise": {"n": 60, "p50_us": 749.5, "p95_us": 1031.7, "max_us": 1312.9, "mb_per_s": 1349.87}, "odirect": {"n": 60, "p50_us": 856.2, "p95_us": 1171.1, "max_us": 1521.5, "mb_per_s": 1311.31}},
+    {"bytes": 4194304, "fadvise": {"n": 60, "p50_us": 4412.8, "p95_us": 8140.8, "max_us": 8995.5, "mb_per_s": 898.31}, "odirect": {"n": 60, "p50_us": 4064.7, "p95_us": 5513.6, "max_us": 6504.8, "mb_per_s": 1122.17}}
+  ],
+  "sequential_mb_per_s": 2443.6,
+  "compute_gflops": {"matmul_192x768_1t": 1.757, "matmul_192x768_8t": 11.670}
+}

@@ -5,7 +5,15 @@ BUILD   := build
 ENGINE  := src/weights.c src/kernels.c src/model.c src/tokenizer.c src/instr.c src/pager.c src/replay.c
 TRAINER := src/weights.c src/kernels.c src/train.c
 
+.PHONY: all calibrate
+
 all: $(BUILD)/cachepotato $(BUILD)/train
+
+# Host calibration probe (Phase 8 T3): measures the memory hierarchy and emits a
+# machine profile. Not part of the engine — a separate diagnostic binary.
+calibrate: tools/calibrate.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/calibrate $< -lm -lpthread
 
 $(BUILD)/cachepotato: src/main.c $(ENGINE)
 	@mkdir -p $(BUILD)

@@ -73,19 +73,23 @@ def load_trace(path) -> Trace:
 
 # ---------------------------------------------------------------- latency model
 
-# Measured on the T480 (i5-8250U, SanDisk SD8SB8U SATA SSD) with
-# POSIX_FADV_DONTNEED + random pread on a never-cached file, 2026-10-16.
+# Measured on the T480 (i5-8250U, SanDisk SD8SB8U SATA SSD, btrfs) by
+# tools/calibrate.c over a 30 GB file — i.e. LARGER THAN RAM, which is the only honest
+# protocol here: a smaller file is served from page cache and fadvise does not reliably
+# evict it on btrfs, so a cache measurement gets reported as disk latency. An earlier
+# table in this file came from a 0.2 GB file and overstated 4 KB latency by ~5x
+# (1705 us vs the 334 us measured properly, and vs the vault's older 227 us).
 # read_size_bytes -> (microseconds per read, MB/s)
 # NOTE: absolute values are contested (the vault records 227us for 4K from an earlier
 # run); the SHAPE of the curve is the load-bearing part. See the file docstring of
 # analysis/traffic.py and bench/results/layout/ for the discrepancy.
 T480_COLD = {
-    4096:    (1705.3, 2.40),
-    16384:   (1756.2, 9.33),
-    65536:   (1938.5, 33.81),
-    262144:  (2958.0, 88.62),
-    1048576: (4819.1, 217.59),
-    4194304: (13171.3, 318.44),
+    4096:    (334.3, 13.97),
+    16384:   (209.7, 65.36),
+    65536:   (246.5, 295.95),
+    262144:  (347.9, 819.88),
+    1048576: (749.5, 1349.87),
+    4194304: (4412.8, 898.31),
 }
 
 

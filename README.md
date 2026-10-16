@@ -81,23 +81,26 @@ rejection of it: the engine half stays the project's spine, while the trained-ro
 (λ) goes from prerequisite to optional upgrade. It does not weaken any earlier claim —
 "sparse + paging wins only where dense does not fit" carries over verbatim.
 
-**Why layout, specifically.** On the T480's SATA SSD, cold random reads cost ~1.7 ms
-almost regardless of size, so *how many* reads you issue binds long before *how many
-bytes* you move:
+**Why layout, specifically.** On the T480's SATA SSD, cold random reads cost a few
+hundred microseconds, and *how many* reads you issue binds well before *how many bytes*
+you move — a 64× throughput spread is available purely by choosing a larger read:
 
-| read size | µs/read | MB/s |
+| read size | µs/read (p50) | MB/s |
 |---:|---:|---:|
-| 4 KB | 1705 | 2.4 |
-| 64 KB | 1939 | 33.8 |
-| 256 KB | 2958 | 88.6 |
-| 1 MB | 4819 | 217.6 |
-| 4 MB | 13171 | 318.4 |
+| 4 KB | 334 | 14.0 |
+| 16 KB | 210 | 65.4 |
+| 64 KB | 247 | 296.0 |
+| 256 KB | 348 | 819.9 |
+| 1 MB | 750 | 1349.9 |
+| 4 MB | 4413 | 898.3 |
 
-That is a 130× throughput spread available purely by choosing a larger read — which is why
-expert ordering and region grouping, not just byte volume, are the lever. (Measured with
-`POSIX_FADV_DONTNEED` + random `pread` on a never-cached file. The vault's earlier 4 KB
-figure of ~227 µs is ~7.5× lower; the vault itself flags that number as pending a proper
-`drop_caches` run, so treat the absolute values here as one measurement set, not settled.)
+That is a 64× throughput spread available purely by choosing a larger read — which is why
+expert ordering and region grouping, not just byte volume, are the lever. Measured by
+`build/calibrate` over a **30 GB file (larger than RAM — the only honest protocol here,
+since a smaller file is served from page cache on btrfs and fadvise does not reliably
+evict it)**. An earlier version of this table used a 0.2 GB file and overstated 4 KB
+latency ~5×; the vault's older ~227 µs figure was substantially right. Full profile and
+method: [`bench/profiles/t480-2026-10-16.json`](bench/profiles/t480-2026-10-16.json).
 
 Two constraints carry over unchanged into every port:
 
