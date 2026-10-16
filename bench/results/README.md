@@ -58,6 +58,7 @@ step 180,000, identical corpus.
 |---|---|
 | [`2026-10-16-permutation-exactness.md`](layout/2026-10-16-permutation-exactness.md) | Does reordering experts in the weight file (with the router's columns permuted to match) leave the model unchanged? **PASS** — routing exactly invariant, logits fp32-equivalent (`max\|Δ\| = 5.722e-06`, relative 2.85e-07), C engine cross-check 0/1280. Records the correction that a permuted layout is **not** bit-identical, and the permutation-direction trap that made a correct file look broken twice |
 | [`2026-10-16-l05-permutation.json`](layout/2026-10-16-l05-permutation.json) | The exact per-layer permutations used (seed `20261016`) and the permuted file's sha256, so the experiment is byte-reproducible |
+| [`2026-10-16-traffic-model-validation.md`](layout/2026-10-16-traffic-model-validation.md) | The Phase 8 traffic model's **failed first validation**: it under-predicts the engine's expert hit rate by 5–26 points, so it is directional only. Records that prefetch and core arithmetic are ruled out, and that the effective capacity implied by measurement is up to 3.7× what the bytes allow — an open mechanism, most likely trace reset frequency |
 
 **Takeaway:** layout compilation is a verified symmetry at the routing level, which is what
 the universal-ports direction (`docs/2026-10-16-universal-ports.md`) depends on.
