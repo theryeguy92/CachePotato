@@ -213,6 +213,16 @@ int main(int argc, char **argv) {
     int have = (stat(path, &st) == 0);
     long want_bytes = want_mb * 1024L * 1024L;
     if (!have || st.st_size < want_bytes) {
+        /* SAFETY: never truncate an existing non-empty file. This binary's job is to
+           create a huge scratch file; if someone points it at real data (a weight file,
+           say) the right behaviour is to refuse, not to overwrite it. The RAM check
+           further down would catch a small file anyway, but only AFTER the truncation. */
+        if (have && st.st_size > 0) {
+            fprintf(stderr, "\nREFUSING to overwrite existing %s (%.1f GB).\n"
+                            "Point --file at a scratch path, or delete that file first.\n",
+                    path, st.st_size / 1e9);
+            return 1;
+        }
         printf("  creating %.1f GB (real data, not sparse)…\n", want_mb / 1024.0);
         int wfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (wfd < 0) { perror("create"); return 1; }
