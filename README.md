@@ -9,13 +9,14 @@
 [![Language](https://img.shields.io/badge/language-C11-555555?style=flat-square&logo=c&logoColor=white)](#build--run)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-none-brightgreen?style=flat-square)](#build--run)
 [![Build](https://img.shields.io/badge/build-make%20%C2%B7%20zero--config-orange?style=flat-square)](#build--run)
-[![Status](https://img.shields.io/badge/phase-7%20done%20%C2%B7%20gates%20pass-blue?style=flat-square)](#status)
+[![Status](https://img.shields.io/badge/phase-7%20done%20%C2%B7%20pivoting-blue?style=flat-square)](#status)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 
 <sub>SSD, RAM and CPU cache treated as one addressable memory space. </sub><br>
-<sub>Allowing a larger model to run on a machine, even a potato.</sub>
+<sub>Allowing a larger model to run on a machine, even a potato.</sub><br>
+<sub>Next: a model-agnostic engine, one port per open-weight model. See [Where this is going](#where-this-is-going).</sub>
 
-[**Results**](#results) · [**Build & run**](#build--run) · [**Status**](#status) · [**Reproduce**](#reproducing-the-benchmarks) · [**Experiment log**](bench/results/)
+[**Results**](#results) · [**Where this is going**](#where-this-is-going) · [**Build & run**](#build--run) · [**Status**](#status) · [**Reproduce**](#reproducing-the-benchmarks) · [**Experiment log**](bench/results/)
 
 </div>
 
@@ -37,6 +38,11 @@ the **co-design loop**:
   to pick experts whose weights the engine already has resident, rather than scattering
   reads across the whole weight file.
 
+**Phase 7 tested the second half of that loop on a hand-built model and got a conditional
+result** (§[Results](#results), and read the caveats in §[Limitations](#limitations--non-goals)).
+The project is now extending the **first** half — the engine — to open-weight models it
+did not train. That pivot is described in §[Where this is going](#where-this-is-going).
+
 ### Terminology
 
 | Symbol | Meaning |
@@ -51,6 +57,61 @@ the **co-design loop**:
 | **KV cache** | Saved per-token attention state during generation, so earlier tokens are not recomputed. |
 | **Prefetch** | Loading something from disk *before* it is needed, to hide the wait. |
 | **p < 0.05** | A significance test. It means a difference this large is unlikely to be luck. |
+
+## Where this is going
+
+Phase 7 answered the question it set out to answer for **one hand-built model on one
+machine**. The next step is to make the *engine* model-agnostic and add one **port** per
+open-weight model — starting with [Nemotron 3.5
+Bolt 74B-A9B](https://research.nvidia.com/labs/nemotron/Nemotron-3.5-Bolt-24GB/), whose
+open weights can be reshaped toward the engine rather than the engine being bolted onto
+them.
+
+The idea is for a port to be a **compilation** step, not a training run. A port is
+classified into exactly one tier, and the tier decides which gate it must pass:
+
+| Tier | What it changes | Router training | Numerics vs. the base model | Expected paging win |
+|---|---|---|:---:|---|
+| **A — as-is** | file format, kernels, block types | none | **exact** (`max\|Δ\| = 0`) | whatever the base model's routing already gives |
+| **B — layout** | expert file order, region grouping, prefetch, alignment | **none** | **exact** (a permutation) | large — it targets *read count* |
+| **C — co-design** | router weights (λ fine-tune), possibly top-K | required | exact only against *its own* recorded reference | largest; unproven at scale |
+
+**Tier B is the direction**, and it is a re-ordering of the original thesis rather than a
+rejection of it: the engine half stays the project's spine, while the trained-routing half
+(λ) goes from prerequisite to optional upgrade. It does not weaken any earlier claim —
+"sparse + paging wins only where dense does not fit" carries over verbatim.
+
+**Why layout, specifically.** On the T480's SATA SSD, cold random reads cost ~1.7 ms
+almost regardless of size, so *how many* reads you issue binds long before *how many
+bytes* you move:
+
+| read size | µs/read | MB/s |
+|---:|---:|---:|
+| 4 KB | 1705 | 2.4 |
+| 64 KB | 1939 | 33.8 |
+| 256 KB | 2958 | 88.6 |
+| 1 MB | 4819 | 217.6 |
+| 4 MB | 13171 | 318.4 |
+
+That is a 130× throughput spread available purely by choosing a larger read — which is why
+expert ordering and region grouping, not just byte volume, are the lever. (Measured with
+`POSIX_FADV_DONTNEED` + random `pread` on a never-cached file. The vault's earlier 4 KB
+figure of ~227 µs is ~7.5× lower; the vault itself flags that number as pending a proper
+`drop_caches` run, so treat the absolute values here as one measurement set, not settled.)
+
+Two constraints carry over unchanged into every port:
+
+- **Verification-first, exact.** A port's C output must reproduce its Python reference
+  bit-for-bit (`max|Δ| = 0`), and a Tier-A/B port must also reproduce the *base model's*
+  recorded routing. No tolerance is added for ports.
+- **Bit-identical pager byte counts apply to refactors, not to layout experiments.**
+  Reordering experts or changing region size changes what is resident, so byte counts
+  differ by design and need their own pre-registered protocol.
+
+Tier B does **not** claim model co-design, and it is conditional on the regime: if the
+model fits in RAM, paging has nothing to do and the engine should say so rather than
+pretend. Full statement, evidence, and open questions:
+[`docs/2026-10-16-universal-ports.md`](docs/2026-10-16-universal-ports.md).
 
 ## Results
 
@@ -114,9 +175,14 @@ floor is 8–17%, and the effect is content-dependent across the three document 
 - **The export is faithful at the routing level**, not merely loadable: the C engine
   reproduces the recorded PyTorch routing **100% (0/20,480 mismatches)** with logits
   identical to **0.000e+00**.
-- **A negative result on expert geometry.** Pairing 1.18 MB experts into 2.36 MB pages
-  roughly *doubles* bytes moved for at most an 8% read-count reduction. The 32 × 1.18 MB
-  layout is correct. ([`expert-grouping-2026-09-28.txt`](bench/results/sweeps/2026-09-28-expert-grouping.txt))
+- **A negative result on expert geometry — and it is specific to this geometry.** Pairing
+  1.18 MB experts into 2.36 MB pages roughly *doubles* bytes moved for at most an 8%
+  read-count reduction, so the 32 × 1.18 MB layout is correct **for this model on this
+  disk**. It is not a general rule: a 1.18 MB expert already clears the sequential-read
+  floor, so the conclusion does not transfer to a quantized MoE whose experts are ~10 KB.
+  The same run found the MoE's ~134 MB/s against dense's ~286 MB/s is an **access-order**
+  problem, not a read-size one.
+  ([`expert-grouping-2026-09-28.txt`](bench/results/sweeps/2026-09-28-expert-grouping.txt))
 
 ## How it works
 
@@ -208,6 +274,7 @@ python3 tools/verify_cpw1_v3.py                         # export + routing gate
 | `src/` | The engine, in C. `model` (forward + incremental decode), `weights` (mmap loader, CPW1 v2/v3), `pager` (regions, LRU, prefetch), `tokenizer` (GPT-2 BPE), `kernels`, `instr`, `train` |
 | `experiments/` | Phase 0 scratch programs — mmap/`madvise` probes, SSD latency. Learning artifacts, not engine code |
 | `tools/` | Python sidecar: HF/reference verification, weight + tokenizer conversion, trace analysis, bench drivers. **Never a runtime dependency** |
+| `docs/` | Dated direction notes — currently the universal-ports pivot and its evidence |
 | `bench/results/` | Committed benchmark output, including the pre-registered Q3 analysis |
 | `tests/` | C unit tests for the numerical kernels — currently a placeholder; verification today runs through `tools/` |
 | `weights/` | Model files — gitignored, regenerate with `tools/` |
@@ -219,6 +286,11 @@ python3 tools/verify_cpw1_v3.py                         # export + routing gate
 demo exists: a trained sparse model served by the paging engine, benchmarked against a dense
 baseline, with the locality hit rate reported.
 
+**In progress: universal ports.** The engine is being generalized from "one hand-built
+model" to "a model-agnostic engine plus one port per open-weight model", with weight
+*layout* as the primary port mechanism (Tier B above). Nothing in this section has moved
+yet — the engine, format, and results below are exactly as Phase 7 left them.
+
 | Phase | Scope | Status |
 |---|---|:---:|
 | 0 — Foundations | mmap/`madvise` primitives, SSD latency measurement | ✅ |
@@ -229,7 +301,8 @@ baseline, with the locality hit rate reported.
 | 5 — Training loop | C trainer with gradient-checked backprop | ✅ |
 | 6 — Scale training + data | PyTorch MoE trainer, FineWeb-Edu, λ=0/0.5 ablation | ✅ |
 | 7 — Integration | Paging engine + trained sparse model, Q1/Q2/Q3 gates | ✅ |
-| 8+ — Scale, agentic workloads | Tool calling, domain SFT, longer-context tiers | ⏳ planned |
+| 8 — Universal ports | `engine/` split, `format/SPEC.md`, first open-weight port (Tier B) | 🔜 planned |
+| 9+ — Scale, agentic workloads | Tool calling, domain SFT, longer-context tiers | ⏳ later |
 
 ## Limitations & non-goals
 
