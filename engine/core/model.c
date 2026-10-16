@@ -1,7 +1,7 @@
 #include "model.h"
 #include "instr.h"
 #include "kernels/kernels.h"
-#include "pager.h"
+#include "pager/pager.h"
 
 #include <math.h>
 #include <stdio.h>

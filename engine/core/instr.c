@@ -1,5 +1,5 @@
-#include "instr.h"
-#include "pager.h"
+#include "core/instr.h"
+#include "pager/pager.h"
 
 #include <stdio.h>
 #include <stdlib.h>

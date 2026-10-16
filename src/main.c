@@ -10,12 +10,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "instr.h"
-#include "model.h"
-#include "pager.h"
-#include "replay.h"
+#include "core/instr.h"
+#include "core/model.h"
+#include "pager/pager.h"
+#include "core/replay.h"
 #include "tokenizers/tokenizer.h"
-#include "weights.h"
+#include "core/weights.h"
 
 #define EOS_TOKEN 50256 /* GPT-2 <|endoftext|> */
 #define MAX_NEW 40

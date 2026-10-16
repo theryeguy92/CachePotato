@@ -18,7 +18,7 @@
 #include <stdint.h>
 
 #include "kernels/kernels.h"
-#include "weights.h"
+#include "core/weights.h"
 
 /* ---------------- config ---------------- */
 
