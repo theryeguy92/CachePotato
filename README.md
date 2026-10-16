@@ -274,12 +274,14 @@ python3 tools/verify_cpw1_v3.py                         # export + routing gate
 
 | Path | Purpose |
 |---|---|
-| `src/` | The engine, in C. `model` (forward + incremental decode), `weights` (mmap loader, CPW1 v2/v3), `pager` (regions, LRU, prefetch), `tokenizer` (GPT-2 BPE), `kernels`, `instr`, `train` |
+| `engine/` | The C runtime, model-agnostic. `core/` (mmap loader, CPW1 v2/v3, forward + incremental decode, trace replay), `pager/` (regions, LRU, prefetch), `kernels/`, `tokenizers/`, `blocks/` (**empty** — splitting `model.c`'s block types out of `core/` is a pending refactor) |
+| `format/` | [`SPEC.md`](format/SPEC.md) — the self-describing weight format (CPW1 v4 draft; not implemented yet) |
+| `src/` | `main.c` (CLI/REPL/bench/gates) and `train.c` (the C trainer) — the two entry points, now that the runtime lives in `engine/` |
 | `experiments/` | Phase 0 scratch programs — mmap/`madvise` probes, SSD latency. Learning artifacts, not engine code |
-| `tools/` | Python sidecar: HF/reference verification, weight + tokenizer conversion, trace analysis, bench drivers. **Never a runtime dependency** |
 | `docs/` | Dated direction notes — currently the universal-ports pivot and its evidence |
 | `bench/results/` | Committed benchmark output, including the pre-registered Q3 analysis |
-| `tests/` | C unit tests for the numerical kernels — currently a placeholder; verification today runs through `tools/` |
+| `tools/` | Python sidecar: HF/reference verification, weight + tokenizer conversion, trace analysis, bench drivers. **Never a runtime dependency** |
+| `tests/` | C unit tests for the numerical kernels — currently a placeholder; verification today runs through `tools/` and [`tools/run_gates.sh`](tools/run_gates.sh) |
 | `weights/` | Model files — gitignored, regenerate with `tools/` |
 | `data/` | Training corpora — gitignored |
 
