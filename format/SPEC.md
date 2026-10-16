@@ -46,22 +46,33 @@ not train, with no model-specific constants compiled into the engine.
 
 ## 3. File layout
 
-```
-magic "CPW4" (u32) | version = 4 (u32) | header_bytes (u32) | flags (u32)
-n_tensors (u32) | n_blocks (u32) | n_regions (u32) | n_encodings (u32)
-off_encodings (u64) | off_tensors (u64) | off_blocks (u64) | off_regions (u64)
-off_data (u64)                        # payload start; all tensors live at or after this
-reserved[4] (u32) = 0                 # must be zero; nonzero is a load error
---- encoding table (n_encodings records) ---
---- tensor table   (n_tensors records)   ---
---- block table    (n_blocks records)    ---
---- region table   (n_regions records)   ---
---- padding to off_data ---
---- payload: raw tensor bytes ---
-```
+| offset | field | type |
+|---:|---|---|
+| 0 | `magic` = `"CPW4"` | u32 |
+| 4 | `version` = 4 | u32 |
+| 8 | `header_bytes` | u32 |
+| 12 | `flags` | u32 |
+| 16 | `n_tensors` | u32 |
+| 20 | `n_blocks` | u32 |
+| 24 | `n_regions` | u32 |
+| 28 | `n_encodings` | u32 |
+| 32 | `off_encodings` | u64 |
+| 40 | `off_tensors` | u64 |
+| 48 | `off_blocks` | u64 |
+| 56 | `off_regions` | u64 |
+| 64 | `off_data` — payload start; all tensors live at or after this | u64 |
+| 72 | `reserved[4]` = 0 — nonzero is a load error | u32 ×4 |
+| | **`header_bytes` = 88** | |
 
-`header_bytes` is the size of the fixed header (so a future version can extend it).
-A loader that does not know `version` refuses the file.
+Then the four tables in the order listed, then zero padding to `off_data`, then the raw
+tensor bytes. `header_bytes` is the size of the fixed header so a future version can extend
+it; a loader that does not know `version` refuses the file.
+
+**This table is asserted, not hand-computed.** Earlier drafts of this document said 64 and
+then 68 — both simple miscounts of the same 16 + 16 + 40 + 16 bytes. The reference writer
+now builds the header from one explicit `struct.pack` and asserts its length against
+`HDR_BYTES`, so a miscount cannot reach a file. A number that is computed by hand twice and
+wrong twice should be computed by the machine instead.
 
 ## 4. Encoding table
 

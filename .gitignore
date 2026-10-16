@@ -23,3 +23,6 @@ scratch/
 
 # calibration probe test file: must exceed RAM to be meaningful (tens of GB)
 scratch/big.bin
+
+# generated CPW1 v4 test files (hundreds of MB; regenerate with tools/v3_to_v4.py)
+scratch/*.v4cp
