@@ -1,3 +1,12 @@
+> **SUPERSEDED 2026-10-16 (same day).** The verdict below — that the model
+> "under-predicts the engine" and is therefore untrustworthy — is **wrong**. The model
+> agrees with the independent C replay simulator (`cachepotato --pager-sim`) to the
+> decimal on both arms, so the model was never the problem; the *comparison* was (the
+> trace's reset structure differs from the bench's). Read
+> [`2026-10-16-c-replay-and-model-diagnosis.md`](2026-10-16-c-replay-and-model-diagnosis.md)
+> for the corrected conclusion. The measurements and the two ruled-out hypotheses below
+> remain valid and are still the supporting evidence.
+
 # Phase 8 T2 — traffic model: built, and its first validation FAILED
 
 **Date:** 2026-10-16 · **Branch:** `feat/universal-ports-tier-b` · **Status: partial.**

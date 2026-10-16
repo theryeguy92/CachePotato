@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 199309L /* clock_gettime with -std=c11 */
+#define _GNU_SOURCE         /* strdup/strtok_r with -std=c11 */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,7 @@
 #include "instr.h"
 #include "model.h"
 #include "pager.h"
+#include "replay.h"
 #include "tokenizer.h"
 #include "weights.h"
 
@@ -244,6 +246,71 @@ static int moe_sel_mode(const char *path, const char *tokbin, long start, int T,
     free(raw); free(toks); free(sel); free(logits);
     model_free(&m);
     return 0;
+}
+
+/* --- Phase 8 T2: pager residency replay --------------------------------------
+   Why this exists: analysis/traffic.py models this policy in Python and
+   under-predicts the engine's measured expert hit rate by 5-26 points, so it could
+   not be trusted to answer "which port, at what budget". src/replay.c implements the
+   residency policy directly and runs a full sweep in milliseconds, so the model and
+   the simulator can be compared against each other AND against the engine.
+
+   Two readings worth knowing before quoting a number:
+     - `reads`  = distinct cold region loads = physical I/O (the metric that matters
+                  on a latency-bound device);
+     - the engine-counter line = what pager.c itself would report, which counts one
+                  miss per expert TOUCH and so over-counts once a region holds >1 expert.
+   Pass --reset 0 to test the hypothesis that the trace's window boundaries are not
+   real sequence resets (the trace has many more windows than a bench has prompts). */
+static int pager_sim_mode(const char *trace_path, long budget_bytes, long region_bytes,
+                          long expert_bytes, long core_bytes, int limit_windows,
+                          int reset_windows, const char *sweep) {
+    ReplayTrace t;
+    if (replay_load(&t, trace_path) != 0)
+        return 1;
+    ReplayConfig cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.budget_bytes = budget_bytes;
+    cfg.core_bytes = core_bytes;
+    cfg.region_bytes = region_bytes > 0 ? region_bytes : expert_bytes;
+    cfg.expert_bytes = expert_bytes;
+    cfg.limit_windows = limit_windows;
+    cfg.reset_windows = reset_windows;
+
+    fprintf(stderr, "trace : %s — %d MoE slots x %d windows x %d tokens, top-%d, "
+            "N=%d, eos=%d\n", trace_path, t.h.n_slots, t.h.n_windows, t.h.window_len,
+            t.h.topk, t.h.n_exp, t.h.eos);
+    fprintf(stderr, "sim   : budget %ld MB, core %ld MB, region %ld B, expert %ld B, "
+            "reset_windows=%d%s\n", budget_bytes >> 20, core_bytes >> 20, cfg.region_bytes,
+            expert_bytes, reset_windows,
+            limit_windows ? "  (limited windows)" : "");
+
+    int rc = 0;
+    if (sweep && *sweep) {
+        printf("  %8s %6s %8s %9s %11s %10s\n", "budget", "cap", "hit%",
+               "reads/tok", "MB/token", "evictions");
+        char *spec = strdup(sweep), *save = NULL;
+        for (char *tok = strtok_r(spec, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+            ReplayConfig c = cfg;
+            c.budget_bytes = atol(tok) * 1024L * 1024L;
+            ReplayStats st;
+            if (replay_run(&t, &c, &st) != 0) { rc = 1; break; }
+            printf("  %8ld %6d %8.2f %9.3f %11.2f %10ld\n",
+                   c.budget_bytes >> 20, st.cap,
+                   st.acc ? 100.0 * (double)st.hits / (double)st.acc : 0.0,
+                   st.tokens ? (double)st.loads / (double)st.tokens : 0.0,
+                   st.tokens ? (double)st.loads * st.group * c.expert_bytes
+                               / (double)st.tokens / 1e6 : 0.0,
+                   st.evictions);
+        }
+        free(spec);
+    } else {
+        ReplayStats st;
+        if (replay_run(&t, &cfg, &st) != 0) rc = 1;
+        else replay_report(&st, &cfg);
+    }
+    replay_free(&t);
+    return rc;
 }
 
 /* --- Gate 1: incremental (KV-cached) vs full-sequence equivalence -----------
@@ -600,6 +667,11 @@ int main(int argc, char **argv) {
     const char *bn_bin = NULL;
     long bn_start = 0;
     int bn_prompt = 0, bn_gen = 0, bn_prompts = 0;
+    int pager_sim = 0;
+    const char *ps_trace = NULL;
+    long ps_budget = 512L * 1024 * 1024, ps_region = 0, ps_expert = 1183488L;
+    long ps_core = 340L * 1024 * 1024, ps_limit = 0, ps_reset = 1;
+    const char *ps_sweep = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc)
@@ -610,6 +682,24 @@ int main(int argc, char **argv) {
             g_max_new = atoi(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc)
             rng_seed(strtoull(argv[++i], NULL, 10));
+        else if (strcmp(argv[i], "--pager-sim") == 0 && i + 1 < argc) {
+            ps_trace = argv[++i];
+            pager_sim = 1;
+        }
+        else if (strcmp(argv[i], "--ps-budget") == 0 && i + 1 < argc)
+            ps_budget = atol(argv[++i]) * 1024L * 1024L;
+        else if (strcmp(argv[i], "--ps-region") == 0 && i + 1 < argc)
+            ps_region = atol(argv[++i]);          /* bytes; 0 = one expert */
+        else if (strcmp(argv[i], "--ps-expert") == 0 && i + 1 < argc)
+            ps_expert = atol(argv[++i]);
+        else if (strcmp(argv[i], "--ps-core") == 0 && i + 1 < argc)
+            ps_core = atol(argv[++i]) * 1024L * 1024L;
+        else if (strcmp(argv[i], "--ps-limit") == 0 && i + 1 < argc)
+            ps_limit = atol(argv[++i]);
+        else if (strcmp(argv[i], "--ps-reset") == 0 && i + 1 < argc)
+            ps_reset = atol(argv[++i]);
+        else if (strcmp(argv[i], "--ps-sweep") == 0 && i + 1 < argc)
+            ps_sweep = argv[++i];
         else if (strcmp(argv[i], "--greedy") == 0)
             g_temp = 0.0;
         else if (strcmp(argv[i], "--bench") == 0 && i + 5 < argc) {
@@ -649,6 +739,10 @@ int main(int argc, char **argv) {
         else if (T < 256)
             tokens[T++] = atoi(argv[i]);
     }
+
+    if (pager_sim)
+        return pager_sim_mode(ps_trace, ps_budget, ps_region, ps_expert, ps_core,
+                              (int)ps_limit, (int)ps_reset, ps_sweep);
 
     if (bench)
         return bench_mode(path, bn_bin, bn_start, bn_prompt, bn_gen, bn_prompts);

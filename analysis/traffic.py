@@ -49,32 +49,36 @@ FIDELITY, STATED UP FRONT
   - Bytes per expert are a parameter, so the same trace answers "what if the experts
     were quantized to N bits" without recording a new trace.
 
-STATUS: DIRECTIONAL, NOT YET QUANTITATIVE — USE ENGINE MEASUREMENTS INSTEAD
-  Validated against the engine's committed expert hit rates (Q3 protocol, L05):
-      384 MB  model 29.6%  vs measured 44.38%   (-14.8)
-      512 MB  model 62.5%  vs measured 88.61%   (-26.1)
-      736 MB  model 95.4%  vs measured 99.82%   (-4.5)
-  The model UNDER-predicts everywhere by 5-26 points, so it cannot be used to make a
-  quantitative claim about a budget yet. Two things are known about the gap:
+STATUS: CORRECT BUT NOT YET COMPARABLE TO THE ENGINE'S NUMBERS
+  An earlier version of this docstring reported that this model "under-predicts the
+  engine by 5-26 points" and blamed the model. That verdict was WRONG. The model is
+  correct: it now agrees with the independent C replay simulator
+  (`cachepotato --pager-sim`, src/replay.c) to the decimal, on both arms --
 
-    1. It is not prefetch (measured above) and not a capacity-arithmetic error: the
-       core footprint is 340.3 MiB of pager-tracked regions, which is arithmetic, and
-       it makes the 736 MB point (`ALL FIT`, near-100% expected) line up.
-    2. Inverting the measured hit rates (the access distribution is near-uniform, so
-       hit_rate ~ K/32 for K resident blocks per slot) gives an effective K of 14.1,
-       22.6 and (capped at the pool) 32+ for 384/512/736 MB — i.e. **3.7x, 1.5x and
-       1.0x the capacity the byte arithmetic allows**. An effective capacity larger
-       than the budget permits is not something the pager can do, so the model is
-       missing a mechanism, most likely the reset frequency: the trace has 488
-       windows, but the Q3 measurement has 16 prompts, and at 736 MB the engine's
-       total misses (323) equal almost exactly ONE expert pool (320), implying ~16
-       resets, not 488.
+      l05 384MB 29.60%   l05 512MB 62.48%   l05 736MB 95.37%   l00 512MB 55.83%
+      (C:         29.60%        62.48%          95.37%           55.83%)
 
-  Next step to close it (not done here): replay the trace through the **C engine** with
-  a `--pager-sim` mode instead of a second Python LRU. The engine is the ground truth
-  for its own policy, it already runs this workload in seconds, and a Python per-touch
-  LRU costs ~30 s per configuration — too slow to be the instrument, which is what
-  stalled this line of work. Until then: **quote engine measurements, not this model.**
+  -- so the disagreement is in the COMPARISON, not the model. With no capacity
+  pressure at all (`--ps-budget 4000`) the replay still reports 95.37% and peak
+  resident = the whole 320-region pool, which means the ~4.6% of misses it reports
+  are not capacity misses: they are the cold touches implied by the TRACE's own reset
+  structure. The replay measures the trace, not the pager.
+
+  Concretely: at 736MB the engine records 323 expert misses (~one expert pool, 320),
+  while this model over the same routing data reports ~11,500. A ~35x difference in
+  reset frequency explains it -- the trace has 488 windows, the Q3 measurement has 16
+  prompts. Distinguishing the two candidate causes (contiguous trace windows vs a
+  different bench prompt structure) needs a trace recorded with the bench's exact
+  structure and replayed against that same run's counters.
+
+  Ruled out by measurement: prefetch is inert here (CP_PREFETCH_W=0 gives 44.38% at
+  384MB vs 44.08% at W=4, and 88.61% at 512MB identically), and core-footprint
+  arithmetic is not the issue.
+
+  Until the trace/counter mismatch is resolved, use this model for WITHIN-TRACE
+  comparisons (layout A vs layout B at fixed budget) and never for absolute claims
+  about what the engine will achieve. Evidence:
+  bench/results/layout/2026-10-16-c-replay-and-model-diagnosis.md.
 """
 
 import argparse
