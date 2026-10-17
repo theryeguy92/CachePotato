@@ -121,3 +121,24 @@ python3 tools/verify_permutation_cpw1_v3.py \
 
 Both tools are deterministic (per-slot `default_rng(seed + slot)`); the permuted file is
 byte-reproducible from the seed and its sha256 is recorded in the report.
+
+
+## Correction (2026-10-17): the mechanism was misattributed
+
+This note originally said the logits moved "because permuting `Wr`'s columns changes the order
+in which the 768 products are accumulated". **That is wrong.** The router dot product sums over
+the *feature* axis, which a permutation of experts does not touch; instrumenting the engine
+showed the hidden state is **identical after layers 1 and 2**.
+
+The layout-dependent reduction is the **router softmax normalisation**, which sums `exp(score)`
+over the **expert axis** — exactly the axis the permutation reorders. Measured over 20,000
+random permutations, the denominator changes by ~1 fp32 ulp in **68%** of cases. In the engine
+the divergence first appears late (layer 8: probabilities `0.0407722071` vs `0.0407722108`),
+growing to `1.3e-05` in the logits. The routed-expert accumulation is already canonical: it
+sums in descending weight order, which is a function of the values rather than the layout.
+
+The measurements and the verdict in this note stand unchanged — routing exactly invariant,
+logits fp32-equivalent. Only the explanation was wrong. Making it bit-exact is **deferred**
+(see `format/SPEC.md` §10), because the engine currently matches PyTorch's routing 100% and a
+canonical softmax sum would shift it ~1 ulp away from PyTorch, risking that property for a
+benefit nothing yet consumes.

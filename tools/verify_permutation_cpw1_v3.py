@@ -31,9 +31,12 @@ PASS CRITERIA
   5. the C engine agrees with the permuted reference exactly
   6. the C engine's routing on the permuted file is exactly the base routing under perm
 
-  Criterion 4 is a tolerance, not an equality: reordering the router's columns
-  changes the summation order of the router matmul, which moves the last bits.
-  The measured max|delta| is recorded, not hidden. Criteria 1, 2, 5 and 6 are exact.
+  Criterion 4 is a tolerance, not an equality. The mechanism (corrected 2026-10-17):
+  reordering experts reorders the ROUTER SOFTMAX NORMALISATION, which sums exp() over the
+  expert axis — the axis the permutation reorders — shifting every probability by ~1 fp32
+  ulp in ~68% of cases. The router DOT PRODUCT and the routed-expert accumulation are both
+  order-stable and verified bit-identical. The measured max|delta| is recorded, not hidden;
+  criteria 1, 2, 5 and 6 are exact. Making it bit-exact is deferred: format/SPEC.md §10.
 
 USAGE
   python3 tools/verify_permutation_cpw1_v3.py \
@@ -206,9 +209,12 @@ def main():
     print("PERMUTATION GATE: PASS")
     print("  expert reorder + matching router permutation is a symmetry:")
     print("  routing equivariant exactly, logits identical to fp32 rounding (%.1e rel)." % rel)
-    print("  NOTE this is NOT bit-identical: router column order changes summation")
-    print("  order, so max|Δ| = %.1e, not 0. Layout compilation is float32-equivalent," % dmax)
-    print("  not bit-exact — machine-invariant claims must say 'exact routing + fp32-equal logits'.")
+    print("  NOTE this is NOT bit-identical: max|Δ| = %.1e, not 0." % dmax)
+    print("  The layout-dependent reduction is the ROUTER SOFTMAX NORMALISATION, which sums")
+    print("  exp() over the expert axis and therefore reorders under a permutation (~1 ulp in")
+    print("  ~68% of cases). The router dot product and the routed-expert accumulation are")
+    print("  both order-stable. So the honest claim is 'exact routing + fp32-equal logits'.")
+    print("  Making it bit-exact is deferred, not rejected: see format/SPEC.md section 10.")
     return 0
 
 

@@ -288,25 +288,39 @@ the project's existing numerical discipline.
 5. **Unknown ⇒ refuse.** An unknown block kind, unknown encoding, or an encoding the binary
    lacks must fail to load. Tested by a deliberately corrupted fixture.
 
-## 10. Exactness, and one numerics change to approve
+## 10. Exactness under layout permutation — mechanism, and a deferred decision
 
 Measured on v3 (see `bench/results/layout/2026-10-16-permutation-exactness.md`): permuting
 expert weights with a matching router permutation leaves **routing exactly invariant** but
-moves the logits by ~5.7e-06, because the router's columns are re-summed in a different
-order.
+moves the logits by ~5.7e-06.
 
-Two ways to specify this:
+**The mechanism, corrected 2026-10-17.** An earlier version of this section said the router's
+columns were "re-summed in a different order". That is wrong: the router dot product sums over
+the *feature* axis, which permuting experts does not touch, and it is bit-identical under
+permutation (verified by instrumenting the engine: layers 1–2 produce identical hidden states).
 
-- **Current behaviour.** Routing exact, logits fp32-equivalent. Cross-layout logits
-  comparisons need a tolerance.
-- **Recommended: canonical accumulation.** Require the routed output to be summed in a
-  canonical order (expert id ascending) *after* selection. Then a permutation is a
-  **bit-exact** symmetry and every gate stays `max|Δ| = 0`.
+The actual layout-dependent reduction is the **softmax normalisation**, which sums `exp(score)`
+over the **expert axis** — the axis a permutation reorders. Measured over 20,000 random
+permutations, the denominator changes by ~1 fp32 ulp in **68%** of cases, which shifts every
+probability slightly and can flip a near-tie; the resulting logit drift grows to ~1.3e-05
+across 12 layers. The routed-expert accumulation is already canonical: it sums in descending
+weight order, which is a function of the values, not of the layout.
 
-The second is cleaner and makes the project's strongest property — bit-exact gates — survive
-layout compilation. **It is a numerics change to the existing engine and therefore requires
-explicit approval before implementation.** Until then, v4 specifies the first behaviour with
-a stated tolerance.
+**Decision: deferred (2026-10-17).** Making this bit-exact is cheap — sum the exponentiated
+scores in sorted order, ~32·log32 comparisons per layer per token. It is deferred because of
+what it would cost, not what it would take:
+
+- The property layout compilation needs is that a **decision** does not change, and that
+  already holds exactly (routing is invariant under permutation).
+- PyTorch sums its softmax in its own order. Making the engine canonical would move it *away*
+  from PyTorch by ~1 ulp, so near-ties could flip and the port's **100% routing match against
+  recorded traces** could regress. Re-recording traces to accommodate that would be moving the
+  reference to fit the implementation.
+- Nothing currently consumes bit-identical cross-layout logits.
+
+Until a reproducibility guarantee ("same weights compiled for two machines ⇒ identical bytes")
+is needed, v4 specifies the first behaviour: **routing exact, logits fp32-equivalent**, with a
+stated tolerance. Recorded in the vault as deliberately deferred.
 
 ## 11. What a port must ship
 
