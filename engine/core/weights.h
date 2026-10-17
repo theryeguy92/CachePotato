@@ -65,6 +65,12 @@ typedef struct {
     int fd;
     float *data;      /* mmap base */
     size_t file_size;
+    float *v4_scratch; /* v4 only: the engine-layout copy of the tensors. A v4 file makes no
+                         promise about tensor order, and the forward pass indexes per-layer
+                         arrays by stride, so the loader copies each tensor into its slot
+                         (~366 MB for the current model) rather than assuming layout. A
+                         v4-native forward pass would remove the copy; that is a later
+                         change, and this one keeps the acceptance test about the FILE. */
 } Model;
 
 /* Load + validate + mmap the weight file (CPW1 v2 or v3). Returns 0 on success,
@@ -95,3 +101,6 @@ int moe_layer_at(const Model *m, int l);
 void model_evict_all(Model *m);
 
 #endif
+
+/* --- CPW1 v4 (format/SPEC.md) --- */
+#include "weights_v4.h"

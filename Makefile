@@ -2,8 +2,8 @@ CC      ?= cc
 CFLAGS  ?= -O3 -march=native -Wall -Wextra -std=c11 -Iengine
 LDLIBS  ?= -lm
 BUILD   := build
-ENGINE  := engine/core/weights.c engine/kernels/kernels.c engine/core/model.c engine/tokenizers/tokenizer.c engine/core/instr.c engine/pager/pager.c engine/core/replay.c
-TRAINER := engine/core/weights.c engine/kernels/kernels.c src/train.c
+ENGINE  := engine/core/weights.c engine/core/weights_v4.c engine/kernels/kernels.c engine/core/model.c engine/tokenizers/tokenizer.c engine/core/instr.c engine/pager/pager.c engine/core/replay.c
+TRAINER := engine/core/weights.c engine/core/weights_v4.c engine/kernels/kernels.c src/train.c
 
 .PHONY: all calibrate
 

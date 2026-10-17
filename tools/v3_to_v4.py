@@ -176,18 +176,35 @@ def main():
                        refs=[tid["token_emb"], tid["pos_emb"]],
                        params=[cfg.vocab, D, cfg.n_ctx]))
     for l in range(L):
+        # attention block (SPEC §7 row 0x10). The v3 test model has MHA with
+        # head_dim == d_model/n_heads and n_kv_heads == n_heads, which is what the loader
+        # accepts; GQA heads with a different head_dim are refused rather than mis-read.
+        blocks.append(dict(kind=KIND_ATTN, layer=l,
+                           refs=[tid[n] for n in ("Wq", "bq", "Wk", "bk",
+                                                  "Wv", "bv", "Wo", "bo")],
+                           params=[cfg.n_heads, cfg.n_heads, 0,
+                                   f32_bits(10000.0), 0, 0]))
         if l in moe_layers:
             s = moe_layers.index(l)
             refs = [tid["Wr"], tid["br"], tid["W1s"], tid["b1s"], tid["W2s"], tid["b2s"]]
             # routed experts are addressed as regions, not as block inputs (SPEC §7.3)
+            # Param order is SPEC §7's MoE row, and the C loader reads it by index:
+            #   [n_experts, top_k, scoring, norm_topk_prob, latent_size,
+            #    routed_scaling_bits, n_shared, shared_overlap, group_limited, n_group]
+            # lambda is NOT a spec'd MoE param. The test model trains lambda=0/0.5 as a
+            # model property, so it is stored in `slot` (the region/block disambiguator)
+            # rather than smuggled into a field the loader reads for a different purpose --
+            # putting it at index 4 made the loader read 0.5f as latent_size and refuse.
             blocks.append(dict(kind=KIND_MOE, layer=l, refs=refs,
-                               params=[N, cfg.topk, SCORING_SOFTMAX, 1,
-                                       f32_bits(cfg.lam), s, 1, 0, 1, 1]))
+                               params=[N, cfg.topk, SCORING_SOFTMAX, 1, 0,
+                                       f32_bits(1.0), 1, 0, 0, 1],
+                               slot=s, lam=cfg.lam))
         else:
             d = dense_layers.index(l)
             refs = [tid["ln2_g"], tid["ln2_b"], tid["W1"], tid["b1"], tid["W2"], tid["b2"]]
             blocks.append(dict(kind=KIND_DENSE_FFN, layer=l, refs=refs,
-                               params=[ACT_GELU_TANH, cfg.d_ff, d]))
+                               params=[ACT_GELU_TANH, cfg.d_ff, d,
+                                       1 if l >= cfg.moe_from else 0]))
     blocks.append(dict(kind=KIND_NORM, layer=L,
                        refs=[tid["lnf_g"], tid["lnf_b"]],
                        params=[f32_bits(1e-5), 0]))
@@ -210,6 +227,11 @@ def main():
 
     blk = W().u32(len(blocks))
     for b in blocks:
+        # The block record has no room for a model-level scalar like lambda, and inventing
+        # one would deviate from SPEC §7. v4 needs no lambda header field for THIS test
+        # anyway: the engine is called with lambda explicitly on the verification path
+        # (forward_moe(..., lambda)), and the v3 source's lambda is what the v3 gate used.
+        # Recorded here as an open spec question: where should a served lambda live in v4?
         blk.u8(b["kind"]).u32(b["layer"]).u8(len(b["refs"]))
         for r in b["refs"]:
             blk.u32(r)

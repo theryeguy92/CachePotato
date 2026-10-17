@@ -18,6 +18,16 @@
 #include "core/weights.h"
 
 #define EOS_TOKEN 50256 /* GPT-2 <|endoftext|> */
+
+/* Lambda used when the file does not carry one. CPW1 v3 stores lambda in its header because
+   serving at a different lambda routes differently. v4 has no home for it yet (recorded as
+   an open spec question), so verification of a v4 file must be told the value:
+   CP_V4_LAMBDA=0.5. Default 0.0 keeps a missing value visible rather than silently wrong. */
+static float model_lambda(const Model *m) {
+    const char *s = getenv("CP_V4_LAMBDA");
+    if (s) return (float)atof(s);
+    return m->hdr.version == 4 ? 0.0f : m->h3.lam;
+}
 #define MAX_NEW 40
 
 /* --- decoding config -------------------------------------------------------
@@ -203,8 +213,8 @@ static int moe_sel_mode(const char *path, const char *tokbin, long start, int T,
     Model m;
     if (model_load(&m, path) != 0)
         return 1;
-    if (!m.is_v3 || !m.w.is_moe) {
-        fprintf(stderr, "%s is not a CPW1 v3 MoE file\n", path);
+    if (!m.w.is_moe) {
+        fprintf(stderr, "%s has no MoE layout (is_moe=0)\n", path);
         return 1;
     }
     FILE *f = fopen(tokbin, "rb");
@@ -225,7 +235,7 @@ static int moe_sel_mode(const char *path, const char *tokbin, long start, int T,
     if (!raw || !toks || !sel || !logits) { fprintf(stderr, "oom\n"); return 1; }
 
     double t0 = now_s();
-    forward_moe(&m, toks, T, logits, sel, m.h3.lam);
+    forward_moe(&m, toks, T, logits, sel, model_lambda(&m));
     double dt = now_s() - t0;
 
     FILE *o = fopen(out_path, "wb");
@@ -242,7 +252,7 @@ static int moe_sel_mode(const char *path, const char *tokbin, long start, int T,
     fprintf(stderr,
             "moe-sel: %d MoE layers x %d tokens x top-%d, lam=%.3f, %.1fs "
             "(%.0f tok/s) | next-argmax %d -> %s\n",
-            nm, T, K, m.h3.lam, dt, dt > 0 ? T / dt : 0.0, best, out_path);
+            nm, T, K, model_lambda(&m), dt, dt > 0 ? T / dt : 0.0, best, out_path);
 
     free(raw); free(toks); free(sel); free(logits);
     model_free(&m);
@@ -322,8 +332,8 @@ static int pager_sim_mode(const char *trace_path, long budget_bytes, long region
 static int step_check_mode(const char *path, const char *tokbin, long start, int T) {
     Model m;
     if (model_load(&m, path) != 0) return 1;
-    if (!m.is_v3 || !m.w.is_moe) {
-        fprintf(stderr, "%s is not a CPW1 v3 MoE file\n", path);
+    if (!m.w.is_moe) {
+        fprintf(stderr, "%s has no MoE layout (is_moe=0)\n", path);
         return 1;
     }
     const int V = m.hdr.vocab, nm = m.w.n_moe, K = m.w.topk;
@@ -349,10 +359,11 @@ static int step_check_mode(const char *path, const char *tokbin, long start, int
         fprintf(stderr, "oom\n"); return 1;
     }
 
-    forward_moe(&m, toks, T, logA, selA, m.h3.lam);
+    forward_moe(&m, toks, T, logA, selA, model_lambda(&m));
 
     RunState rs;
     runstate_alloc(&rs, &m);
+    rs.lam = model_lambda(&m);   /* keep the incremental path on the same lambda as the reference */
     runstate_reset_sequence(&rs, &m);
     rs.moe_sel_out = selB;
     rs.moe_sel_stride = T;
@@ -391,7 +402,7 @@ static int step_check_mode(const char *path, const char *tokbin, long start, int
             }
     }
 
-    printf("step-check: T=%d  moe_layers=%d  top-%d  lam=%.3f\n", T, nm, K, m.h3.lam);
+    printf("step-check: T=%d  moe_layers=%d  top-%d  lam=%.3f\n", T, nm, K, model_lambda(&m));
     printf("  logits  : max|delta| = %.3e   argmax mismatches %d/%d\n", dmax, am, T);
     printf("  routing : %d / %zu selections differ\n", sm, nsel);
     printf("  speed   : %.1f tok/s (%.1fs for %d tokens, incremental)\n",
@@ -415,8 +426,8 @@ static int gen_check_mode(const char *path, const char *tokbin, long start,
                           int prompt_T, int N) {
     Model m;
     if (model_load(&m, path) != 0) return 1;
-    if (!m.is_v3 || !m.w.is_moe) {
-        fprintf(stderr, "%s is not a CPW1 v3 MoE file\n", path);
+    if (!m.w.is_moe) {
+        fprintf(stderr, "%s has no MoE layout (is_moe=0)\n", path);
         return 1;
     }
     const int V = m.hdr.vocab, nm = m.w.n_moe, K = m.w.topk;
@@ -438,6 +449,7 @@ static int gen_check_mode(const char *path, const char *tokbin, long start,
     int *idsA = malloc((size_t)N * sizeof(int));
     RunState rs;
     runstate_alloc(&rs, &m);
+    rs.lam = model_lambda(&m);   /* keep the incremental path on the same lambda as the reference */
     runstate_reset_sequence(&rs, &m);
     rs.moe_sel_out = selA;
     rs.moe_sel_stride = Lmax;
@@ -459,7 +471,7 @@ static int gen_check_mode(const char *path, const char *tokbin, long start,
     int id_mm = 0, sel_mm = 0, first_bad = -1;
     for (int i = 0; i < N; i++) {
         int P = prompt_T + i;
-        forward_moe(&m, seq, P, logits, selB, m.h3.lam);
+        forward_moe(&m, seq, P, logits, selB, model_lambda(&m));
         const float *row = logits + (size_t)(P - 1) * V;
         int best = 0;
         for (int j = 1; j < V; j++) if (row[j] > row[best]) best = j;
@@ -477,7 +489,7 @@ static int gen_check_mode(const char *path, const char *tokbin, long start,
     for (int i = 0; i < prompt_T; i++) if (seq[i] == EOS_TOKEN) eos_prompt++;
 
     printf("gen-check: prompt %d tokens, %d generated greedily, lam=%.3f\n",
-           prompt_T, N, m.h3.lam);
+           prompt_T, N, model_lambda(&m));
     printf("  generated ids    : %d / %d differ from full-sequence%s\n",
            id_mm, N, id_mm ? "   <-- DIVERGENCE" : "");
     printf("  last-pos routing : %d / %d selections differ\n", sel_mm, nm * N * K);
@@ -607,7 +619,7 @@ static int bench_mode(const char *path, const char *tokbin, long start,
        either, so the trace stays rectangular for the RTP1 reader. */
     const int WPI = prompt_T + gen_N, nslots = m.w.is_moe ? m.w.n_moe : 0;
     int32_t *rt = NULL; int16_t *rs_sel = NULL;
-    if (g_record_trace && m.is_v3 && m.w.is_moe) {
+    if (g_record_trace && m.w.is_moe) {
         rt = malloc((size_t)n_prompts * WPI * sizeof(int32_t));
         rs_sel = calloc((size_t)nslots * n_prompts * WPI * m.w.topk, sizeof(int16_t));
         if (!rt || !rs_sel) { fprintf(stderr, "trace: oom\n"); return 1; }
@@ -631,7 +643,7 @@ static int bench_mode(const char *path, const char *tokbin, long start,
     }
 
     fprintf(stderr, "bench: %s\n  prompt_T=%d gen_N=%d n_prompts=%d lam=%.3f\n",
-            path, prompt_T, gen_N, n_prompts, m.h3.lam);
+            path, prompt_T, gen_N, n_prompts, model_lambda(&m));
     for (int i = 0; i < n_prompts; i++) {
         runstate_reset_sequence(&rs, &m);
         long o = offs[i];

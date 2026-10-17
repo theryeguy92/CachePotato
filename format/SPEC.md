@@ -196,10 +196,22 @@ fields, then kind-specific fields. Blocks appear in execution order.
 | `0x01` | `embedding` | token table | — |
 | `0x02` | `norm` | weight, bias | `eps_bits` (f32 bit pattern), `kind` (0 layernorm, 1 rmsnorm) |
 | `0x10` | `attention` | Wq,bq,Wk,bk,Wv,bv,Wo,bo | `n_heads`, `n_kv_heads`, `head_dim`, `rope_theta_bits`, `qk_norm`, `sliding_window` |
-| `0x11` | `dense_ffn` | W1,b1,W2,b2 | `act` (0 gelu_tanh, 1 silu, 2 relu2), `d_ff` |
+| `0x11` | `dense_ffn` | W1,b1,W2,b2 | `act` (0 gelu_tanh, 1 silu, 2 relu2), `d_ff`, `dense_index`, `dense_packed` |
 | `0x20` | `moe` | router W,b; shared W1,b1,W2,b2; routed expert blocks | `n_experts`, `top_k`, `scoring` (0 softmax, 1 sigmoid), `norm_topk_prob`, `routed_scaling_bits`, `latent_size`, `n_shared`, `shared_overlap`, `group_limited` (`n_group`, `topk_group`) |
 | `0x21` | `moe_latent` | as `moe`, plus down/up latent projections | `latent_size` ≠ 0 and the latent projections present |
 | `0x30` | `ssm` (mamba) | `in_proj`, `out_proj`, conv, `A_log`, `D`, `dt_bias` | `n_heads`, `head_dim`, `state_size`, `conv_kernel`, `chunk_size`, `dt_min_bits`, `dt_max_bits` |
+
+`dense_packed` exists because a model can legitimately hold *packed dense FFN weights on a
+layer at a MoE position* — weights that exist in the checkpoint and are never executed, only
+to keep tensor shapes uniform. The project's own served model does exactly this on its last
+layer (an accepted, documented deviation in the decision log). The flag lets a file say
+"this layer's FFN is dense even though the engine's layout rule would call the slot MoE",
+so the format can express the model honestly instead of either rejecting it or loading
+untrained weights. A block with `dense_packed != 0` does not contribute a MoE slot.
+
+**Layer indices are execution positions, not a count.** A trailing `norm` block carries
+`layer = n_layer` (it runs after the last layer), so a loader must derive the layer count
+from the highest layer that has an FFN block, not from the maximum layer index in the table.
 
 **Why a union rather than a predicate.** Bolt's own config is the proof: `layers_block_type`
 is an explicit 88-entry list interleaving `mamba`/`moe`/`attention`, and every MoE entry

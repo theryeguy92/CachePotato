@@ -15,5 +15,21 @@ run "gate1_step_check" ./build/cachepotato weights/moe-scale-run/l05.cpw1v3 --st
 run "gate2_gen_check"  ./build/cachepotato weights/moe-scale-run/l05.cpw1v3 --gen-check data/fineweb_edu_valid.bin 0 16 8
 run "pager_sim_736"    ./build/cachepotato --pager-sim scratch/bench_l05.rtp1 --ps-budget 736
 run "perm_gate"        python3 tools/verify_permutation_cpw1_v3.py --base weights/moe-scale-run/l05.cpw1v3 --permuted scratch/l05_permuted.cpw1v3 --ckpt weights/moe-scale-run/l05/model_only.pt --perm-json scratch/l05_permutation.json
+# CPW1 v4 acceptance (format/SPEC.md 9.2/9.3). The v4 files are ~736MB each and
+# gitignored, so they are generated on demand and reused. Set CP_SKIP_V4=1 to skip.
+if [ "${CP_SKIP_V4:-0}" != "1" ] && [ -f weights/moe-scale-run/l05.cpw1v3 ]; then
+    [ -f scratch/l05.v4cp ]      || python3 tools/v3_to_v4.py \
+        --src weights/moe-scale-run/l05.cpw1v3 --dst scratch/l05.v4cp >/dev/null
+    [ -f scratch/l05_shuf.v4cp ] || python3 tools/v3_to_v4.py \
+        --src weights/moe-scale-run/l05.cpw1v3 --dst scratch/l05_shuf.v4cp --shuffle >/dev/null
+    printf '  %-22s ' "v4_acceptance"
+    out=$(python3 tools/verify_v4_roundtrip.py --v3 weights/moe-scale-run/l05.cpw1v3 \
+        --v4 scratch/l05.v4cp --v4-shuffled scratch/l05_shuf.v4cp \
+        --engine ./build/cachepotato --tokens 64 2>&1)
+    rc=$?
+    echo "$out" | grep -E "^V4 ACCEPTANCE" | tail -1 | sed 's/^/ /'
+    [ $rc -eq 0 ] || fail=1
+fi
+
 echo "== done (fail=$fail) =="
 exit $fail

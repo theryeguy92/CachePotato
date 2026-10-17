@@ -170,7 +170,7 @@ void forward_moe(const Model *m, const int *tokens, int T, float *logits_out,
         } else {
             /* dense slots are compacted in v3 (dead dense FFNs are not in the
                file), so layer -> slot; v2 has one dense FFN per layer */
-            const int ds = m->is_v3 ? m->w.dense_slot[l] : l;
+            const int ds = m->w.is_moe ? m->w.dense_slot[l] : l;
             const float *W1 = w->W1 + (size_t)ds * D * F, *b1 = w->b1 + (size_t)ds * F;
             const float *W2 = w->W2 + (size_t)ds * F * D, *b2 = w->b2 + (size_t)ds * D;
             for (int t = 0; t < T; t++) {
@@ -204,6 +204,7 @@ void forward(const Model *m, const int *tokens, int T, float *logits_out) {
 /* ---- incremental generation mode (KV-cached, one token per call) ------- */
 
 void runstate_alloc(RunState *s, const Model *m) {
+    s->lam = m->h3.lam;   /* callers may override (v4 files carry no lambda) */
     int D = m->hdr.d_model, F = m->hdr.d_ff, V = m->hdr.vocab;
     int L = m->hdr.n_layer, N = m->w.n_exp, K = m->w.topk;
     size_t cache = (size_t)m->hdr.n_layer * m->hdr.n_ctx * D;
@@ -258,7 +259,7 @@ static void moe_ffn_step(const Model *m, RunState *s, int slot, int layer,
     float *p = s->moe_p;
 
     matmul_xw(p, xn, Wr, br, D, N);
-    const float lam = m->h3.lam;
+    const float lam = s->lam;
     for (int e = 0; e < N; e++) p[e] += prev[e] ? lam : 0.0f;
     softmax(p, N);
 
@@ -365,7 +366,7 @@ void forward_step(const Model *m, RunState *s, int token, int pos) {
             moe_ffn_step(m, s, m->w.moe_slot[l], l, s->xn, s->x, token, pos);
         } else {
             /* dense slots are compacted in v3 (see forward_moe) */
-            const int ds = m->is_v3 ? m->w.dense_slot[l] : l;
+            const int ds = m->w.is_moe ? m->w.dense_slot[l] : l;
             const float *W1 = w->W1 + (size_t)ds * D * F, *b1 = w->b1 + (size_t)ds * F;
             const float *W2 = w->W2 + (size_t)ds * F * D, *b2 = w->b2 + (size_t)ds * D;
             instr_touch("W1", l, pos, (D * F + F) * sizeof(float));

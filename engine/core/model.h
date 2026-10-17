@@ -36,6 +36,12 @@ typedef struct {
        written by forward_step when non-NULL. NULL in normal generation. */
     int   *moe_sel_out;
     int    moe_sel_stride;
+    /* The locality bias actually applied by forward_step. The full-sequence path takes it
+       as an argument; the incremental path used to read m->h3.lam directly, which is 0 for
+       a v4 file (v4 has no home for lambda yet). Gate 1 then compared a lambda=0.5
+       full-sequence pass against a lambda=0 incremental one and reported a divergence that
+       was not there. One field, so both paths are driven by the same value. */
+    float  lam;
 } RunState;
 
 void runstate_alloc(RunState *s, const Model *m);
