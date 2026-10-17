@@ -244,6 +244,12 @@ static int moe_sel_mode(const char *path, const char *tokbin, long start, int T,
     fwrite(&T, sizeof(int), 1, o);
     fwrite(&K, sizeof(int), 1, o);
     fwrite(sel, sizeof(int), (size_t)nm * T * K, o);
+    /* APPENDED (2026-10-16): the full logits block, T x vocab floats. Additive by design —
+       existing readers take a count and ignore trailing bytes, so verify_cpw1_v3.py is
+       unaffected. It exists because the routing trace alone cannot check numerics: a port
+       needs to compare the engine's logits against its reference at the trained lambda, and
+       the plain CLI prints those at lambda=0 (forward() predates the locality bias). */
+    fwrite(logits, sizeof(float), (size_t)T * m.hdr.vocab, o);
     fclose(o);
 
     int best = 0;

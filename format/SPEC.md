@@ -321,7 +321,9 @@ models/<port>/
 ```
 
 A port **declares its tier** (A as-is / B layout / C co-design — see
-`docs/2026-10-16-universal-ports.md`). A `BIT_IDENTICAL` reshape must pass the base model's
+`docs/2026-10-16-universal-ports.md`). The full contract, including three things a port must state that
+this format does not record (layer split, dead weights, model-level scalars with no home
+here), is [`models/CONTRACT.md`](../models/CONTRACT.md). A `BIT_IDENTICAL` reshape must pass the base model's
 reference; a `ROUTING_CHANGED` reshape needs its own recorded trace.
 
 ## 12. Open questions

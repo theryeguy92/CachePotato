@@ -26,3 +26,6 @@ scratch/big.bin
 
 # generated CPW1 v4 test files (hundreds of MB; regenerate with tools/v3_to_v4.py)
 scratch/*.v4cp
+
+# port-generated v4 files (hundreds of MB; regenerate with models/<port>/convert.py)
+scratch/port_*.v4cp

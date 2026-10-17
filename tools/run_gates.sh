@@ -31,5 +31,20 @@ if [ "${CP_SKIP_V4:-0}" != "1" ] && [ -f weights/moe-scale-run/l05.cpw1v3 ]; the
     [ $rc -eq 0 ] || fail=1
 fi
 
+# First port (models/gpt2-moe). Skipped unless its checkpoint exists, since weights are
+# gitignored. Converts the checkpoint to v4, then runs the port's own gate.
+if [ "${CP_SKIP_PORT:-0}" != "1" ] && [ -f weights/moe-scale-run/l05/model_only.pt ]; then
+    printf '  %-22s ' "port_gpt2_moe"
+    [ -f scratch/port_l05.v4cp ] || python3 models/gpt2-moe/convert.py \
+        --ckpt weights/moe-scale-run/l05/model_only.pt --out scratch/port_l05.v4cp >/dev/null 2>&1
+    [ -f scratch/port_l05_shuf.v4cp ] || python3 models/gpt2-moe/convert.py \
+        --ckpt weights/moe-scale-run/l05/model_only.pt --out scratch/port_l05_shuf.v4cp \
+        --shuffle >/dev/null 2>&1
+    out=$(python3 models/gpt2-moe/verify/gate.py --windows 1 --tokens 64 2>&1)
+    rc=$?
+    echo "$out" | grep -E "^PORT GATE" | tail -1 | sed 's/^/ /'
+    [ $rc -eq 0 ] || fail=1
+fi
+
 echo "== done (fail=$fail) =="
 exit $fail

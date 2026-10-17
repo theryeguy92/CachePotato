@@ -275,6 +275,7 @@ python3 tools/verify_cpw1_v3.py                         # export + routing gate
 | Path | Purpose |
 |---|---|
 | `engine/` | The C runtime, model-agnostic. `core/` (mmap loader, CPW1 v2/v3, forward + incremental decode, trace replay), `pager/` (regions, LRU, prefetch), `kernels/`, `tokenizers/`, `blocks/` (**empty** — splitting `model.c`'s block types out of `core/` is a pending refactor) |
+| `models/` | One port per model: [`CONTRACT.md`](models/CONTRACT.md) (what a port must ship) and `gpt2-moe/` — the project's own model ported through it, with an independent numpy reference, a converter and the port gate |
 | `format/` | [`SPEC.md`](format/SPEC.md) — the self-describing weight format (CPW1 v4). **Implemented and gated**: a v3→v4 round-trip reproduces the recorded PyTorch routing 100% and survives a shuffled physical payload, i.e. tensors are addressed by offset |
 | `src/` | `main.c` (CLI/REPL/bench/gates) and `train.c` (the C trainer) — the two entry points, now that the runtime lives in `engine/` |
 | `experiments/` | Phase 0 scratch programs — mmap/`madvise` probes, SSD latency. Learning artifacts, not engine code |
