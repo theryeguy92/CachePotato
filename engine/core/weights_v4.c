@@ -503,6 +503,20 @@ int model_load_v4(Model *m, const char *path) {
            region is not allocated at all — allocating it would defeat the purpose (379 MB
            here, multiple GB on a real model). */
         int q8_experts = exp_is_q8;
+        /* All routed-expert tensors must use ONE layout. A mixed file is not expressible by
+           this loader — and it is exactly how the bytes-vs-elements bug would come back:
+           exp_hid is derived from the first expert tensor, so a file with some f32 and some
+           Q8 experts would be sized by one and decoded by the other. Refuse, do not guess. */
+        for (uint32_t i2 = 0; i2 < h.n_tensors; i2++) {
+            int s_, e_;
+            if (tens[i2].role == ROLE_EXPERT &&
+                sscanf(tens[i2].name, "experts.%d.%d", &s_, &e_) == 2 &&
+                encs[tens[i2].dtype_id].is_q8 != q8_experts) {
+                fprintf(stderr, "v4: mixed expert layouts (%s) — all routed experts must be "
+                                "raw f32 or all Q8_0\n", tens[i2].name);
+                goto done;
+            }
+        }
         long off_exp   = o; o += q8_experts ? 0 : nmoe * N * exp_floats;
         long off_lnfg  = o; o += dd;
         long off_lnfb  = o; o += dd;
@@ -510,12 +524,19 @@ int model_load_v4(Model *m, const char *path) {
 
         /* does every tensor sit exactly where the forward pass wants it, contiguous?
            expected offset (floats, relative to off_data) per tensor */
+        /* PARTIAL in-place: f32 tensors point into the mapped file, quantized ones are read
+           from their blocks on the fly. The old rule disabled in-place for the WHOLE file if
+           any tensor was quantized, so a quantized file copied everything into an fp32 layout
+           and used MORE memory than the fp32 original. A quantized tensor is not a reason to
+           copy the f32 ones: it occupies no layout space at all when experts are quantized,
+           so the f32 tensors can still form a contiguous prefix that matches the engine
+           layout exactly. Only tensors that need fp32 in the layout are checked here. */
         int in_place = 1;
-        /* A quantized tensor can never be used in place: the forward pass needs fp32. */
-        for (uint32_t i = 0; i < h.n_tensors; i++)
-            if (encs[tens[i].dtype_id].is_q8) { in_place = 0; break; }
         for (uint32_t i = 0; i < h.n_tensors && in_place; i++) {
             const TRec *t2 = &tens[i];
+            /* quantized: never laid out in fp32 (experts are used on the fly, and any other
+               quantized tensor is decoded by the copy path below) */
+            if (encs[t2->dtype_id].is_q8) continue;
             long want = -1, idx = 0, stride = 0;
             int s_, e_;
             const char *nm = t2->name;
@@ -579,8 +600,9 @@ int model_load_v4(Model *m, const char *path) {
             p_W1s = base + off_W1s; p_b1s = base + off_b1s;
             p_W2s = base + off_W2s; p_b2s = base + off_b2s;
             p_exp = base + off_exp; p_lnfg = base + off_lnfg; p_lnfb = base + off_lnfb;
-            printf("v4: layout matches the forward pass — using the file's bytes in place "
-                   "(no %ld MB copy)\n", need * 4 / (1024 * 1024));
+            printf("v4: f32 tensors match the forward pass — using the file's bytes in place "
+                   "(no %ld MB copy)%s\n", need * 4 / (1024 * 1024),
+                   q8_experts ? ", quantized experts decoded on the fly" : "");
         } else {
             layout = calloc((size_t)need + 16, sizeof(float));
             if (!layout) { fprintf(stderr, "v4: oom for %ld-float layout buffer\n", need); goto done; }
@@ -618,6 +640,42 @@ int model_load_v4(Model *m, const char *path) {
             }
         }
 
+        /* Fill the quantized-expert pointer arrays HERE, not inside the copy loop: with
+           partial in-place the copy loop does not run at all, and the first version of this
+           left every expert pointer NULL and segfaulted on the first forward pass. Pointers
+           into the mapped file are valid whether or not anything is copied. */
+        if (q8_experts) {
+            for (uint32_t i = 0; i < h.n_tensors; i++) {
+                const TRec *tc = &tens[i];
+                const char *nm = tc->name;
+                int sl = -1, ex = -1;
+                if (!strncmp(nm, "expert_bias.", 12)) {
+                    if (sscanf(nm, "expert_bias.%d", &sl) != 1 || sl < 0 || sl >= nmoe) {
+                        fprintf(stderr, "v4: bad expert_bias slot in %s\n", nm); goto done;
+                    }
+                    const float *bs = (const float *)(img + h.off_data + tc->off);
+                    for (int e3 = 0; e3 < N; e3++)
+                        w_expert_bias[(size_t)sl * N + e3] = bs + (size_t)e3 * (exp_hid + dd);
+                } else if (tc->role == ROLE_EXPERT) {
+                    if (sscanf(nm, "experts.%d.%d", &sl, &ex) != 2) continue;
+                    if (!encs[tc->dtype_id].is_q8) continue;
+                    if (sl < 0 || sl >= nmoe || ex < 0 || ex >= N) {
+                        fprintf(stderr, "v4: bad expert index in %s\n", nm); goto done;
+                    }
+                    long w_elems = 2L * dd * exp_hid;
+                    if (tc->len != (uint64_t)(w_elems / 32) * 34) {
+                        fprintf(stderr, "v4: %s: %llu bytes, expected %llu for %ld elements "
+                                        "of W1|W2 (D=%ld EH=%ld)\n", nm,
+                                (unsigned long long)tc->len,
+                                (unsigned long long)((w_elems / 32) * 34), w_elems,
+                                (long)dd, (long)exp_hid);
+                        goto done;
+                    }
+                    w_experts_q8[(size_t)sl * N + ex] = img + h.off_data + tc->off;
+                }
+            }
+        }
+
         if (!in_place) {
             int bad = 0;
             for (uint32_t i = 0; i < h.n_tensors && !bad; i++) {
@@ -648,20 +706,10 @@ int model_load_v4(Model *m, const char *path) {
                 int s2 = -1, e2 = -1;
                 const char *nm = tc->name;
 
-                if (!strncmp(nm, "expert_bias.", 12)) {
-                    int sl = -1;
-                    if (sscanf(nm, "expert_bias.%d", &sl) != 1) continue;
-                    const float *bs = (const float *)(img + h.off_data + tc->off);
-                    for (int e3 = 0; e3 < N; e3++)
-                        w_expert_bias[(size_t)sl * N + e3] = bs + (size_t)e3 * (exp_hid + dd);
-                    continue;
-                }
+                if (!strncmp(nm, "expert_bias.", 12)) continue;   /* handled above */
                 if (tc->role == ROLE_EXPERT) {
                     if (sscanf(nm, "experts.%d.%d", &s2, &e2) != 2) continue;
-                    if (tq8) {
-                        w_experts_q8[(size_t)s2 * N + e2] = (const unsigned char *)srcb;
-                        continue;
-                    }
+                    if (tq8) continue;   /* pointers + length checks handled above */
                     base = p_exp; stride = exp_floats;
                     exp = exp_floats;
                     if (cnt != exp) { fprintf(stderr, "v4: %s size mismatch\n", nm); bad = 1; break; }

@@ -43,6 +43,15 @@ if [ $rc -eq 0 ]; then
     run=$(CP_V4_LAMBDA=0.5 ./build/cachepotato scratch/l05_q8.v4cp --moe-sel \
             data/fineweb_edu_valid.bin 0 16 scratch/q8_gate.bin 2>&1)
     echo "$run" | grep -q "next-argmax" || rc=1
+    # the experts-only file must take the PARTIAL IN-PLACE path: f32 tensors pointed into the
+    # file, quantized experts decoded on the fly. If it silently falls back to the layout copy,
+    # resident memory goes UP for a quantized file, which is the regression this exists to stop.
+    python3 models/gpt2-moe/convert.py --ckpt weights/moe-scale-run/l05/model_only.pt \
+        --out scratch/l05_q8x.v4cp --quant q8_experts >/dev/null 2>&1 || rc=1
+    inl=$(CP_V4_LAMBDA=0.5 ./build/cachepotato scratch/l05_q8x.v4cp --moe-sel \
+            data/fineweb_edu_valid.bin 0 8 scratch/q8x_gate.bin 2>&1)
+    echo "$inl" | grep -q "in place" || { echo "      (experts-only file did NOT load in place)"; rc=1; }
+    echo "$inl" | grep -q "quantized experts decoded on the fly" || rc=1
 fi
 if [ $rc -eq 0 ]; then echo " PASS — Q8_0 file validates and the engine runs it"
 else echo " FAIL — see scratch/l05_q8.v4cp"; fail=1; fi

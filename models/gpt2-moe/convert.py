@@ -55,7 +55,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--moe-from", type=int, default=1,
                     help="first MoE layer; NOT recorded in the checkpoint (MODEL.md §3)")
-    ap.add_argument("--quant", choices=["none", "q8_0"], default="none",
+    ap.add_argument("--quant", choices=["none", "q8_0", "q8_experts"], default="none",
                     help="Q8_0 the big matrices (attention, dense FFN, shared expert, router). "
                          "Embeddings, norms, biases and the expert pool stay fp32: biases must "
                          "not share a group scale with weights, and the expert pool needs a "
@@ -94,7 +94,12 @@ def main():
     tid = {}
 
     # Which tensors get quantized: the large weight matrices, where the bytes are.
+    # q8_0        : matrices + experts quantized (needs on-the-fly decode for matrices, else
+    #               the loader must materialise them and the layout copy returns)
+    # q8_experts  : experts only. The quantized tensors then occupy NO layout space, so the f32
+    #               tensors form a contiguous prefix the loader can use in place — no copy.
     Q8 = {"Wq","Wk","Wv","Wo","W1","W2","W1s","W2s","Wr"} if args.quant == "q8_0" else set()
+    q8_experts = args.quant in ("q8_0", "q8_experts")
 
     def add(name, arr, role, enc=None):
         if enc is None:
@@ -122,7 +127,7 @@ def main():
         add(nm, sd[nm][moe], role)
     # routed experts: ONE TENSOR PER (layer, expert) so one expert is one pageable region
     # (SPEC §7.3 interleaved-pair arrangement, as this model's v3 file already uses)
-    if args.quant == "q8_0":
+    if q8_experts:
         # Quantized experts: the Q8 tensor holds W1 then W2 (both large matrices), and the
         # biases move OUT of the quantized block into a per-slot f32 tensor. A bias inside a
         # weight group would be scaled by the weights' peak and crushed to a step or two.
@@ -177,13 +182,17 @@ def main():
                     "ln2_g", "ln2_b", "W1", "b1", "W2", "b2",
                     "Wr", "br", "W1s", "b1s", "W2s", "b2s"]
     order_ids = [tid[n] for n in engine_order]
+    # The f32 tensors must form a CONTIGUOUS PREFIX in engine order, and the quantized expert
+    # blocks go after them. That is what lets the loader use f32 tensors in place (no copy)
+    # while quantized experts are read on the fly: the prefix matches the engine's layout
+    # exactly, and the expert region costs no layout space at all.
+    order_ids += [tid["lnf_g"], tid["lnf_b"]]
     for slot in range(len(moe)):
         for e in range(N):
             order_ids.append(tid["experts.%d.%d" % (slot, e)])
     for slot in range(len(moe)):
         if "expert_bias.%d" % slot in tid:
             order_ids.append(tid["expert_bias.%d" % slot])
-    order_ids += [tid["lnf_g"], tid["lnf_b"]]
     if args.shuffle:
         np.random.default_rng(args.seed).shuffle(order_ids)
 
@@ -195,7 +204,7 @@ def main():
     print("  layout: %s" % ("SHUFFLED (exercises the copy path)" if args.shuffle
                             else "engine order (loads in place)"))
     print("  encoding: %s (%d matrices + %d expert blocks quantized)"
-          % (args.quant, len(Q8), len(moe) * N if args.quant == "q8_0" else 0))
+          % (args.quant, len(Q8), len(moe) * N if q8_experts else 0))
     print("  step=%s lam=%s layer split: MoE %s dense %s (ASSUMED from --moe-from %d)"
           % (ck.get("step"), cfg["lam"], moe, dense, cfg["moe_from"]))
     return 0
