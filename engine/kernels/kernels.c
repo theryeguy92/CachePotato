@@ -134,6 +134,12 @@ static float q8_scale(const uint8_t *blk) {
     return f16_to_f32(h);
 }
 
+void matmul_xw_auto(float *out, const float *x, const float *w, const uint8_t *q8,
+                    const float *bias, int n_in, int n_out) {
+    if (q8) matmul_xw_q8(out, x, q8, bias, n_in, n_out);
+    else    matmul_xw(out, x, w, bias, n_in, n_out);
+}
+
 void q8_dequant_row(const uint8_t *blocks, float *out, int n) {
     int ng = n / 32;
     for (int g = 0; g < ng; g++) {

@@ -56,6 +56,11 @@ typedef struct {
        between a quantized model that FITS and one that only has a smaller file. Layout per
        expert: q8(W1) then q8(W2); biases live separately (b1 then b2) because a bias must not
        share a group scale with weights. */
+    /* Quantized non-expert matrices. NULL when the file stores that tensor as f32; the
+       forward pass dispatches on presence, so a block never learns its own dtype. Biases are
+       always f32: a bias must not share a group scale with its matrix. */
+    const unsigned char *q_Wq, *q_Wk, *q_Wv, *q_Wo;
+    const unsigned char *q_W1, *q_W2, *q_W1s, *q_W2s, *q_Wr;
     const unsigned char **experts_q8;   /* [n_moe * N] -> q8(W1)|q8(W2) */
     const float **expert_bias;          /* [n_moe * N] -> b1[EH] then b2[D] */
     int is_moe;
@@ -102,6 +107,12 @@ float *expert_block(const Weights *w, int slot, int e);
 const unsigned char *expert_block_q8(const Weights *w, int slot, int e);
 const float *expert_bias_ptr(const Weights *w, int slot, int e);
 long q8_bytes_for(long elems);
+/* A multi-layer quantized group is ONE tensor; index `idx` of it starts `idx` blocks in.
+   Passing the tensor base for every layer is a silent bug: every layer reads layer 0 and the
+   model runs with plausible-looking garbage (routing fell to 10.7% this way). */
+static inline const unsigned char *q8_slice(const unsigned char *base, int idx, long elems) {
+    return base ? base + (size_t)idx * (size_t)q8_bytes_for(elems) : (const unsigned char *)0;
+}
 /* true when engine layer l uses a sparse FFN */
 int moe_layer_at(const Model *m, int l);
 

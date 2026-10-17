@@ -21,9 +21,9 @@ void blk_ffn_dense(const Model *m, int layer, int T,
     for (int t = 0; t < T; t++) {
         instr_touch("W1", layer, t, (D * F + F) * sizeof(float));
         instr_touch("W2", layer, t, (F * D + D) * sizeof(float));
-        matmul_xw(h + t * F, xn + t * D, W1, b1, D, F);
+        matmul_xw_auto(h + t * F, xn + t * D, W1, q8_slice(w->q_W1, ds, (long)D*F), b1, D, F);
         for (int e = 0; e < F; e++) h[t * F + e] = gelu(h[t * F + e]);
-        matmul_xw(proj, h + t * F, W2, b2, F, D);
+        matmul_xw_auto(proj, h + t * F, W2, q8_slice(w->q_W2, ds, (long)F*D), b2, F, D);
         for (int e = 0; e < D; e++) x[t * D + e] += proj[e];
     }
 }
@@ -37,8 +37,8 @@ void blk_ffn_dense_step(const Model *m, RunState *s, int layer) {
     /* instr_touch happens in the caller's loop position: forward_step uses `pos`, which the
        step path knows and the block does not (it has no position argument). Kept there so
        the touch order is unchanged. */
-    matmul_xw(s->h, s->xn, W1, b1, D, F);
+    matmul_xw_auto(s->h, s->xn, W1, q8_slice(w->q_W1, ds, (long)D*F), b1, D, F);
     for (int e = 0; e < F; e++) s->h[e] = gelu(s->h[e]);
-    matmul_xw(s->proj, s->h, W2, b2, F, D);
+    matmul_xw_auto(s->proj, s->h, W2, q8_slice(w->q_W2, ds, (long)F*D), b2, F, D);
     for (int e = 0; e < D; e++) s->x[e] += s->proj[e];
 }

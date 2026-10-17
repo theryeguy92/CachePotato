@@ -36,9 +36,9 @@ void blk_attention_mha(const Model *m, int layer, int T,
         instr_touch("Wq", layer, t, (D * D + D) * sizeof(float));
         instr_touch("Wk", layer, t, (D * D + D) * sizeof(float));
         instr_touch("Wv", layer, t, (D * D + D) * sizeof(float));
-        matmul_xw(q  + t * D, xn + t * D, Wq, bq, D, D);
-        matmul_xw(k  + t * D, xn + t * D, Wk, bk, D, D);
-        matmul_xw(vv + t * D, xn + t * D, Wv, bv, D, D);
+        matmul_xw_auto(q  + t * D, xn + t * D, Wq, q8_slice(w->q_Wq, layer, (long)D*D), bq, D, D);
+        matmul_xw_auto(k  + t * D, xn + t * D, Wk, q8_slice(w->q_Wk, layer, (long)D*D), bk, D, D);
+        matmul_xw_auto(vv + t * D, xn + t * D, Wv, q8_slice(w->q_Wv, layer, (long)D*D), bv, D, D);
     }
     for (int hh = 0; hh < H; hh++) {
         for (int i = 0; i < T; i++) {
@@ -60,7 +60,7 @@ void blk_attention_mha(const Model *m, int layer, int T,
     }
     for (int t = 0; t < T; t++) {
         instr_touch("Wo", layer, t, (D * D + D) * sizeof(float));
-        matmul_xw(proj, ao + t * D, Wo, bo, D, D);
+        matmul_xw_auto(proj, ao + t * D, Wo, q8_slice(w->q_Wo, layer, (long)D*D), bo, D, D);
         for (int e = 0; e < D; e++) out_x[t * D + e] += proj[e];
     }
 }
@@ -85,9 +85,9 @@ void blk_attention_mha_step(const Model *m, RunState *s, int layer, int pos, int
     instr_touch("Wq", layer, pos, (D * D + D) * sizeof(float));
     instr_touch("Wk", layer, pos, (D * D + D) * sizeof(float));
     instr_touch("Wv", layer, pos, (D * D + D) * sizeof(float));
-    matmul_xw(s->q, s->xn, Wq, bq, D, D);
-    matmul_xw(kc + pos * D, s->xn, Wk, bk, D, D);
-    matmul_xw(vc + pos * D, s->xn, Wv, bv, D, D);
+    matmul_xw_auto(s->q, s->xn, Wq, q8_slice(w->q_Wq, layer, (long)D*D), bq, D, D);
+    matmul_xw_auto(kc + pos * D, s->xn, Wk, q8_slice(w->q_Wk, layer, (long)D*D), bk, D, D);
+    matmul_xw_auto(vc + pos * D, s->xn, Wv, q8_slice(w->q_Wv, layer, (long)D*D), bv, D, D);
 
     for (int hh = 0; hh < H; hh++) {
         float scale = 1.0f / sqrtf((float)HD);
@@ -108,6 +108,6 @@ void blk_attention_mha_step(const Model *m, RunState *s, int layer, int pos, int
         }
     }
     instr_touch("Wo", layer, pos, (D * D + D) * sizeof(float));
-    matmul_xw(s->proj, s->ao, Wo, bo, D, D);
+    matmul_xw_auto(s->proj, s->ao, Wo, q8_slice(w->q_Wo, layer, (long)D*D), bo, D, D);
     for (int e = 0; e < D; e++) s->x[e] += s->proj[e];
 }

@@ -72,6 +72,12 @@ typedef struct { char *name; uint8_t kind, scalar;     uint32_t group, block;
     int is_q8;
 } ERec;
 
+static int v4_is_q8_named(const ERec *encs, const TRec *tens, uint32_t n, const char *name) {
+    for (uint32_t i = 0; i < n; i++)
+        if (!strcmp(tens[i].name, name)) return encs[tens[i].dtype_id].is_q8;
+    return 0;
+}
+
 int v4_read_header(int fd, V4Header *h) {
     unsigned char b[88];
     if (pread(fd, b, sizeof b, 0) != (ssize_t)sizeof b) return -1;
@@ -475,30 +481,30 @@ int model_load_v4(Model *m, const char *path) {
 
         /* the layout the forward pass expects, as (offset_in_floats, size_in_floats) */
         long o = 0;
-        long off_token = o; o += v * dd;
-        long off_pos   = o; o += ctx * dd;
-        long off_ln1g  = o; o += Ll * dd;
-        long off_ln1b  = o; o += Ll * dd;
-        long off_Wq    = o; o += Ll * dd * dd;
-        long off_bq    = o; o += Ll * dd;
-        long off_Wk    = o; o += Ll * dd * dd;
-        long off_bk    = o; o += Ll * dd;
-        long off_Wv    = o; o += Ll * dd * dd;
-        long off_bv    = o; o += Ll * dd;
-        long off_Wo    = o; o += Ll * dd * dd;
-        long off_bo    = o; o += Ll * dd;
-        long off_ln2g  = o; o += Ll * dd;
-        long off_ln2b  = o; o += Ll * dd;
-        long off_W1    = o; o += ndense * dd * ffl;
-        long off_b1    = o; o += ndense * ffl;
-        long off_W2    = o; o += ndense * ffl * dd;
-        long off_b2    = o; o += ndense * dd;
-        long off_Wr    = o; o += nmoe * dd * N;
-        long off_br    = o; o += nmoe * N;
-        long off_W1s   = o; o += nmoe * dd * dd;
-        long off_b1s   = o; o += nmoe * dd;
-        long off_W2s   = o; o += nmoe * dd * dd;
-        long off_b2s   = o; o += nmoe * dd;
+        long off_token = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "token_emb")) o += v * dd;
+        long off_pos = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "pos_emb")) o += ctx * dd;
+        long off_ln1g = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "ln1_g")) o += Ll * dd;
+        long off_ln1b = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "ln1_b")) o += Ll * dd;
+        long off_Wq = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "Wq")) o += Ll * dd * dd;
+        long off_bq = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "bq")) o += Ll * dd;
+        long off_Wk = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "Wk")) o += Ll * dd * dd;
+        long off_bk = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "bk")) o += Ll * dd;
+        long off_Wv = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "Wv")) o += Ll * dd * dd;
+        long off_bv = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "bv")) o += Ll * dd;
+        long off_Wo = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "Wo")) o += Ll * dd * dd;
+        long off_bo = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "bo")) o += Ll * dd;
+        long off_ln2g = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "ln2_g")) o += Ll * dd;
+        long off_ln2b = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "ln2_b")) o += Ll * dd;
+        long off_W1 = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "W1")) o += ndense * dd * ffl;
+        long off_b1 = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "b1")) o += ndense * ffl;
+        long off_W2 = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "W2")) o += ndense * ffl * dd;
+        long off_b2 = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "b2")) o += ndense * dd;
+        long off_Wr = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "Wr")) o += nmoe * dd * N;
+        long off_br = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "br")) o += nmoe * N;
+        long off_W1s = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "W1s")) o += nmoe * dd * dd;
+        long off_b1s = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "b1s")) o += nmoe * dd;
+        long off_W2s = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "W2s")) o += nmoe * dd * dd;
+        long off_b2s = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "b2s")) o += nmoe * dd;
         /* Quantized experts are read from the file's blocks on the fly, so the fp32 expert
            region is not allocated at all — allocating it would defeat the purpose (379 MB
            here, multiple GB on a real model). */
@@ -518,8 +524,8 @@ int model_load_v4(Model *m, const char *path) {
             }
         }
         long off_exp   = o; o += q8_experts ? 0 : nmoe * N * exp_floats;
-        long off_lnfg  = o; o += dd;
-        long off_lnfb  = o; o += dd;
+        long off_lnfg = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "lnf_g")) o += dd;
+        long off_lnfb = o; if (!v4_is_q8_named(encs, tens, h.n_tensors, "lnf_b")) o += dd;
         long need = o;
 
         /* does every tensor sit exactly where the forward pass wants it, contiguous?
@@ -583,6 +589,9 @@ int model_load_v4(Model *m, const char *path) {
         float *p_W2 = NULL, *p_b2 = NULL, *p_Wr = NULL, *p_br = NULL;
         float *p_W1s = NULL, *p_b1s = NULL, *p_W2s = NULL, *p_b2s = NULL;
         float *p_exp = NULL, *p_lnfg = NULL, *p_lnfb = NULL;
+        const unsigned char *w_q_Wq = NULL, *w_q_Wk = NULL, *w_q_Wv = NULL, *w_q_Wo = NULL;
+        const unsigned char *w_q_W1 = NULL, *w_q_W2 = NULL, *w_q_W1s = NULL, *w_q_W2s = NULL;
+        const unsigned char *w_q_Wr = NULL;
 
         if (in_place) {
             /* zero copy: the file's payload is already the engine's layout */
@@ -637,6 +646,24 @@ int model_load_v4(Model *m, const char *path) {
             w_expert_bias = calloc((size_t)nmoe * N, sizeof *w_expert_bias);
             if (!w_experts_q8 || !w_expert_bias) {
                 fprintf(stderr, "v4: oom for expert pointer arrays\n"); goto done;
+            }
+        }
+
+        /* Quantized non-expert matrices: point at the file's blocks, in their own pass so it
+           runs whether or not anything is copied (the expert pointers below had exactly this
+           bug first — filled inside the copy loop, NULL under partial in-place, segfault). */
+        {
+            struct { const char *n; const unsigned char **slot; } qm[] = {
+                {"Wq", &w_q_Wq}, {"Wk", &w_q_Wk}, {"Wv", &w_q_Wv}, {"Wo", &w_q_Wo},
+                {"W1", &w_q_W1}, {"W2", &w_q_W2}, {"W1s", &w_q_W1s}, {"W2s", &w_q_W2s},
+                {"Wr", &w_q_Wr},
+            };
+            for (uint32_t i = 0; i < h.n_tensors; i++) {
+                const TRec *tc = &tens[i];
+                if (!encs[tc->dtype_id].is_q8 || tc->role == ROLE_EXPERT) continue;
+                for (size_t k = 0; k < sizeof qm / sizeof qm[0]; k++)
+                    if (!strcmp(tc->name, qm[k].n))
+                        *qm[k].slot = img + h.off_data + tc->off;
             }
         }
 
@@ -792,6 +819,9 @@ int model_load_v4(Model *m, const char *path) {
         w->Wr = p_Wr; w->br = p_br; w->W1s = p_W1s; w->b1s = p_b1s;
         w->W2s = p_W2s; w->b2s = p_b2s; w->experts = p_exp;
         w->lnf_g = p_lnfg; w->lnf_b = p_lnfb;
+        w->q_Wq = w_q_Wq; w->q_Wk = w_q_Wk; w->q_Wv = w_q_Wv; w->q_Wo = w_q_Wo;
+        w->q_W1 = w_q_W1; w->q_W2 = w_q_W2; w->q_W1s = w_q_W1s; w->q_W2s = w_q_W2s;
+        w->q_Wr = w_q_Wr;
         w->experts_q8 = w_experts_q8;
         w->expert_bias = w_expert_bias;
         w->is_moe = 1; w->d_model = (int)dd; w->n_moe = (int)nmoe; w->n_exp = (int)N;

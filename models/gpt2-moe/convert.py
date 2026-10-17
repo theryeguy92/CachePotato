@@ -193,6 +193,12 @@ def main():
     for slot in range(len(moe)):
         if "expert_bias.%d" % slot in tid:
             order_ids.append(tid["expert_bias.%d" % slot])
+    # ALL f32 tensors first, in engine order, then every quantized tensor. The loader computes
+    # its layout offsets skipping quantized tensors, so this ordering is what lets the f32
+    # prefix be used in place with no copy — for quantized matrices as well as experts.
+    f32_ids = [i for i in order_ids if w.tensors[i]["enc"] == "f32"]
+    q8_ids = [i for i in order_ids if w.tensors[i]["enc"] != "f32"]
+    order_ids = f32_ids + q8_ids
     if args.shuffle:
         np.random.default_rng(args.seed).shuffle(order_ids)
 

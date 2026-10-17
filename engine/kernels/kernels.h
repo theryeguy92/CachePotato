@@ -21,6 +21,10 @@ void matmul_wx(float *out, const float *x, const float *w, int n_in, int n_out);
 void q8_dequant_row(const uint8_t *blocks, float *out, int n);
 void matmul_xw_q8(float *out, const float *x, const uint8_t *w,
                   const float *bias, int n_in, int n_out);
+/* Dispatch: use the Q8 kernel when a quantized block pointer is present, else fp32. Lets a
+   block stay representation-agnostic — it never learns whether its weights are quantized. */
+void matmul_xw_auto(float *out, const float *x, const float *w, const uint8_t *q8,
+                    const float *bias, int n_in, int n_out);
 void matmul_wx_q8(float *out, const float *x, const uint8_t *w, int n_in, int n_out);
 
 #endif

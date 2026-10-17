@@ -44,7 +44,7 @@ void blk_moe_ffn(const Model *m, int slot, int layer, const float *xn, float *x,
         const float *xt = xn + (size_t)t * D;
         float *out = x + (size_t)t * D;
 
-        matmul_xw(rlog, xt, Wr, br, D, N);
+        matmul_xw_auto(rlog, xt, Wr, q8_slice(w->q_Wr, slot, (long)D*N), br, D, N);
         for (int e = 0; e < N; e++) p[e] = rlog[e] + (prev[e] ? lambda : 0.0f);
         softmax(p, N);
 
@@ -65,9 +65,9 @@ void blk_moe_ffn(const Model *m, int slot, int layer, const float *xn, float *x,
         pager_moe_access(slot, idx, K, t);
 
         /* shared expert */
-        matmul_xw(h, xt, W1s, b1s, D, D);
+        matmul_xw_auto(h, xt, W1s, q8_slice(w->q_W1s, slot, (long)D*D), b1s, D, D);
         for (int e = 0; e < D; e++) h[e] = gelu(h[e]);
-        matmul_xw(proj, h, W2s, b2s, D, D);
+        matmul_xw_auto(proj, h, W2s, q8_slice(w->q_W2s, slot, (long)D*D), b2s, D, D);
         for (int e = 0; e < D; e++) out[e] += proj[e];
 
         /* routed experts: one contiguous block per expert = one pager region */
@@ -118,7 +118,7 @@ void blk_moe_ffn_step(const Model *m, RunState *s, int slot, int layer,
     int *prev = s->moe_prev + (size_t)layer * N;
     float *p = s->moe_p;
 
-    matmul_xw(p, xn, Wr, br, D, N);
+    matmul_xw_auto(p, xn, Wr, q8_slice(w->q_Wr, slot, (long)D*N), br, D, N);
     const float lam = s->lam;
     for (int e = 0; e < N; e++) p[e] += prev[e] ? lam : 0.0f;
     softmax(p, N);
@@ -138,9 +138,9 @@ void blk_moe_ffn_step(const Model *m, RunState *s, int slot, int layer,
     pager_moe_access(slot, s->moe_idx, K, pos);
 
     /* shared expert */
-    matmul_xw(s->h, xn, W1s, b1s, D, D);
+    matmul_xw_auto(s->h, xn, W1s, q8_slice(w->q_W1s, slot, (long)D*D), b1s, D, D);
     for (int e = 0; e < D; e++) s->h[e] = gelu(s->h[e]);
-    matmul_xw(s->proj, s->h, W2s, b2s, D, D);
+    matmul_xw_auto(s->proj, s->h, W2s, q8_slice(w->q_W2s, slot, (long)D*D), b2s, D, D);
     for (int e = 0; e < D; e++) x[e] += s->proj[e];
 
     /* routed experts */
