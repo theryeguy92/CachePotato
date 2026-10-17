@@ -96,8 +96,10 @@ def main():
     # Which tensors get quantized: the large weight matrices, where the bytes are.
     Q8 = {"Wq","Wk","Wv","Wo","W1","W2","W1s","W2s","Wr"} if args.quant == "q8_0" else set()
 
-    def add(name, arr, role):
-        tid[name] = w.add_tensor(name, arr, role=role, enc="q8_0" if name in Q8 else "f32")
+    def add(name, arr, role, enc=None):
+        if enc is None:
+            enc = "q8_0" if name in Q8 else "f32"
+        tid[name] = w.add_tensor(name, arr, role=role, enc=enc)
 
     # global tensors
     add("token_emb", sd["token_emb"], V.R_EMBED)
@@ -120,11 +122,23 @@ def main():
         add(nm, sd[nm][moe], role)
     # routed experts: ONE TENSOR PER (layer, expert) so one expert is one pageable region
     # (SPEC §7.3 interleaved-pair arrangement, as this model's v3 file already uses)
-    for slot, l in enumerate(moe):
-        for e in range(N):
-            flat = np.concatenate([sd["W1e"][l, e].ravel(), sd["b1e"][l, e].ravel(),
-                                   sd["W2e"][l, e].ravel(), sd["b2e"][l, e].ravel()])
-            add("experts.%d.%d" % (slot, e), flat, V.R_EXPERT)
+    if args.quant == "q8_0":
+        # Quantized experts: the Q8 tensor holds W1 then W2 (both large matrices), and the
+        # biases move OUT of the quantized block into a per-slot f32 tensor. A bias inside a
+        # weight group would be scaled by the weights' peak and crushed to a step or two.
+        for slot, l in enumerate(moe):
+            for e in range(N):
+                wflat = np.concatenate([sd["W1e"][l, e].ravel(), sd["W2e"][l, e].ravel()])
+                add("experts.%d.%d" % (slot, e), wflat, V.R_EXPERT, enc="q8_0")
+            bias = np.concatenate([np.concatenate([sd["b1e"][l, e], sd["b2e"][l, e]])
+                                   for e in range(N)])
+            add("expert_bias.%d" % slot, bias, V.R_OTHER, enc="f32")
+    else:
+        for slot, l in enumerate(moe):
+            for e in range(N):
+                flat = np.concatenate([sd["W1e"][l, e].ravel(), sd["b1e"][l, e].ravel(),
+                                       sd["W2e"][l, e].ravel(), sd["b2e"][l, e].ravel()])
+                add("experts.%d.%d" % (slot, e), flat, V.R_EXPERT, enc="f32")
 
     # ---- blocks (SPEC §7). Param order is the spec's, and the loader reads it by index.
     w.add_block(V.KIND_EMBED, 0xFFFFFFFF, refs=[tid["token_emb"], tid["pos_emb"]],
@@ -166,6 +180,9 @@ def main():
     for slot in range(len(moe)):
         for e in range(N):
             order_ids.append(tid["experts.%d.%d" % (slot, e)])
+    for slot in range(len(moe)):
+        if "expert_bias.%d" % slot in tid:
+            order_ids.append(tid["expert_bias.%d" % slot])
     order_ids += [tid["lnf_g"], tid["lnf_b"]]
     if args.shuffle:
         np.random.default_rng(args.seed).shuffle(order_ids)
@@ -177,7 +194,8 @@ def main():
           % (info["tensors"], info["blocks"], info["regions"], info["off_data"]))
     print("  layout: %s" % ("SHUFFLED (exercises the copy path)" if args.shuffle
                             else "engine order (loads in place)"))
-    print("  encoding: %s (%d quantized tensor(s))" % (args.quant, len(Q8)))
+    print("  encoding: %s (%d matrices + %d expert blocks quantized)"
+          % (args.quant, len(Q8), len(moe) * N if args.quant == "q8_0" else 0))
     print("  step=%s lam=%s layer split: MoE %s dense %s (ASSUMED from --moe-from %d)"
           % (ck.get("step"), cfg["lam"], moe, dense, cfg["moe_from"]))
     return 0

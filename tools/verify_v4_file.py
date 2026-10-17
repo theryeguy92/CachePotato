@@ -235,13 +235,45 @@ def main():
             elif not np.array_equal(got[nm].ravel(), arr.ravel()):
                 mism.append(f"{nm}: values differ")
         # experts: v4 splits them per (slot, expert); v3 stores them packed
+        # Experts. Two layouts are legal and they are NOT interchangeable:
+        #   f32 : one tensor per expert, W1|b1|W2|b2 concatenated
+        #   q8  : one Q8 tensor per expert holding W1|W2, with biases moved to a separate
+        #         per-slot f32 tensor `expert_bias.<slot>` (a bias must not share a group
+        #         scale with weights). Comparing one against the other would report every
+        #         expert as a mismatch, which is what the first version of this did.
         exp = want["experts"]           # (n_moe, N, expert_floats)
         n_moe, N, ef = exp.shape
+        # care: want["W1"] is the DENSE FFN, not the expert matrix. Derive the expert
+        # geometry from the packed expert length instead: ef = 2*D*EH + EH + D.
+        D = want["W1"].shape[1]                 # d_model
+        EH = (ef - D) // (2 * D + 1)
+        w_elems = 2 * D * EH
+        assert ef == 2 * D * EH + EH + D, (ef, D, EH)
         for s in range(n_moe):
             for e in range(N):
                 nm = "experts.%d.%d" % (s, e)
                 if nm not in got: mism.append(f"{nm}: missing"); continue
-                if not np.array_equal(got[nm].ravel(), exp[s, e].ravel()):
+                src = exp[s, e]
+                v3_w = np.concatenate([src[:D * EH], src[D * EH + EH: D * EH + EH + EH * D]])
+                if got_enc.get(nm) == "q8":
+                    g = got[nm].ravel()
+                    if g.size != w_elems:
+                        mism.append(f"{nm}: {g.size} elements, expected {w_elems} (W1|W2)")
+                        continue
+                    d2 = np.abs(g - v3_w).max()
+                    peak = max(float(np.abs(v3_w).max()), 1e-30)
+                    q8_stats.append((nm, d2 / peak))
+                    if d2 / peak > 2.0 / 127:
+                        mism.append(f"{nm}: q8 error {d2/peak:.2e} exceeds bound")
+                    bnm = "expert_bias.%d" % s
+                    if bnm not in got:
+                        mism.append(f"{bnm}: missing (q8 experts need a bias tensor)")
+                        continue
+                    want_b = np.concatenate([src[D * EH: D * EH + EH], src[D * EH + EH + EH * D:]])
+                    have_b = got[bnm].ravel()[e * (EH + D): (e + 1) * (EH + D)]
+                    if not np.array_equal(have_b, want_b):
+                        mism.append(f"{bnm}[{e}]: bias values differ")
+                elif not np.array_equal(got[nm].ravel(), src.ravel()):
                     mism.append(f"{nm}: values differ")
         # Never say "identical" for a file that contains lossy tensors: the exact and the
         # bounded checks are different claims and must not be reported with one word.

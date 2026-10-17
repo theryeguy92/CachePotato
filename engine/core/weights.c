@@ -165,6 +165,17 @@ void layout_weights_v3(Weights *w, const HeaderV3 *h, float *ptr) {
     w->moe_from = h->moe_from;
 }
 
+/* Q8_0 byte length for `elems` values (groups of 32, 34 bytes each). */
+long q8_bytes_for(long elems) { return (elems / 32) * 34; }
+
+const unsigned char *expert_block_q8(const Weights *w, int slot, int e) {
+    return w->experts_q8 ? w->experts_q8[(size_t)slot * w->n_exp + e] : NULL;
+}
+
+const float *expert_bias_ptr(const Weights *w, int slot, int e) {
+    return w->expert_bias ? w->expert_bias[(size_t)slot * w->n_exp + e] : NULL;
+}
+
 float *expert_block(const Weights *w, int slot, int e) {
     return w->experts
          + ((size_t)slot * w->n_exp + e) * expert_floats(w->d_model, w->exp_hid);

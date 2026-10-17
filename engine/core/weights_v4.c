@@ -448,17 +448,30 @@ int model_load_v4(Model *m, const char *path) {
         long v = vocab, dd = d, ffl = ff, Ll = L;
         long nmoe = n_moe, ndense = n_dense, N = n_exp;
         long exp_floats = 0;
+        long exp_elems = 0;
+        int exp_is_q8 = 0;
         for (uint32_t i = 0; i < h.n_tensors; i++) {
             int s_, e_;
             if (tens[i].role == ROLE_EXPERT &&
                 sscanf(tens[i].name, "experts.%d.%d", &s_, &e_) == 2) {
-                exp_floats = (long)(tens[i].len / 4);
+                exp_is_q8 = encs[tens[i].dtype_id].is_q8;
+                /* `len` is BYTES, and for a block encoding bytes != 4*elements. exp_hid was
+                   derived from len/4 and silently became 50 instead of 192 for a Q8 file,
+                   which mis-pointed every expert bias. Use the LOGICAL shape for quantized
+                   tensors: the weight tensor is W1 then W2, so it holds 2*D*EH elements. */
+                exp_elems = 1;
+                for (int d2 = 0; d2 < tens[i].rank; d2++) exp_elems *= (long)tens[i].shape[d2];
+                exp_floats = exp_is_q8 ? 0 : (long)(tens[i].len / 4);
                 break;
             }
         }
-        if (exp_floats <= 0) { fprintf(stderr, "v4: no routed expert tensors\n"); goto done; }
-        long exp_hid = (exp_floats - dd) / (2L * dd);
-        if (exp_hid <= 0) { fprintf(stderr, "v4: cannot derive exp_hid from %ld floats\n", exp_floats); goto done; }
+        if (exp_is_q8 ? exp_elems <= 0 : exp_floats <= 0) {
+            fprintf(stderr, "v4: no routed expert tensors\n"); goto done;
+        }
+        long exp_hid = exp_is_q8 ? (exp_elems / (2L * dd))
+                                 : ((exp_floats - dd) / (2L * dd));
+        if (exp_hid <= 0) { fprintf(stderr, "v4: cannot derive exp_hid (%ld floats, %ld elems)\n",
+                                    exp_floats, exp_elems); goto done; }
 
         /* the layout the forward pass expects, as (offset_in_floats, size_in_floats) */
         long o = 0;
@@ -486,7 +499,11 @@ int model_load_v4(Model *m, const char *path) {
         long off_b1s   = o; o += nmoe * dd;
         long off_W2s   = o; o += nmoe * dd * dd;
         long off_b2s   = o; o += nmoe * dd;
-        long off_exp   = o; o += nmoe * N * exp_floats;
+        /* Quantized experts are read from the file's blocks on the fly, so the fp32 expert
+           region is not allocated at all — allocating it would defeat the purpose (379 MB
+           here, multiple GB on a real model). */
+        int q8_experts = exp_is_q8;
+        long off_exp   = o; o += q8_experts ? 0 : nmoe * N * exp_floats;
         long off_lnfg  = o; o += dd;
         long off_lnfb  = o; o += dd;
         long need = o;
@@ -589,6 +606,18 @@ int model_load_v4(Model *m, const char *path) {
            earlier version used one stride (d*d) for every layer-indexed tensor and guarded
            the offset with `li > 0`, which silently misplaced layer 0 and every bias/norm
            (their per-layer stride is d, not d*d). */
+        /* Pointer arrays for quantized experts: built whether or not the payload is copied,
+           because they point into the mapped file rather than into the layout buffer. */
+        const unsigned char **w_experts_q8 = NULL;
+        const float **w_expert_bias = NULL;
+        if (q8_experts) {
+            w_experts_q8 = calloc((size_t)nmoe * N, sizeof *w_experts_q8);
+            w_expert_bias = calloc((size_t)nmoe * N, sizeof *w_expert_bias);
+            if (!w_experts_q8 || !w_expert_bias) {
+                fprintf(stderr, "v4: oom for expert pointer arrays\n"); goto done;
+            }
+        }
+
         if (!in_place) {
             int bad = 0;
             for (uint32_t i = 0; i < h.n_tensors && !bad; i++) {
@@ -619,8 +648,20 @@ int model_load_v4(Model *m, const char *path) {
                 int s2 = -1, e2 = -1;
                 const char *nm = tc->name;
 
+                if (!strncmp(nm, "expert_bias.", 12)) {
+                    int sl = -1;
+                    if (sscanf(nm, "expert_bias.%d", &sl) != 1) continue;
+                    const float *bs = (const float *)(img + h.off_data + tc->off);
+                    for (int e3 = 0; e3 < N; e3++)
+                        w_expert_bias[(size_t)sl * N + e3] = bs + (size_t)e3 * (exp_hid + dd);
+                    continue;
+                }
                 if (tc->role == ROLE_EXPERT) {
                     if (sscanf(nm, "experts.%d.%d", &s2, &e2) != 2) continue;
+                    if (tq8) {
+                        w_experts_q8[(size_t)s2 * N + e2] = (const unsigned char *)srcb;
+                        continue;
+                    }
                     base = p_exp; stride = exp_floats;
                     exp = exp_floats;
                     if (cnt != exp) { fprintf(stderr, "v4: %s size mismatch\n", nm); bad = 1; break; }
@@ -703,6 +744,8 @@ int model_load_v4(Model *m, const char *path) {
         w->Wr = p_Wr; w->br = p_br; w->W1s = p_W1s; w->b1s = p_b1s;
         w->W2s = p_W2s; w->b2s = p_b2s; w->experts = p_exp;
         w->lnf_g = p_lnfg; w->lnf_b = p_lnfb;
+        w->experts_q8 = w_experts_q8;
+        w->expert_bias = w_expert_bias;
         w->is_moe = 1; w->d_model = (int)dd; w->n_moe = (int)nmoe; w->n_exp = (int)N;
         w->exp_hid = (int)exp_hid; w->topk = topk; w->moe_from = moe_from;
         w->moe_slot = malloc((size_t)Ll * sizeof(int));

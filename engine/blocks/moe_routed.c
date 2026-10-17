@@ -72,13 +72,24 @@ void blk_moe_ffn(const Model *m, int slot, int layer, const float *xn, float *x,
 
         /* routed experts: one contiguous block per expert = one pager region */
         for (int s = 0; s < K; s++) {
-            float *blk = expert_block(w, slot, idx[s]);
-            const float *b1e = blk + (size_t)D * EH;
-            const float *W2e = b1e + EH;
-            const float *b2e = W2e + (size_t)EH * D;
-            matmul_xw(h, xt, blk, b1e, D, EH);
-            for (int e = 0; e < EH; e++) h[e] = gelu(h[e]);
-            matmul_xw(proj, h, W2e, b2e, EH, D);
+            if (w->experts_q8) {
+                /* quantized: stream the blocks, never materialise fp32 weights */
+                const unsigned char *W1q = expert_block_q8(w, slot, idx[s]);
+                const float *b1e = expert_bias_ptr(w, slot, idx[s]);
+                const float *b2e = b1e + EH;
+                const unsigned char *W2q = W1q + q8_bytes_for((long)D * EH);
+                matmul_xw_q8(h, xt, W1q, b1e, D, EH);
+                for (int e = 0; e < EH; e++) h[e] = gelu(h[e]);
+                matmul_xw_q8(proj, h, W2q, b2e, EH, D);
+            } else {
+                float *blk = expert_block(w, slot, idx[s]);
+                const float *b1e = blk + (size_t)D * EH;
+                const float *W2e = b1e + EH;
+                const float *b2e = W2e + (size_t)EH * D;
+                matmul_xw(h, xt, blk, b1e, D, EH);
+                for (int e = 0; e < EH; e++) h[e] = gelu(h[e]);
+                matmul_xw(proj, h, W2e, b2e, EH, D);
+            }
             for (int e = 0; e < D; e++) out[e] += wt[s] * proj[e];
         }
 
@@ -134,13 +145,23 @@ void blk_moe_ffn_step(const Model *m, RunState *s, int slot, int layer,
 
     /* routed experts */
     for (int k = 0; k < K; k++) {
-        float *blk = expert_block(w, slot, s->moe_idx[k]);
-        const float *b1e = blk + (size_t)D * EH;
-        const float *W2e = b1e + EH;
-        const float *b2e = W2e + (size_t)EH * D;
-        matmul_xw(s->h, xn, blk, b1e, D, EH);
-        for (int e = 0; e < EH; e++) s->h[e] = gelu(s->h[e]);
-        matmul_xw(s->proj, s->h, W2e, b2e, EH, D);
+        if (w->experts_q8) {
+            const unsigned char *W1q = expert_block_q8(w, slot, s->moe_idx[k]);
+            const float *b1e = expert_bias_ptr(w, slot, s->moe_idx[k]);
+            const float *b2e = b1e + EH;
+            const unsigned char *W2q = W1q + q8_bytes_for((long)D * EH);
+            matmul_xw_q8(s->h, xn, W1q, b1e, D, EH);
+            for (int e = 0; e < EH; e++) s->h[e] = gelu(s->h[e]);
+            matmul_xw_q8(s->proj, s->h, W2q, b2e, EH, D);
+        } else {
+            float *blk = expert_block(w, slot, s->moe_idx[k]);
+            const float *b1e = blk + (size_t)D * EH;
+            const float *W2e = b1e + EH;
+            const float *b2e = W2e + (size_t)EH * D;
+            matmul_xw(s->h, xn, blk, b1e, D, EH);
+            for (int e = 0; e < EH; e++) s->h[e] = gelu(s->h[e]);
+            matmul_xw(s->proj, s->h, W2e, b2e, EH, D);
+        }
         for (int e = 0; e < D; e++) x[e] += s->moe_wt[k] * s->proj[e];
     }
 
