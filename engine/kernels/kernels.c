@@ -93,3 +93,89 @@ void matmul_wx(float *out, const float *x, const float *w, int n_in, int n_out) 
         out[i] = acc;
     }
 }
+
+/* ---------------------------------------------------------------- Q8_0 (format/SPEC.md §6)
+ *
+ * Group = 34 bytes: fp16 scale, then 32 int8.  decode: y[i] = (float)q[i] * d
+ *
+ * The layout is llama.cpp's Q8_0 on purpose, so a published checkpoint needs no re-encoding
+ * (SPEC §6 option 1). `format/q8.py` is the reference and `tools/verify_q8_decode.py` requires
+ * EXACT equality between the two decoders: the scale is fp16, an exact subset of fp32, so
+ * `q * d` has exactly one correct fp32 answer and there is no tolerance to hide a mistake in.
+ */
+#include <stdint.h>
+#include <string.h>
+
+static float f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp  = (h >> 10) & 0x1Fu;
+    uint32_t mant = h & 0x3FFu;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) { f = sign; }
+        else {                       /* subnormal: renormalise */
+            uint32_t e = 127 - 15 + 1;
+            while (!(mant & 0x400u)) { mant <<= 1; e--; }
+            mant &= 0x3FFu;
+            f = sign | (e << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {          /* inf / nan: preserve */
+        f = sign | 0x7F800000u | (mant << 13);
+    } else {
+        f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float r;
+    memcpy(&r, &f, sizeof r);        /* avoid a strict-aliasing violation */
+    return r;
+}
+
+static float q8_scale(const uint8_t *blk) {
+    uint16_t h = (uint16_t)(blk[0] | (blk[1] << 8));
+    return f16_to_f32(h);
+}
+
+void q8_dequant_row(const uint8_t *blocks, float *out, int n) {
+    int ng = n / 32;
+    for (int g = 0; g < ng; g++) {
+        const uint8_t *blk = blocks + (size_t)g * 34;
+        float d = q8_scale(blk);
+        const int8_t *q = (const int8_t *)(blk + 2);
+        for (int i = 0; i < 32; i++) out[g * 32 + i] = (float)q[i] * d;
+    }
+}
+
+/* out[j] += x[k] * W[k][j], W row-quantized with groups along n_out. Dequantised inline so
+ * no scratch buffer (and no per-call allocation) is needed. */
+void matmul_xw_q8(float *out, const float *x, const uint8_t *w,
+                  const float *bias, int n_in, int n_out) {
+    const int ng = n_out / 32;
+    const size_t rowbytes = (size_t)ng * 34;
+    for (int j = 0; j < n_out; j++) out[j] = bias[j];
+    for (int k = 0; k < n_in; k++) {
+        float xk = x[k];
+        const uint8_t *row = w + (size_t)k * rowbytes;
+        for (int g = 0; g < ng; g++) {
+            float d = q8_scale(row + (size_t)g * 34);
+            const int8_t *q = (const int8_t *)(row + (size_t)g * 34 + 2);
+            float *o = out + g * 32;
+            for (int i = 0; i < 32; i++) o[i] += xk * ((float)q[i] * d);
+        }
+    }
+}
+
+/* out[i] = sum_k W[i][k] * x[k], W row-quantized. Same accumulation order as the fp32
+ * version (groups in order, elements within a group in order); only the values differ. */
+void matmul_wx_q8(float *out, const float *x, const uint8_t *w, int n_in, int n_out) {
+    const int ng = n_in / 32;
+    const size_t rowbytes = (size_t)ng * 34;
+    for (int i = 0; i < n_out; i++) {
+        const uint8_t *row = w + (size_t)i * rowbytes;
+        float acc = 0.0f;
+        for (int g = 0; g < ng; g++) {
+            float d = q8_scale(row + (size_t)g * 34);
+            const int8_t *q = (const int8_t *)(row + (size_t)g * 34 + 2);
+            for (int j = 0; j < 32; j++) acc += ((float)q[j] * d) * x[g * 32 + j];
+        }
+        out[i] = acc;
+    }
+}
