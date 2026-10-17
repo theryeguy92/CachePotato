@@ -83,18 +83,38 @@ models/qwen2.5-0.5b/
 
 ## 5. Verification plan
 
-The gpt2-moe port could be gated against routing recorded from its own trainer. This model has
-no routing (it is dense), so the oracle is different and *stronger* in one respect: the
-**published weights themselves are the reference**. The gate is:
+The gpt2-moe port could be gated against routing recorded from its own trainer. This model is
+dense, so there is no routing to record — but the reference is stronger in one respect: **the
+published weights are the target**, checked through a library that is not ours.
 
-1. Run HF `transformers` on a fixed prompt, record logits (and the top-k distribution).
-2. `reference.py` must reproduce those logits to a stated tolerance — a genuine
-   cross-implementation check, since HF is not ours.
-3. The C engine must then reproduce `reference.py` exactly on argmax and within the
-   fp32-accumulation tolerance on logits (the same 5e-4 bound established for gpt2-moe).
+**The target is recorded, not recomputed.** `tools/record_hf_baseline.py` wrote
+`data/traces/qwen25_05b_hf.npz` (21.6 MB, gitignored like the other traces):
 
-If (2) fails, the reference is wrong, not HF. If (3) fails, the engine is wrong, not the
-reference. That ordering is the point.
+| field | contents |
+|---|---|
+| `raw_logits` | (5, 151936) fp32 for `"The capital of France is"` |
+| `chat_logits` | (34, 151936) fp32 for the `<\|im_start\|>` templated form |
+| `*_greedy` | a 16-token greedy continuation from those logits |
+| `*_top_ids/_vals` | top-32 per position, readable without numpy |
+| `meta` | torch version, dtype, thread count, **weights sha256** |
+
+Verified **bit-identical across two independent recordings** (max|Δ| = 0.000e+00), which is the
+property that makes it a target: a baseline that drifts between runs lets a drifting port pass.
+
+Recorded behaviour: the raw prompt continues `" Paris. It is the largest city in Europe…"`; the
+chat form answers `"The capital of France is Paris.<|im_end|>"`. So the model is credible and
+both the plain and the templated paths have a target.
+
+**The gate order, and why it cannot be reordered:**
+
+1. `reference.py` (numpy) vs `raw_logits` — a real cross-implementation check, since HF is not
+   ours. **If this fails, the reference is wrong, not HF.**
+2. The C engine vs `reference.py` — argmax exact, logits within the 5e-4 fp32-accumulation
+   bound established on gpt2-moe. **If this fails, the engine is wrong, not the reference.**
+
+**And the rule written into the recorder's own output:** *do not regenerate this file to make a
+failing test pass.* Re-recording to match a buggy implementation is the one failure mode that
+would make every downstream gate meaningless.
 
 ## 6. Speed expectation, stated before measuring
 
