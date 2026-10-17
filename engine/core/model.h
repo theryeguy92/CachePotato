@@ -3,6 +3,11 @@
 
 #include "weights.h"
 
+/* End-of-sequence token: resets the locality set, so the engine needs it for its own state
+   and a block needs it for the same reason. One definition, in the header, so a port with a
+   different EOS can change it once. */
+#define CP_EOS_TOKEN 50256
+
 /* Full-sequence forward pass (prompt processing / verification mode).
    Fills logits_out: (T, vocab) row-major; row t scores what follows token t.
    Mirrors experiments/forward_by_hand.py exactly — same op order, same mask.
