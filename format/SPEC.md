@@ -154,6 +154,26 @@ would be split and the tensor would not decode.
 (a) named by `scalar`, (b) implemented by the port's decoder, and (c) reproduced exactly by
 the port's Python decoder against the C decoder.
 
+**Q8_0 (scalar 3) — DEFINED here, 2026-10-17.** 34-byte group, 32 elements:
+
+| bytes | content |
+|---|---|
+| 0..1 | `d`, an fp16 scale, little-endian |
+| 2..33 | 32 × int8 |
+
+Decode is `y[i] = (float)q[i] * d`. Encoding is `d = max|x| / 127` (fp16-rounded **first**,
+then used for quantization so the stored scale and the values agree), `q = clamp(round(x/d),
+-127, 127)`. The range is ±127, not ±128: **-128 is deliberately unused**, because a symmetric
+range that includes it decodes one LSB away from every other implementation of this layout.
+
+The layout matches llama.cpp's Q8_0 so published checkpoints need no re-encoding (§6 option 1).
+
+*Exactness:* the scale is fp16, an exact subset of fp32, so `q * d` has **exactly one** correct
+fp32 answer. The decoder is therefore gated bit-exactly, C against Python
+(`tools/verify_q8_decode.py`), with no tolerance. The *matmul* over decoded values is not
+bit-exact and cannot be (summation order; FMA on vector paths), so it is gated against
+`dequant + matmul` at 1e-5 relative (`tools/verify_q8_kernels.py`).
+
 **This is where the project must make a decision, and it should be made deliberately.**
 `IQ2_XXS`'s full definition is a hierarchical codebook (a 256-entry grid, an 8-bit sign
 pattern, and a per-8-element scale). Implementing it exactly, in dependency-free C11, is the

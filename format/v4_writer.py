@@ -34,6 +34,8 @@ from pathlib import Path
 
 import numpy as np
 
+import q8 as _q8
+
 MAGIC = 0x34575043          # "CPW4"
 VERSION = 4
 HDR_BYTES = 88
@@ -82,15 +84,32 @@ class V4Writer:
         self.tensors = []      # dicts, index == tensor id
         self.blocks = []
         self.regions = []
+        self.ENCODINGS = []
 
     # ---------------- tensors
-    def add_tensor(self, name, array, role=R_OTHER, dtype_id=0):
-        """Register a tensor; offset is assigned at write() time. Returns its id."""
+    def add_tensor(self, name, array, role=R_OTHER, enc="f32"):
+        """Register a tensor; offset is assigned at write() time. Returns its id.
+
+        `enc` is "f32" or "q8_0". The SHAPE stays logical (elements) and the stored length
+        differs for a block encoding — the loader checks `length` against the encoding's
+        group/block size, so the two are not interchangeable (SPEC §5).
+        """
         a = np.ascontiguousarray(array, dtype="<f4")
+        self._use_enc(enc)
+        if enc == "q8_0":
+            raw, _ = _q8.encode_q8_0(a)
+        elif enc == "f32":
+            raw = a.tobytes()
+        else:
+            raise ValueError(f"unknown encoding {enc!r}")
         self.tensors.append(dict(name=name, shape=tuple(int(x) for x in a.shape),
-                                 role=role, dtype=dtype_id, raw=a.tobytes(),
+                                 role=role, enc=enc, raw=raw,
                                  offset=None, pad=0))
         return len(self.tensors) - 1
+
+    def _use_enc(self, enc):
+        if enc not in self.ENCODINGS:
+            self.ENCODINGS.append(enc)
 
     def tensor_id(self, name):
         for i, t in enumerate(self.tensors):
@@ -143,16 +162,25 @@ class V4Writer:
               layout=None):
         """Emit the file. `encoding` is (id, kind, scalar, group, block_bytes, sub, flags,
         align, name) per SPEC §4; the default is one raw-f32 entry."""
-        eid, ek, esc, egrp, eblk, esub, eflag, ealign, ename = encoding
         if self._place(layout) == 0 and self.tensors:
             raise ValueError("no payload")
+        if not self.ENCODINGS:
+            self.ENCODINGS = ["f32"]
+        n_encodings = len(self.ENCODINGS)
 
-        enc = _W().u32(eid).u8(ek).u8(esc).u16(egrp).u16(eblk)
-        enc.u8(esub).u8(eflag).u8(ealign).string(ename)
+        # One record per encoding actually used. f32 and Q8_0 have different block geometry,
+        # and the loader checks each tensor's stored length against its own record.
+        DESC = {"f32":  (0, 0, 0, 4, 1, 0, 4, "f32"),
+                "q8_0": (1, 3, 32, 34, 1, 3, 64, "Q8_0")}
+        enc = _W()
+        for i, name in enumerate(self.ENCODINGS):
+            ek, esc, egrp, eblk, esub, eflag, ealign, ename = DESC[name]
+            enc.u32(i).u8(ek).u8(esc).u16(egrp).u16(eblk)
+            enc.u8(esub).u8(eflag).u8(ealign).string(ename)
 
         tens = _W().u32(len(self.tensors))
         for t in self.tensors:
-            tens.string(t["name"]).u32(t["dtype"]).u8(len(t["shape"]))
+            tens.string(t["name"]).u32(self.ENCODINGS.index(t["enc"])).u8(len(t["shape"]))
             for d in t["shape"]:
                 tens.u32(d)
             tens.u64(t["offset"]).u64(len(t["raw"]))

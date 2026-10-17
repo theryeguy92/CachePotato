@@ -55,6 +55,11 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--moe-from", type=int, default=1,
                     help="first MoE layer; NOT recorded in the checkpoint (MODEL.md §3)")
+    ap.add_argument("--quant", choices=["none", "q8_0"], default="none",
+                    help="Q8_0 the big matrices (attention, dense FFN, shared expert, router). "
+                         "Embeddings, norms, biases and the expert pool stay fp32: biases must "
+                         "not share a group scale with weights, and the expert pool needs a "
+                         "split layout (next increment).")
     ap.add_argument("--shuffle", action="store_true",
                     help="write the payload in a different physical order (format test)")
     ap.add_argument("--seed", type=int, default=20261016)
@@ -88,8 +93,11 @@ def main():
     w = V.V4Writer()
     tid = {}
 
+    # Which tensors get quantized: the large weight matrices, where the bytes are.
+    Q8 = {"Wq","Wk","Wv","Wo","W1","W2","W1s","W2s","Wr"} if args.quant == "q8_0" else set()
+
     def add(name, arr, role):
-        tid[name] = w.add_tensor(name, arr, role=role)
+        tid[name] = w.add_tensor(name, arr, role=role, enc="q8_0" if name in Q8 else "f32")
 
     # global tensors
     add("token_emb", sd["token_emb"], V.R_EMBED)
@@ -169,6 +177,7 @@ def main():
           % (info["tensors"], info["blocks"], info["regions"], info["off_data"]))
     print("  layout: %s" % ("SHUFFLED (exercises the copy path)" if args.shuffle
                             else "engine order (loads in place)"))
+    print("  encoding: %s (%d quantized tensor(s))" % (args.quant, len(Q8)))
     print("  step=%s lam=%s layer split: MoE %s dense %s (ASSUMED from --moe-from %d)"
           % (ck.get("step"), cfg["lam"], moe, dense, cfg["moe_from"]))
     return 0

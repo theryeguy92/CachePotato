@@ -193,11 +193,27 @@ def main():
             for nm, shape in v3.payload_layout(cfg):
                 want[nm] = np.frombuffer(f.read(int(np.prod(shape)) * 4),
                                          dtype="<f4").reshape(shape).copy()
-        got = {}
+        # Decode per the tensor's OWN encoding. A raw-f32 tensor must match v3 exactly; a
+        # block-quantized tensor is LOSSY by construction, so it is checked against a bound
+        # and its measured error is reported. Conflating the two is how a legitimate Q8 file
+        # got reported as "9 tensor value mismatches" — the check was exact for everything.
+        import sys as _s, pathlib as _p
+        _s.path.insert(0, str(_p.Path(__file__).resolve().parents[1] / "format"))
+        import q8 as _q8
+        enc_of = {e["id"]: e for e in encs}
+        got, got_enc = {}, {}
         for t in tens:
-            got[t["name"]] = np.frombuffer(b, dtype="<f4", count=t["len"] // 4,
-                                           offset=o_data + t["off"])
-        mism = []
+            e = enc_of[t["dtype"]]
+            n = int(np.prod(t["shape"])) if t["shape"] else 0
+            if e["name"].upper().startswith("Q8"):
+                blk = np.frombuffer(b, dtype=np.uint8, count=t["len"], offset=o_data + t["off"])
+                got[t["name"]] = _q8.decode_q8_0(blk.tobytes(), t["shape"]).ravel()
+                got_enc[t["name"]] = "q8"
+            else:
+                got[t["name"]] = np.frombuffer(b, dtype="<f4", count=n,
+                                               offset=o_data + t["off"])
+                got_enc[t["name"]] = "f32" 
+        mism, q8_stats = [], []
         for nm, arr in want.items():
             if nm == "experts":
                 continue
@@ -208,7 +224,15 @@ def main():
             # how the "344 tensor value mismatches" in this tool's first working version
             # were produced. Flatten, then compare values (not shapes: shape is a table
             # property checked above).
-            if not np.array_equal(got[nm].ravel(), arr.ravel()):
+            if got_enc.get(nm) == "q8":
+                # lossy: bounded by the 127-level symmetric quantizer, checked as a fraction
+                # of each tensor's own peak magnitude
+                d = np.abs(got[nm].ravel() - arr.ravel()).max()
+                peak = max(float(np.abs(arr).max()), 1e-30)
+                q8_stats.append((nm, d / peak))
+                if d / peak > 2.0 / 127:
+                    mism.append(f"{nm}: q8 error {d/peak:.2e} exceeds 2/127 of peak")
+            elif not np.array_equal(got[nm].ravel(), arr.ravel()):
                 mism.append(f"{nm}: values differ")
         # experts: v4 splits them per (slot, expert); v3 stores them packed
         exp = want["experts"]           # (n_moe, N, expert_floats)
@@ -219,7 +243,16 @@ def main():
                 if nm not in got: mism.append(f"{nm}: missing"); continue
                 if not np.array_equal(got[nm].ravel(), exp[s, e].ravel()):
                     mism.append(f"{nm}: values differ")
-        print(f"  value round-trip vs v3: {'IDENTICAL' if not mism else 'MISMATCH'}")
+        # Never say "identical" for a file that contains lossy tensors: the exact and the
+        # bounded checks are different claims and must not be reported with one word.
+        if q8_stats:
+            worst = max(e for _, e in q8_stats)
+            print(f"  value round-trip vs v3: f32 tensors EXACT; "
+                  f"{len(q8_stats)} quantized tensor(s) within bound "
+                  f"(worst {worst:.2%} of peak, limit {2/127:.2%})"
+                  + ("" if not mism else "  -- MISMATCH"))
+        else:
+            print(f"  value round-trip vs v3: {'IDENTICAL' if not mism else 'MISMATCH'}")
         for m in mism[:6]: print("     ", m)
         if mism: errs.append(f"{len(mism)} tensor value mismatches")
 

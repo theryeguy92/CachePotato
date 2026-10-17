@@ -136,3 +136,33 @@ and the mitigation would have to be a better encoding, not a fp32 exception.
 **Consequence:** quantization costs ~0.8% of routing decisions and ~1% of argmax positions here
 and that cost is inherent. A quantized port is therefore gated on **quality** (routing and argmax
 agreement, loss on held-out data), never on exactness, and must be labelled Tier C.
+
+---
+
+# End to end: a Q8_0 file that the engine loads
+
+`models/gpt2-moe/convert.py --quant q8_0` writes a v4 file whose attention, dense FFN, shared
+expert and router tensors are Q8_0 while embeddings, norms, biases and the expert pool stay f32.
+The loader decodes each block into its engine layout; the independent validator reads the file
+back and reports the two kinds of check separately.
+
+| | |
+|---|---|
+| file size | 735.8 MB → **589.6 MB** (1.25× — only 9 tensors quantized) |
+| validator | `f32 tensors EXACT; 9 quantized tensor(s) within bound (worst 0.39% of peak, limit 1.57%)` |
+| engine vs fp32 engine, 128 tokens | routing **99.0234%** same, logits max\|Δ\| 1.38, argmax **127/128** |
+
+The engine number matches the numpy prediction (~99.2%), which is the point: the loader decodes
+what the encoder wrote, and the quality cost measured in Python is the quality cost measured in C.
+
+## Two limits, stated plainly
+
+1. **The expert pool is still f32.** It is ~51% of the params here and ~95% of a real MoE's
+   bytes. Quantizing it needs a split tensor layout (`experts.<slot>.<e>.w` Q8 +
+   `.b` f32), because a bias must not share a group scale with weights — the scale would be set
+   by the weights and crush the bias to a step or two.
+2. **Dequantization happens at LOAD, not on the fly.** So this proves the format→loader→engine
+   path and gives a 1.25× smaller file, but it does not yet reach the Q8 kernels during
+   inference: RSS stays fp32 and speed is unchanged. On-the-fly dispatch is what makes a 4-bit
+   port *fit* on a 16 GB machine — at load-time dequant a 15 GB quantized model would need 60 GB
+   of RSS.

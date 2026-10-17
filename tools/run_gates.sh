@@ -33,6 +33,20 @@ fi
 
 # First port (models/gpt2-moe). Skipped unless its checkpoint exists, since weights are
 # gitignored. Converts the checkpoint to v4, then runs the port's own gate.
+printf '  %-22s ' "q8_file"
+out=$(python3 models/gpt2-moe/convert.py --ckpt weights/moe-scale-run/l05/model_only.pt \
+        --out scratch/l05_q8.v4cp --quant q8_0 2>&1); rc=$?
+if [ $rc -eq 0 ]; then
+    v=$(python3 tools/verify_v4_file.py --file scratch/l05_q8.v4cp \
+          --v3 weights/moe-scale-run/l05.cpw1v3 2>&1)
+    echo "$v" | grep -q "V4 FORMAT: PASS" || rc=1
+    run=$(CP_V4_LAMBDA=0.5 ./build/cachepotato scratch/l05_q8.v4cp --moe-sel \
+            data/fineweb_edu_valid.bin 0 16 scratch/q8_gate.bin 2>&1)
+    echo "$run" | grep -q "next-argmax" || rc=1
+fi
+if [ $rc -eq 0 ]; then echo " PASS — Q8_0 file validates and the engine runs it"
+else echo " FAIL — see scratch/l05_q8.v4cp"; fail=1; fi
+
 printf '  %-22s ' "q8_kernels"
 out=$(python3 tools/verify_q8_kernels.py 2>&1); rc=$?
 echo "$out" | grep -E "^Q8 KERNELS" | tail -1 | sed 's/^/ /'

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "weights_v4.h"
+#include "kernels/kernels.h"
 
 #include <fcntl.h>
 #include <errno.h>
@@ -67,7 +68,9 @@ typedef struct { uint8_t kind; uint32_t layer; uint8_t n_refs; uint32_t refs[MAX
                  uint8_t n_params; uint32_t params[MAX_PARAMS]; } BRec;
 typedef struct { uint64_t off, len; uint32_t lo, hi; uint8_t kind; uint16_t slot;
                  uint32_t mlo, mhi; uint64_t digest; } RRec;
-typedef struct { char *name; uint8_t kind, scalar; } ERec;
+typedef struct { char *name; uint8_t kind, scalar;     uint32_t group, block;
+    int is_q8;
+} ERec;
 
 int v4_read_header(int fd, V4Header *h) {
     unsigned char b[88];
@@ -134,7 +137,10 @@ int model_load_v4(Model *m, const char *path) {
         for (uint32_t i = 0; i < n_enc; i++) {
             if (o + 13 > fsz) goto done;
             ERec *e = &encs[i];
-            o += 4; e->kind = img[o++]; e->scalar = img[o++]; o += 4 + 3;
+            o += 4; e->kind = img[o++]; e->scalar = img[o++];
+            e->group = rd_u16(img + o); o += 2;
+            e->block = rd_u16(img + o); o += 2;
+            o += 3;   /* sub_blocks, flags, align */
             uint16_t n = rd_u16(img + o); o += 2;
             if (o + n > fsz) goto done;
             e->name = strndup((const char *)img + o, n); o += n;
@@ -146,13 +152,21 @@ int model_load_v4(Model *m, const char *path) {
             goto done;
         }
     }
-    for (uint32_t i = 0; i < n_enc; i++)
-        if (encs[i].kind != 0 || encs[i].scalar != 0) {
-            fprintf(stderr, "v4: encoding \"%s\" (kind %u scalar %u) is not raw f32 — this "
-                            "loader implements raw f32 only and refuses rather than "
-                            "approximating\n", encs[i].name, encs[i].kind, encs[i].scalar);
+    /* Raw f32 and Q8_0 are implemented. Anything else is refused rather than approximated:
+       a wrong decode produces confident nonsense, not a crash. */
+    for (uint32_t i = 0; i < n_enc; i++) {
+        int raw = (encs[i].kind == 0 && encs[i].scalar == 0);
+        int q8  = (encs[i].kind == 1 && encs[i].scalar == 3 &&
+                   encs[i].group == 32 && encs[i].block == 34);
+        if (!raw && !q8) {
+            fprintf(stderr, "v4: encoding \"%s\" (kind %u scalar %u group %u block %u) is not "
+                            "implemented — this loader supports raw f32 and Q8_0 "
+                            "(group 32, 34-byte block) and refuses rather than approximating\n",
+                    encs[i].name, encs[i].kind, encs[i].scalar, encs[i].group, encs[i].block);
             goto done;
         }
+        encs[i].is_q8 = q8 ? 1 : 0;
+    }
 
     /* ---- tensor table */
     tens = calloc(h.n_tensors ? h.n_tensors : 1, sizeof *tens);
@@ -480,6 +494,9 @@ int model_load_v4(Model *m, const char *path) {
         /* does every tensor sit exactly where the forward pass wants it, contiguous?
            expected offset (floats, relative to off_data) per tensor */
         int in_place = 1;
+        /* A quantized tensor can never be used in place: the forward pass needs fp32. */
+        for (uint32_t i = 0; i < h.n_tensors; i++)
+            if (encs[tens[i].dtype_id].is_q8) { in_place = 0; break; }
         for (uint32_t i = 0; i < h.n_tensors && in_place; i++) {
             const TRec *t2 = &tens[i];
             long want = -1, idx = 0, stride = 0;
@@ -576,8 +593,27 @@ int model_load_v4(Model *m, const char *path) {
             int bad = 0;
             for (uint32_t i = 0; i < h.n_tensors && !bad; i++) {
                 const TRec *tc = &tens[i];
-                float *src = (float *)(img + h.off_data + tc->off);
-                long cnt = (long)(tc->len / 4);
+                const unsigned char *srcb = img + h.off_data + tc->off;
+                float *src = (float *)srcb;
+                const int tq8 = encs[tc->dtype_id].is_q8;
+                long logical = 1;
+                for (int d = 0; d < tc->rank; d++) logical *= (long)tc->shape[d];
+                /* The stored length is bytes; the logical length is elements. For Q8 a tensor
+                   of N elements occupies N/32 blocks of 34 bytes, so the two differ and every
+                   size check below must use the logical count. */
+                long cnt = logical;
+                if (tq8) {
+                    if (logical % 32 || tc->len != (uint64_t)(logical / 32) * 34) {
+                        fprintf(stderr, "v4: %s: %ld elements need %ld Q8 bytes, file says %llu\n",
+                                tc->name, logical, (long)(logical / 32) * 34,
+                                (unsigned long long)tc->len);
+                        bad = 1; break;
+                    }
+                } else if (tc->len != (uint64_t)logical * 4) {
+                    fprintf(stderr, "v4: %s: %ld elements need %ld f32 bytes, file says %llu\n",
+                            tc->name, logical, logical * 4, (unsigned long long)tc->len);
+                    bad = 1; break;
+                }
                 long exp = 0, stride = 0;
                 float *base = NULL;
                 int s2 = -1, e2 = -1;
@@ -587,9 +623,9 @@ int model_load_v4(Model *m, const char *path) {
                     if (sscanf(nm, "experts.%d.%d", &s2, &e2) != 2) continue;
                     base = p_exp; stride = exp_floats;
                     exp = exp_floats;
-                    src = (float *)(img + h.off_data + tc->off);
                     if (cnt != exp) { fprintf(stderr, "v4: %s size mismatch\n", nm); bad = 1; break; }
-                    memcpy(base + ((long)s2 * N + e2) * stride, src, (size_t)cnt * 4);
+                    if (tq8) q8_dequant_row(srcb, base + ((long)s2 * N + e2) * stride, (int)cnt);
+                    else memcpy(base + ((long)s2 * N + e2) * stride, src, (size_t)cnt * 4);
                     continue;
                 }
                 if (!strcmp(nm, "token_emb")) { base = p_token; exp = v * dd; }
@@ -651,7 +687,8 @@ int model_load_v4(Model *m, const char *path) {
                             nm, cnt, exp);
                     bad = 1; break;
                 }
-                memcpy(base, src, (size_t)cnt * sizeof(float));
+                if (tq8) q8_dequant_row(srcb, base, (int)cnt);
+                else memcpy(base, src, (size_t)cnt * sizeof(float));
             }
             if (bad) goto done;
         }
