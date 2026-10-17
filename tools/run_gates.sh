@@ -33,6 +33,11 @@ fi
 
 # First port (models/gpt2-moe). Skipped unless its checkpoint exists, since weights are
 # gitignored. Converts the checkpoint to v4, then runs the port's own gate.
+printf '  %-22s ' "q8_decode"
+out=$(python3 tools/verify_q8_decode.py 2>&1); rc=$?
+echo "$out" | grep -E "^Q8 DECODER" | tail -1 | sed 's/^/ /'
+[ $rc -eq 0 ] || fail=1
+
 if [ "${CP_SKIP_PORT:-0}" != "1" ] && [ -f weights/moe-scale-run/l05/model_only.pt ]; then
     printf '  %-22s ' "port_gpt2_moe"
     [ -f scratch/port_l05.v4cp ] || python3 models/gpt2-moe/convert.py \

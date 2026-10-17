@@ -50,3 +50,42 @@ forward). The engine, once wired, does it in seconds.
 
 `models/gpt2-moe/reference.py` applied to weights round-tripped through `format/q8.py`, compared
 against fp32 on `data/traces/l05_fp32.npz` windows. No engine changes involved.
+
+---
+
+# And what the Q8 kernel actually buys: only out of cache
+
+`matmul_xw` (fp32) vs `matmul_xw_q8` on the shapes gpt2-moe actually uses. Q8 reads **3.76×
+fewer bytes**, so if the kernel were bandwidth-bound it should win nearly 4×. It does not.
+
+| shape | fp32, 1t | q8, 1t | q8/fp32 | fp32, 4t | q8, 4t | q8/fp32 |
+|---|---:|---:|---:|---:|---:|---:|
+| expert W1 768×192 | 28.8 µs | 46.5 | **0.62×** | 62.2 | 65.6 | 0.95× |
+| expert W2 192×768 | 30.9 | 43.9 | **0.71×** | 24.2 | 36.4 | 0.67× |
+| attention 768×768 | 123.8 | 178.4 | **0.69×** | 102.8 | 132.9 | 0.77× |
+| dense W1 768×3072 | 815.8 | 719.7 | 1.13× | 611.9 | 347.7 | **1.76×** |
+
+**Q8 is a net loss on every matrix that fits in cache, and a win only on the largest one that
+does not.** The reason is that the scalar dequant costs ~3 operations per element
+(`int8→float`, `× scale`, `FMA`) against 1 for fp32, so at small sizes the kernel is
+compute-bound on the decode and the 3.76× byte saving buys nothing. Only at 768×3072 does the
+fp32 kernel hit real DRAM bandwidth (12 GB/s) and the byte saving dominate.
+
+## What this changes about the plan
+
+The received idea was "quantize, and bytes buy speed". **False as implemented.** The ordering
+that follows from the measurement:
+
+1. **A vectorised dequant is a prerequisite**, not an optimisation. With AVX2 the decode is
+   ~4–8 instructions per 32 elements (`vpmovsxbd` → `vcvtdq2ps` → `vfmadd`), which is the only
+   way the byte saving reaches the FMA loop. Scalar dequant cannot be expected to beat fp32.
+2. **Quantization only pays for weights larger than cache.** For gpt2-moe that is almost
+   nothing; for a 4-bit open-weight MoE it is everything, because every expert matrix is
+   DRAM-bound. So Q8/4-bit is a *large-model* win, and measuring it on gpt2-moe understates it.
+3. Byte savings still pay **off-disk** immediately and unconditionally: a 3.76× smaller file is
+   3.76× less SSD traffic, which the pager reads whether or not the kernel is fast.
+
+Separately: the first version of these Q8 kernels was **not threaded at all**, which made them
+3× slower than fp32 at 4 threads. Threading is now split by group (a group's 32 outputs share
+one scale, so it is the smallest unit that can move between threads without re-reading it).
+That is why the 4-thread column above is not catastrophic — but it is still not a win.

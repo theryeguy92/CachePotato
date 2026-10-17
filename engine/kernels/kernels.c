@@ -145,12 +145,37 @@ void q8_dequant_row(const uint8_t *blocks, float *out, int n) {
 }
 
 /* out[j] += x[k] * W[k][j], W row-quantized with groups along n_out. Dequantised inline so
- * no scratch buffer (and no per-call allocation) is needed. */
+ * no scratch buffer (and no per-call allocation) is needed.
+ *
+ * Split by GROUP, not by element: a group's 32 outputs share one scale, so a group is the
+ * smallest unit that can be moved to another thread without re-reading the scale. */
+typedef struct { float *out; const float *x; const uint8_t *w; int n_in, ng;
+                 size_t rowbytes; } XWQ8Ctx;
+
+static void xw_q8_slice(void *v, int glo, int ghi) {
+    XWQ8Ctx *c = v;
+    for (int k = 0; k < c->n_in; k++) {
+        float xk = c->x[k];
+        const uint8_t *row = c->w + (size_t)k * c->rowbytes;
+        for (int g = glo; g < ghi; g++) {
+            float d = q8_scale(row + (size_t)g * 34);
+            const int8_t *q = (const int8_t *)(row + (size_t)g * 34 + 2);
+            float *o = c->out + g * 32;
+            for (int i = 0; i < 32; i++) o[i] += xk * ((float)q[i] * d);
+        }
+    }
+}
+
 void matmul_xw_q8(float *out, const float *x, const uint8_t *w,
                   const float *bias, int n_in, int n_out) {
     const int ng = n_out / 32;
     const size_t rowbytes = (size_t)ng * 34;
     for (int j = 0; j < n_out; j++) out[j] = bias[j];
+    if (cp_would_parallelise((long)n_in * n_out, CP_MATMUL_MIN) && ng > 1) {
+        XWQ8Ctx c = { out, x, w, n_in, ng, rowbytes };
+        cp_parallel_for(ng, xw_q8_slice, &c);
+        return;
+    }
     for (int k = 0; k < n_in; k++) {
         float xk = x[k];
         const uint8_t *row = w + (size_t)k * rowbytes;
@@ -165,9 +190,30 @@ void matmul_xw_q8(float *out, const float *x, const uint8_t *w,
 
 /* out[i] = sum_k W[i][k] * x[k], W row-quantized. Same accumulation order as the fp32
  * version (groups in order, elements within a group in order); only the values differ. */
+typedef struct { float *out; const float *x; const uint8_t *w; int ng; size_t rowbytes; } WXQ8Ctx;
+
+static void wx_q8_slice(void *v, int ilo, int ihi) {
+    WXQ8Ctx *c = v;
+    for (int i = ilo; i < ihi; i++) {
+        const uint8_t *row = c->w + (size_t)i * c->rowbytes;
+        float acc = 0.0f;
+        for (int g = 0; g < c->ng; g++) {
+            float d = q8_scale(row + (size_t)g * 34);
+            const int8_t *q = (const int8_t *)(row + (size_t)g * 34 + 2);
+            for (int j = 0; j < 32; j++) acc += ((float)q[j] * d) * c->x[g * 32 + j];
+        }
+        c->out[i] = acc;
+    }
+}
+
 void matmul_wx_q8(float *out, const float *x, const uint8_t *w, int n_in, int n_out) {
     const int ng = n_in / 32;
     const size_t rowbytes = (size_t)ng * 34;
+    if (cp_would_parallelise((long)n_in * n_out, CP_MATMUL_MIN) && n_out > 1) {
+        WXQ8Ctx c = { out, x, w, ng, rowbytes };
+        cp_parallel_for(n_out, wx_q8_slice, &c);
+        return;
+    }
     for (int i = 0; i < n_out; i++) {
         const uint8_t *row = w + (size_t)i * rowbytes;
         float acc = 0.0f;
