@@ -89,3 +89,50 @@ Separately: the first version of these Q8 kernels was **not threaded at all**, w
 3× slower than fp32 at 4 threads. Threading is now split by group (a group's 32 outputs share
 one scale, so it is the smallest unit that can move between threads without re-reading it).
 That is why the 4-thread column above is not catastrophic — but it is still not a win.
+
+---
+
+# AVX2 dequant, and where the quality loss actually comes from
+
+## The kernel
+
+A vectorised decoder (`_mm256_cvtepi8_epi32` → `_mm256_cvtepi32_ps` → FMA) turns the 3
+ops/element scalar decode into 4 instructions per 32 elements. Effect, q8/fp32:
+
+| shape | scalar (1t) | AVX2 (1t) | AVX2 (4t) |
+|---|---:|---:|---:|
+| 768×192 | 0.62× | 0.60× | 1.22× |
+| 192×768 | 0.71× | 0.71× | 0.81× |
+| 768×768 | 0.69× | 0.72× | 0.75× |
+| **768×3072** | 1.13× | 0.90× | **2.55×** |
+
+The conclusion sharpens rather than changes: **fp32 is already auto-vectorised by the compiler**,
+so Q8 trades 3.76× fewer bytes for extra decode work, and only wins where the fp32 kernel is
+genuinely DRAM-bound. AVX2 lifted the large case from 1.76× to **2.55×**. For a 4-bit open-weight
+MoE *every* expert matrix is that large case, which is why quantization is a large-model win and
+measuring it on gpt2-moe understates it.
+
+Nothing here is bit-identical to fp32 — and it cannot be: FMA fuses the multiply-add and SIMD
+reduces in lanes. So the *decoder* (the definition of the file's values) is gated bit-exactly,
+while the *matmul* is gated against `dequant + matmul` at 1e-5 relative, which is where the four
+cases above land (3.9e-07 … 1.0e-06).
+
+## Where the quality loss comes from: not the router
+
+Hypothesis: quantizing `Wr` (the router) is what moved 0.8% of the selections, and it is only
+0.13% of the bytes, so keep it fp32.
+
+| configuration (window 0, 512 tokens) | routing vs fp32 | logits max\|Δ\| | argmax |
+|---|---:|---:|---:|
+| everything quantized | 99.2188% | 1.693 | 507/512 |
+| **router kept in fp32** | 99.4336% | 1.788 | 507/512 |
+
+**Hypothesis rejected.** Keeping the router in fp32 recovers 22 of 10240 selections (0.2%) and
+changes neither the logit delta (it rises slightly) nor a single argmax. The loss is not a router
+artifact; it is the accumulated effect of 8-bit weights through 12 layers in a small, lightly
+trained model (1M training tokens). That is a property of the model, not of a particular matrix,
+and the mitigation would have to be a better encoding, not a fp32 exception.
+
+**Consequence:** quantization costs ~0.8% of routing decisions and ~1% of argmax positions here
+and that cost is inherent. A quantized port is therefore gated on **quality** (routing and argmax
+agreement, loss on held-out data), never on exactness, and must be labelled Tier C.

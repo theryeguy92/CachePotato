@@ -149,6 +149,64 @@ void q8_dequant_row(const uint8_t *blocks, float *out, int n) {
  *
  * Split by GROUP, not by element: a group's 32 outputs share one scale, so a group is the
  * smallest unit that can be moved to another thread without re-reading the scale. */
+/* ------------------------------------------------------------ AVX2 dequant
+ *
+ * The scalar decoder costs ~3 ops per element (int8->float, x scale, FMA) against 1 for fp32,
+ * which is why Q8 measured SLOWER than fp32 on every cache-resident matrix (0.62-0.95x). The
+ * vector form decodes 32 elements with 4 sign-extends, 4 converts and 4 FMAs, so the byte
+ * saving (3.76x) can finally reach the arithmetic.
+ *
+ * Guarded by __AVX2__ rather than a runtime check: the build already passes -march=native, so
+ * a binary either has AVX2 or is compiled for a CPU without it. The scalar path is kept as the
+ * fallback.
+ *
+ * NOT bit-identical to the scalar path, and it cannot be: FMA fuses the multiply-add (one
+ * rounding instead of two) and the horizontal sum reduces in lanes. This is the SAME class of
+ * difference as C-vs-numpy fp32 accumulation, and it is why the *decoder* (q8_dequant_row, the
+ * definition of what the file's values ARE) is gated bit-exactly while the *matmul* is gated
+ * with a stated tolerance (tools/verify_q8_kernels.py). Quantised-vs-fp32 is already lossy, so
+ * demanding exactness here would mean forbidding FMA — the main reason the kernel is fast.
+ */
+#if defined(__AVX2__)
+#include <immintrin.h>
+
+static inline void q8_axpy_avx2(float *out, const uint8_t *blk, float xk) {
+    const float d = q8_scale(blk);
+    const int8_t *q = (const int8_t *)(blk + 2);
+    const __m256 dv = _mm256_set1_ps(d);
+    const __m256 xv = _mm256_set1_ps(xk);
+    for (int h = 0; h < 4; h++) {
+        __m128i b = _mm_loadl_epi64((const __m128i *)(q + h * 8));
+        __m256i i32 = _mm256_cvtepi8_epi32(b);
+        __m256 f = _mm256_cvtepi32_ps(i32);
+        __m256 v = _mm256_mul_ps(f, dv);
+        __m256 o = _mm256_loadu_ps(out + h * 8);
+        o = _mm256_fmadd_ps(v, xv, o);
+        _mm256_storeu_ps(out + h * 8, o);
+    }
+}
+
+/* out[i] += (float)q[i] * d * xk, 32 elements */
+static inline void q8_dot_avx2(float *acc, const uint8_t *blk, const float *x) {
+    const float d = q8_scale(blk);
+    const int8_t *q = (const int8_t *)(blk + 2);
+    const __m256 dv = _mm256_set1_ps(d);
+    __m256 s = _mm256_setzero_ps();
+    for (int h = 0; h < 4; h++) {
+        __m128i b = _mm_loadl_epi64((const __m128i *)(q + h * 8));
+        __m256i i32 = _mm256_cvtepi8_epi32(b);
+        __m256 v = _mm256_mul_ps(_mm256_cvtepi32_ps(i32), dv);
+        s = _mm256_fmadd_ps(v, _mm256_loadu_ps(x + h * 8), s);
+    }
+    /* horizontal sum in a FIXED order so the result does not depend on lane count */
+    float lane[8];
+    _mm256_storeu_ps(lane, s);
+    float r = ((lane[0] + lane[1]) + (lane[2] + lane[3])) +
+              ((lane[4] + lane[5]) + (lane[6] + lane[7]));
+    *acc += r;
+}
+#endif
+
 typedef struct { float *out; const float *x; const uint8_t *w; int n_in, ng;
                  size_t rowbytes; } XWQ8Ctx;
 
@@ -158,10 +216,15 @@ static void xw_q8_slice(void *v, int glo, int ghi) {
         float xk = c->x[k];
         const uint8_t *row = c->w + (size_t)k * c->rowbytes;
         for (int g = glo; g < ghi; g++) {
-            float d = q8_scale(row + (size_t)g * 34);
-            const int8_t *q = (const int8_t *)(row + (size_t)g * 34 + 2);
+            const uint8_t *blk = row + (size_t)g * 34;
             float *o = c->out + g * 32;
+#if defined(__AVX2__)
+            q8_axpy_avx2(o, blk, xk);
+#else
+            float d = q8_scale(blk);
+            const int8_t *q = (const int8_t *)(blk + 2);
             for (int i = 0; i < 32; i++) o[i] += xk * ((float)q[i] * d);
+#endif
         }
     }
 }
@@ -198,9 +261,14 @@ static void wx_q8_slice(void *v, int ilo, int ihi) {
         const uint8_t *row = c->w + (size_t)i * c->rowbytes;
         float acc = 0.0f;
         for (int g = 0; g < c->ng; g++) {
-            float d = q8_scale(row + (size_t)g * 34);
-            const int8_t *q = (const int8_t *)(row + (size_t)g * 34 + 2);
+            const uint8_t *blk = row + (size_t)g * 34;
+#if defined(__AVX2__)
+            q8_dot_avx2(&acc, blk, c->x + g * 32);
+#else
+            float d = q8_scale(blk);
+            const int8_t *q = (const int8_t *)(blk + 2);
             for (int j = 0; j < 32; j++) acc += ((float)q[j] * d) * c->x[g * 32 + j];
+#endif
         }
         c->out[i] = acc;
     }
