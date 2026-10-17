@@ -2,9 +2,12 @@
 #include "weights_v4.h"
 
 #include <fcntl.h>
+#include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -108,11 +111,15 @@ int model_load_v4(Model *m, const char *path) {
         fprintf(stderr, "v4: table offsets not ordered or past EOF\n"); close(fd); return -1;
     }
 
-    unsigned char *img = malloc(fsz);
-    if (!img) { fprintf(stderr, "v4: oom for %zu bytes\n", fsz); close(fd); return -1; }
-    if (pread(fd, img, fsz, 0) != (ssize_t)fsz) {
-        fprintf(stderr, "v4: short read\n"); free(img); close(fd); return -1;
-    }
+    /* MAP, do not malloc+read. Two reasons, both measured:
+         1. mmap is demand-paged, so a 736 MB file does not cost 736 MB of RSS up front
+            (eager read: 705 MB peak; mmap: pages arrive as they are touched);
+         2. pager_enforce() computes a FILE OFFSET as (region_ptr - model_data) for
+            POSIX_FADV_DONTNEED. With a malloc'd image that subtraction is garbage and the
+            advice would target a nonsense file range — silently wrong, and the reason this
+            is mmap rather than a memory optimisation. */
+    unsigned char *img = mmap(NULL, fsz, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (img == MAP_FAILED) { perror("mmap"); close(fd); return -1; }
 
     int rc = -1;
     TRec *tens = NULL; BRec *blks = NULL; RRec *regs = NULL; ERec *encs = NULL;
@@ -251,6 +258,14 @@ int model_load_v4(Model *m, const char *path) {
         }
         if (o > h.off_data) { fprintf(stderr, "v4: region table past off_data\n"); goto done; }
     }
+    /* Verify every region, then DROP its pages again.
+       Verifying the whole payload in one pass faults the entire file into RAM, which defeats
+       demand paging and is fatal for the real target: a 24 GB checkpoint cannot be read
+       start-to-finish on a 16 GB machine, so a load that does so cannot load it at all.
+       Checking region by region and calling MADV_DONTNEED afterwards keeps the guarantees —
+       every byte is still checked — while peak RSS stays near one region. Measured on the
+       736 MB file: 705 MB peak without the drop. */
+    long long verified = 0;
     for (uint32_t i = 0; i < h.n_regions; i++) {
         const RRec *r = &regs[i];
         uint32_t got = crc32_bytes(img + h.off_data + r->off, (size_t)r->len);
@@ -259,6 +274,23 @@ int model_load_v4(Model *m, const char *path) {
                             "(stored %08x, computed %08x)\n",
                     i, tens[r->lo].name, (uint32_t)r->digest, got);
             goto done;
+        }
+        verified += (long long)r->len;
+        /* Align the ABSOLUTE address, then round the length out. off_data is not
+           page-aligned (32000 in the v3-derived file), so aligning the payload-relative
+           offset instead leaves the address misaligned and madvise returns EINVAL — which is
+           how the first version of this silently dropped nothing and left the whole file
+           resident. Dropping a boundary page twice is harmless. */
+        {
+            uintptr_t abs = (uintptr_t)(img + h.off_data + r->off);
+            uintptr_t al = abs & ~(uintptr_t)4095;
+            size_t len = (size_t)(abs - al) + (size_t)r->len;
+            len = (len + 4095) & ~(size_t)4095;
+            posix_fadvise(fd, (off_t)((h.off_data + r->off) & ~(uint64_t)4095),
+                          (off_t)len, POSIX_FADV_DONTNEED);
+            if (madvise((void *)al, len, MADV_DONTNEED) != 0 && i == 0) {
+                fprintf(stderr, "v4: warning: MADV_DONTNEED failed (%m); pages stay resident\n");
+            }
         }
     }
     {
@@ -390,18 +422,22 @@ int model_load_v4(Model *m, const char *path) {
         m->h3.lam = lam; m->h3.n_exp = n_exp; m->h3.topk = topk;
         m->h3.moe_from = moe_from; m->h3.n_moe_layers = n_moe; m->h3.n_dense_layers = n_dense;
 
-        /* ---- build the engine's strided layout in one buffer.
-           The forward pass indexes per-layer arrays by stride (layer l of Wq at Wq + l*d*d).
-           In v3 that held because the writer emits one tensor per (type, all layers). A v4
-           file makes no such promise, so rather than assume it, copy each tensor into its
-           slot in engine layout. --shuffle exists precisely to prove this is done by table
-           lookup and not by position. */
+        /* ---- engine layout: use the file's bytes IN PLACE when they already match.
+           The forward pass indexes per-layer arrays by stride (layer l of Wq at Wq + l*d*d),
+           so it needs each (type, all-layers) group contiguous and in a fixed order. A v4
+           file makes no such promise, so the old code ALWAYS copied into a ~701 MB buffer.
+           That copy is unnecessary for the common case: the v3-derived writer already emits
+           exactly this order. So compute where each tensor WOULD be, check whether it is
+           really there, and only copy if not. The shuffled file therefore still exercises the
+           copy path — which is what keeps offset addressing proven — while an ordinary file
+           costs nothing. */
         long v = vocab, dd = d, ffl = ff, Ll = L;
         long nmoe = n_moe, ndense = n_dense, N = n_exp;
         long exp_floats = 0;
         for (uint32_t i = 0; i < h.n_tensors; i++) {
-            int s, e;
-            if (tens[i].role == ROLE_EXPERT && sscanf(tens[i].name, "experts.%d.%d", &s, &e) == 2) {
+            int s_, e_;
+            if (tens[i].role == ROLE_EXPERT &&
+                sscanf(tens[i].name, "experts.%d.%d", &s_, &e_) == 2) {
                 exp_floats = (long)(tens[i].len / 4);
                 break;
             }
@@ -410,141 +446,215 @@ int model_load_v4(Model *m, const char *path) {
         long exp_hid = (exp_floats - dd) / (2L * dd);
         if (exp_hid <= 0) { fprintf(stderr, "v4: cannot derive exp_hid from %ld floats\n", exp_floats); goto done; }
 
-        long need = v * dd * 2            /* token_emb, pos_emb share the (v,d) and (ctx,d) */
-                  + 4 * Ll * dd           /* ln1_g,b, ln2_g,b */
-                  + Ll * (4 * dd * dd + 4 * dd)
-                  + ndense * ((dd * ffl + ffl) + (ffl * dd + dd))
-                  + nmoe * (dd * N + N)
-                  + nmoe * (2 * (dd * dd + dd))
-                  + nmoe * N * exp_floats
-                  + 2 * dd;
-        layout = calloc((size_t)need + 16, sizeof(float));
-        if (!layout) { fprintf(stderr, "v4: oom for %ld-float layout buffer\n", need); goto done; }
-
+        /* the layout the forward pass expects, as (offset_in_floats, size_in_floats) */
         long o = 0;
-        float *p_token = layout + o; o += v * dd;
-        float *p_pos   = layout + o; o += ctx * dd;
-        float *p_ln1g  = layout + o; o += Ll * dd;
-        float *p_ln1b  = layout + o; o += Ll * dd;
-        float *p_Wq    = layout + o; o += Ll * dd * dd;
-        float *p_bq    = layout + o; o += Ll * dd;
-        float *p_Wk    = layout + o; o += Ll * dd * dd;
-        float *p_bk    = layout + o; o += Ll * dd;
-        float *p_Wv    = layout + o; o += Ll * dd * dd;
-        float *p_bv    = layout + o; o += Ll * dd;
-        float *p_Wo    = layout + o; o += Ll * dd * dd;
-        float *p_bo    = layout + o; o += Ll * dd;
-        float *p_ln2g  = layout + o; o += Ll * dd;
-        float *p_ln2b  = layout + o; o += Ll * dd;
-        float *p_W1    = layout + o; o += ndense * dd * ffl;
-        float *p_b1    = layout + o; o += ndense * ffl;
-        float *p_W2    = layout + o; o += ndense * ffl * dd;
-        float *p_b2    = layout + o; o += ndense * dd;
-        float *p_Wr    = layout + o; o += nmoe * dd * N;
-        float *p_br    = layout + o; o += nmoe * N;
-        float *p_W1s   = layout + o; o += nmoe * dd * dd;
-        float *p_b1s   = layout + o; o += nmoe * dd;
-        float *p_W2s   = layout + o; o += nmoe * dd * dd;
-        float *p_b2s   = layout + o; o += nmoe * dd;
-        float *p_exp   = layout + o; o += nmoe * N * exp_floats;
-        float *p_lnfg  = layout + o; o += dd;
-        float *p_lnfb  = layout + o;
-        if (o + dd > need + 16) { fprintf(stderr, "v4: layout arithmetic overflow\n"); goto done; }
+        long off_token = o; o += v * dd;
+        long off_pos   = o; o += ctx * dd;
+        long off_ln1g  = o; o += Ll * dd;
+        long off_ln1b  = o; o += Ll * dd;
+        long off_Wq    = o; o += Ll * dd * dd;
+        long off_bq    = o; o += Ll * dd;
+        long off_Wk    = o; o += Ll * dd * dd;
+        long off_bk    = o; o += Ll * dd;
+        long off_Wv    = o; o += Ll * dd * dd;
+        long off_bv    = o; o += Ll * dd;
+        long off_Wo    = o; o += Ll * dd * dd;
+        long off_bo    = o; o += Ll * dd;
+        long off_ln2g  = o; o += Ll * dd;
+        long off_ln2b  = o; o += Ll * dd;
+        long off_W1    = o; o += ndense * dd * ffl;
+        long off_b1    = o; o += ndense * ffl;
+        long off_W2    = o; o += ndense * ffl * dd;
+        long off_b2    = o; o += ndense * dd;
+        long off_Wr    = o; o += nmoe * dd * N;
+        long off_br    = o; o += nmoe * N;
+        long off_W1s   = o; o += nmoe * dd * dd;
+        long off_b1s   = o; o += nmoe * dd;
+        long off_W2s   = o; o += nmoe * dd * dd;
+        long off_b2s   = o; o += nmoe * dd;
+        long off_exp   = o; o += nmoe * N * exp_floats;
+        long off_lnfg  = o; o += dd;
+        long off_lnfb  = o; o += dd;
+        long need = o;
 
-        /* Per-tensor copy with an explicit size check and an EXPLICIT stride per tensor
-           type. An earlier version used one stride (d*d) for every layer-indexed tensor and
-           guarded the offset with `li > 0`, which (a) gave layer 0 no offset at all and
-           (b) is wrong for biases and norms whose per-layer stride is d, not d*d. Both
-           errors are silent garbage, so both are now structural: every branch names its
-           stride, and the offset applies for li >= 0. */
-        int bad = 0;
-        for (uint32_t i = 0; i < h.n_tensors && !bad; i++) {
-            const TRec *t = &tens[i];
-            float *src = (float *)(img + h.off_data + t->off);
-            long cnt = (long)(t->len / 4);
-            long exp = 0, stride = 0, index = 0;
-            float *base = NULL;
-            int s2 = -1, e2 = -1;
-            const char *nm = t->name;
-
-            if (t->role == ROLE_EXPERT) {
-                if (sscanf(nm, "experts.%d.%d", &s2, &e2) != 2) continue;
-                base = p_exp; stride = exp_floats; index = (long)s2 * N + e2; exp = exp_floats;
-            } else if (!strcmp(nm, "token_emb")) { base = p_token; stride = 0; exp = v * dd; }
-            else if (!strcmp(nm, "pos_emb"))      { base = p_pos;   stride = 0; exp = ctx * dd; }
-            else if (!strcmp(nm, "lnf_g"))        { base = p_lnfg;  stride = 0; exp = dd; }
-            else if (!strcmp(nm, "lnf_b"))        { base = p_lnfb;  stride = 0; exp = dd; }
-            else {
-                struct { const char *n; float *b; long s; } tab[] = {
-                    {"ln1_g", p_ln1g, dd},  {"ln1_b", p_ln1b, dd},
-                    {"ln2_g", p_ln2g, dd},  {"ln2_b", p_ln2b, dd},
-                    {"Wq", p_Wq, dd*dd},    {"bq", p_bq, dd},
-                    {"Wk", p_Wk, dd*dd},    {"bk", p_bk, dd},
-                    {"Wv", p_Wv, dd*dd},    {"bv", p_bv, dd},
-                    {"Wo", p_Wo, dd*dd},    {"bo", p_bo, dd},
-                };
-                int matched = 0;
-                for (size_t k = 0; k < sizeof tab / sizeof tab[0]; k++)
-                    if (!strcmp(nm, tab[k].n)) { base = tab[k].b; stride = tab[k].s; matched = 1; break; }
-                if (matched) {
-                    /* Layer-indexed per-tensor arrays are (L, ...): shape[0] is the number of
-                       LAYERS, and the array starts at layer 0, so the payload is copied once
-                       with index 0 and the rest of the layers follow contiguously. (Dense and
-                       MoE arrays below are (n_dense, ...) / (n_moe, ...) and shape[0] is a real
-                       index into the group.) Treating both the same made the loader reject
-                       ln1_g with "layer 12 out of range" for a 12-layer model. */
-                    if (t->rank < 2) { fprintf(stderr, "v4: %s needs rank >= 2\n", nm); bad = 1; break; }
-                    if ((long)t->shape[0] != Ll) {
-                        fprintf(stderr, "v4: %s declares %u layers, the model has %ld\n",
-                                nm, t->shape[0], Ll);
-                        bad = 1; break;
-                    }
-                    index = 0;
-                    exp = stride * Ll;
-                } else if (!strcmp(nm, "W1") || !strcmp(nm, "b1") ||
-                           !strcmp(nm, "W2") || !strcmp(nm, "b2")) {
-                    static const char *dn[] = {"W1","b1","W2","b2"};
-                    (void)dn;
-                    base = (!strcmp(nm,"W1")) ? p_W1 : (!strcmp(nm,"b1")) ? p_b1 :
-                           (!strcmp(nm,"W2")) ? p_W2 : p_b2;
-                    stride = (!strcmp(nm,"W1")) ? dd*ffl : (!strcmp(nm,"b1")) ? ffl :
-                             (!strcmp(nm,"W2")) ? ffl*dd : dd;
-                    /* (n_dense, ...): shape[0] is the count; the payload is the whole group. */
-                    if ((long)t->shape[0] != ndense) {
-                        fprintf(stderr, "v4: %s declares %u dense layers, the model has %ld\n",
-                                nm, t->shape[0], ndense);
-                        bad = 1; break;
-                    }
-                    index = 0;
-                    exp = stride * ndense;
-                } else if (!strcmp(nm,"Wr") || !strcmp(nm,"br") || !strcmp(nm,"W1s") ||
-                           !strcmp(nm,"b1s") || !strcmp(nm,"W2s") || !strcmp(nm,"b2s")) {
-                    base = (!strcmp(nm,"Wr"))  ? p_Wr  : (!strcmp(nm,"br"))  ? p_br  :
-                           (!strcmp(nm,"W1s")) ? p_W1s : (!strcmp(nm,"b1s")) ? p_b1s :
-                           (!strcmp(nm,"W2s")) ? p_W2s : p_b2s;
-                    stride = (!strcmp(nm,"Wr"))  ? dd*N  : (!strcmp(nm,"br"))  ? N :
-                             (!strcmp(nm,"W1s")) ? dd*dd : (!strcmp(nm,"b1s")) ? dd :
-                             (!strcmp(nm,"W2s")) ? dd*dd : dd;
-                    /* (n_moe, ...): likewise, shape[0] is the count. */
-                    if ((long)t->shape[0] != nmoe) {
-                        fprintf(stderr, "v4: %s declares %u moe layers, the model has %ld\n",
-                                nm, t->shape[0], nmoe);
-                        bad = 1; break;
-                    }
-                    index = 0;
-                    exp = stride * nmoe;
-                } else {
-                    continue;                 /* regioned, but the forward pass ignores it */
-                }
-            }
-            if (cnt != exp) {
-                fprintf(stderr, "v4: %s has %ld floats, engine layout expects %ld — the file "
-                                "and the forward pass disagree on shape\n", nm, cnt, exp);
-                bad = 1; break;
-            }
-            memcpy(base + index * stride, src, (size_t)cnt * sizeof(float));
+        /* does every tensor sit exactly where the forward pass wants it, contiguous?
+           expected offset (floats, relative to off_data) per tensor */
+        int in_place = 1;
+        for (uint32_t i = 0; i < h.n_tensors && in_place; i++) {
+            const TRec *t2 = &tens[i];
+            long want = -1, idx = 0, stride = 0;
+            int s_, e_;
+            const char *nm = t2->name;
+            if (t2->role == ROLE_EXPERT) {
+                if (sscanf(nm, "experts.%d.%d", &s_, &e_) != 2) continue;
+                want = off_exp + ((long)s_ * N + e_) * exp_floats;
+            } else if (!strcmp(nm, "token_emb")) want = off_token;
+            else if (!strcmp(nm, "pos_emb"))      want = off_pos;
+            else if (!strcmp(nm, "lnf_g"))        want = off_lnfg;
+            else if (!strcmp(nm, "lnf_b"))        want = off_lnfb;
+            else if (!strcmp(nm, "ln1_g")) want = off_ln1g;
+            else if (!strcmp(nm, "ln1_b")) want = off_ln1b;
+            else if (!strcmp(nm, "ln2_g")) want = off_ln2g;
+            else if (!strcmp(nm, "ln2_b")) want = off_ln2b;
+            else if (!strcmp(nm, "Wq")) want = off_Wq;
+            else if (!strcmp(nm, "bq")) want = off_bq;
+            else if (!strcmp(nm, "Wk")) want = off_Wk;
+            else if (!strcmp(nm, "bk")) want = off_bk;
+            else if (!strcmp(nm, "Wv")) want = off_Wv;
+            else if (!strcmp(nm, "bv")) want = off_bv;
+            else if (!strcmp(nm, "Wo")) want = off_Wo;
+            else if (!strcmp(nm, "bo")) want = off_bo;
+            else if (!strcmp(nm, "W1")) want = off_W1;
+            else if (!strcmp(nm, "b1")) want = off_b1;
+            else if (!strcmp(nm, "W2")) want = off_W2;
+            else if (!strcmp(nm, "b2")) want = off_b2;
+            else if (!strcmp(nm, "Wr")) want = off_Wr;
+            else if (!strcmp(nm, "br")) want = off_br;
+            else if (!strcmp(nm, "W1s")) want = off_W1s;
+            else if (!strcmp(nm, "b1s")) want = off_b1s;
+            else if (!strcmp(nm, "W2s")) want = off_W2s;
+            else if (!strcmp(nm, "b2s")) want = off_b2s;
+            else continue;
+            (void)idx; (void)stride;
+            if (t2->off != (uint64_t)(want * 4)) in_place = 0;
         }
-        if (bad) goto done;
+        /* the payload must also end exactly where the layout ends */
+        if (in_place && h.off_data + (uint64_t)(need * 4) > fsz) in_place = 0;
+
+        float *p_token = NULL, *p_pos = NULL, *p_ln1g = NULL, *p_ln1b = NULL;
+        float *p_Wq = NULL, *p_bq = NULL, *p_Wk = NULL, *p_bk = NULL;
+        float *p_Wv = NULL, *p_bv = NULL, *p_Wo = NULL, *p_bo = NULL;
+        float *p_ln2g = NULL, *p_ln2b = NULL, *p_W1 = NULL, *p_b1 = NULL;
+        float *p_W2 = NULL, *p_b2 = NULL, *p_Wr = NULL, *p_br = NULL;
+        float *p_W1s = NULL, *p_b1s = NULL, *p_W2s = NULL, *p_b2s = NULL;
+        float *p_exp = NULL, *p_lnfg = NULL, *p_lnfb = NULL;
+
+        if (in_place) {
+            /* zero copy: the file's payload is already the engine's layout */
+            float *base = (float *)(img + h.off_data);
+            p_token = base + off_token; p_pos = base + off_pos;
+            p_ln1g = base + off_ln1g;  p_ln1b = base + off_ln1b;
+            p_Wq = base + off_Wq; p_bq = base + off_bq;
+            p_Wk = base + off_Wk; p_bk = base + off_bk;
+            p_Wv = base + off_Wv; p_bv = base + off_bv;
+            p_Wo = base + off_Wo; p_bo = base + off_bo;
+            p_ln2g = base + off_ln2g; p_ln2b = base + off_ln2b;
+            p_W1 = base + off_W1; p_b1 = base + off_b1;
+            p_W2 = base + off_W2; p_b2 = base + off_b2;
+            p_Wr = base + off_Wr; p_br = base + off_br;
+            p_W1s = base + off_W1s; p_b1s = base + off_b1s;
+            p_W2s = base + off_W2s; p_b2s = base + off_b2s;
+            p_exp = base + off_exp; p_lnfg = base + off_lnfg; p_lnfb = base + off_lnfb;
+            printf("v4: layout matches the forward pass — using the file's bytes in place "
+                   "(no %ld MB copy)\n", need * 4 / (1024 * 1024));
+        } else {
+            layout = calloc((size_t)need + 16, sizeof(float));
+            if (!layout) { fprintf(stderr, "v4: oom for %ld-float layout buffer\n", need); goto done; }
+            p_token = layout + off_token; p_pos = layout + off_pos;
+            p_ln1g = layout + off_ln1g;  p_ln1b = layout + off_ln1b;
+            p_Wq = layout + off_Wq; p_bq = layout + off_bq;
+            p_Wk = layout + off_Wk; p_bk = layout + off_bk;
+            p_Wv = layout + off_Wv; p_bv = layout + off_bv;
+            p_Wo = layout + off_Wo; p_bo = layout + off_bo;
+            p_ln2g = layout + off_ln2g; p_ln2b = layout + off_ln2b;
+            p_W1 = layout + off_W1; p_b1 = layout + off_b1;
+            p_W2 = layout + off_W2; p_b2 = layout + off_b2;
+            p_Wr = layout + off_Wr; p_br = layout + off_br;
+            p_W1s = layout + off_W1s; p_b1s = layout + off_b1s;
+            p_W2s = layout + off_W2s; p_b2s = layout + off_b2s;
+            p_exp = layout + off_exp; p_lnfg = layout + off_lnfg; p_lnfb = layout + off_lnfb;
+            printf("v4: payload order differs from the forward pass — copying %ld MB into "
+                   "engine layout\n", need * 4 / (1024 * 1024));
+        }
+
+        /* Fill the engine layout from the tensor table — only when the payload is NOT
+           already in that order. Each branch names the per-tensor stride explicitly: an
+           earlier version used one stride (d*d) for every layer-indexed tensor and guarded
+           the offset with `li > 0`, which silently misplaced layer 0 and every bias/norm
+           (their per-layer stride is d, not d*d). */
+        if (!in_place) {
+            int bad = 0;
+            for (uint32_t i = 0; i < h.n_tensors && !bad; i++) {
+                const TRec *tc = &tens[i];
+                float *src = (float *)(img + h.off_data + tc->off);
+                long cnt = (long)(tc->len / 4);
+                long exp = 0, stride = 0;
+                float *base = NULL;
+                int s2 = -1, e2 = -1;
+                const char *nm = tc->name;
+
+                if (tc->role == ROLE_EXPERT) {
+                    if (sscanf(nm, "experts.%d.%d", &s2, &e2) != 2) continue;
+                    base = p_exp; stride = exp_floats;
+                    exp = exp_floats;
+                    src = (float *)(img + h.off_data + tc->off);
+                    if (cnt != exp) { fprintf(stderr, "v4: %s size mismatch\n", nm); bad = 1; break; }
+                    memcpy(base + ((long)s2 * N + e2) * stride, src, (size_t)cnt * 4);
+                    continue;
+                }
+                if (!strcmp(nm, "token_emb")) { base = p_token; exp = v * dd; }
+                else if (!strcmp(nm, "pos_emb")) { base = p_pos; exp = ctx * dd; }
+                else if (!strcmp(nm, "lnf_g")) { base = p_lnfg; exp = dd; }
+                else if (!strcmp(nm, "lnf_b")) { base = p_lnfb; exp = dd; }
+                else {
+                    struct { const char *n; float *b; long s; } tab[] = {
+                        {"ln1_g", p_ln1g, dd}, {"ln1_b", p_ln1b, dd},
+                        {"ln2_g", p_ln2g, dd}, {"ln2_b", p_ln2b, dd},
+                        {"Wq", p_Wq, dd*dd},   {"bq", p_bq, dd},
+                        {"Wk", p_Wk, dd*dd},   {"bk", p_bk, dd},
+                        {"Wv", p_Wv, dd*dd},   {"bv", p_bv, dd},
+                        {"Wo", p_Wo, dd*dd},   {"bo", p_bo, dd},
+                    };
+                    int matched = 0;
+                    for (size_t k = 0; k < sizeof tab / sizeof tab[0]; k++)
+                        if (!strcmp(nm, tab[k].n)) { base = tab[k].b; stride = tab[k].s; matched = 1; break; }
+                    if (matched) {
+                        /* (L, ...) group: shape[0] is the layer COUNT; copy the whole group */
+                        if ((long)tc->shape[0] != Ll) {
+                            fprintf(stderr, "v4: %s declares %u layers, model has %ld\n",
+                                    nm, tc->shape[0], Ll);
+                            bad = 1; break;
+                        }
+                        exp = stride * Ll;
+                    } else if (!strcmp(nm, "W1") || !strcmp(nm, "b1") ||
+                               !strcmp(nm, "W2") || !strcmp(nm, "b2")) {
+                        base = (!strcmp(nm,"W1")) ? p_W1 : (!strcmp(nm,"b1")) ? p_b1 :
+                               (!strcmp(nm,"W2")) ? p_W2 : p_b2;
+                        stride = (!strcmp(nm,"W1")) ? dd*ffl : (!strcmp(nm,"b1")) ? ffl :
+                                 (!strcmp(nm,"W2")) ? ffl*dd : dd;
+                        if ((long)tc->shape[0] != ndense) {
+                            fprintf(stderr, "v4: %s declares %u dense layers, model has %ld\n",
+                                    nm, tc->shape[0], ndense);
+                            bad = 1; break;
+                        }
+                        exp = stride * ndense;
+                    } else if (!strcmp(nm,"Wr") || !strcmp(nm,"br") || !strcmp(nm,"W1s") ||
+                               !strcmp(nm,"b1s") || !strcmp(nm,"W2s") || !strcmp(nm,"b2s")) {
+                        base = (!strcmp(nm,"Wr"))  ? p_Wr  : (!strcmp(nm,"br"))  ? p_br  :
+                               (!strcmp(nm,"W1s")) ? p_W1s : (!strcmp(nm,"b1s")) ? p_b1s :
+                               (!strcmp(nm,"W2s")) ? p_W2s : p_b2s;
+                        stride = (!strcmp(nm,"Wr"))  ? dd*N  : (!strcmp(nm,"br"))  ? N :
+                                 (!strcmp(nm,"W1s")) ? dd*dd : (!strcmp(nm,"b1s")) ? dd :
+                                 (!strcmp(nm,"W2s")) ? dd*dd : dd;
+                        if ((long)tc->shape[0] != nmoe) {
+                            fprintf(stderr, "v4: %s declares %u moe layers, model has %ld\n",
+                                    nm, tc->shape[0], nmoe);
+                            bad = 1; break;
+                        }
+                        exp = stride * nmoe;
+                    } else {
+                        continue;
+                    }
+                }
+                if (cnt != exp) {
+                    fprintf(stderr, "v4: %s has %ld floats, engine layout expects %ld\n",
+                            nm, cnt, exp);
+                    bad = 1; break;
+                }
+                memcpy(base, src, (size_t)cnt * sizeof(float));
+            }
+            if (bad) goto done;
+        }
 
         Weights *w = &m->w;
         memset(w, 0, sizeof *w);
@@ -579,9 +689,9 @@ int model_load_v4(Model *m, const char *path) {
     m->file_size = fsz;
     m->data = (float *)img;
     m->fd = fd;
-    printf("v4: loaded %s — %u tensors, %u blocks, %u regions; vocab %d d %d L %d; "
+    printf("v4: loaded %s — %u tensors, %u blocks, %u regions (%lld MB verified); vocab %d d %d L %d; "
            "%d MoE slots x %d experts top-%d lam %.2f; regions CRC-verified\n",
-           path, h.n_tensors, h.n_blocks, h.n_regions, m->hdr.vocab, m->hdr.d_model,
+           path, h.n_tensors, h.n_blocks, h.n_regions, verified / (1024*1024), m->hdr.vocab, m->hdr.d_model,
            m->hdr.n_layer, m->h3.n_moe_layers, m->h3.n_exp, m->h3.topk, m->h3.lam);
     rc = 0;
 
@@ -591,6 +701,6 @@ done:
     if (blks) free(blks);
     if (regs) free(regs);
     if (encs) { for (uint32_t i = 0; i < n_enc; i++) free(encs[i].name); free(encs); }
-    if (rc != 0) { free(img); close(fd); }
+    if (rc != 0) { munmap(img, fsz); close(fd); }
     return rc;
 }

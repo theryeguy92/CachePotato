@@ -68,7 +68,7 @@ typedef struct {
     float *v4_scratch; /* v4 only: the engine-layout copy of the tensors. A v4 file makes no
                          promise about tensor order, and the forward pass indexes per-layer
                          arrays by stride, so the loader copies each tensor into its slot
-                         (~366 MB for the current model) rather than assuming layout. A
+                         (~701 MB for the current model) rather than assuming layout. A
                          v4-native forward pass would remove the copy; that is a later
                          change, and this one keeps the acceptance test about the FILE. */
 } Model;
