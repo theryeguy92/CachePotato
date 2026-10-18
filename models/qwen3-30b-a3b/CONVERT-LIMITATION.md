@@ -78,5 +78,7 @@ tensor is quantized as it is written.
    when the tensors are visited in the same order, or keep it lazy and accept reading twice —
    but reading twice means paying the encoder twice.
 
-Measured: ~10 minutes for ONE layer. At 48 layers that is ~8 hours, which is not a conversion, it is
+RESOLVED: ~10 min -> 47 s for one layer, and the output file is BYTE-IDENTICAL (md5
+349a9e45b33c9da11373ea3889dec611 before and after). At ~47 s per layer the full 48-layer Q8
+conversion is roughly 30-40 minutes, which is a conversion rather than a workday.
 a workday. Both fixes are small and independent; neither changes the format.
