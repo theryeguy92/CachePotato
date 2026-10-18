@@ -98,7 +98,7 @@ static void git_rev(char *out, size_t n) {
 }
 
 static void write_meta(const char *pre, const char *model_path, const QW3Layer *m,
-                       const char *ids_arg, int T, int L) {
+                       const char *ids_arg, int T, int L, const char *mode, int gen) {
     char fn[512], host[256], cpu[256], isa[96], sha[64], ts[40], pager[96];
     cpu_model(cpu, sizeof cpu);
     isa_string(isa, sizeof isa);
@@ -135,17 +135,110 @@ static void write_meta(const char *pre, const char *model_path, const QW3Layer *
     fprintf(f, "git: %s\n", sha);
     fprintf(f, "model: %s\n", model_path);
     fprintf(f, "model_bytes: %lld\n", model_bytes);
+    fprintf(f, "mode: %s\n", mode);
     fprintf(f, "layers: %d\n", L);
     fprintf(f, "tokens: %s\n", ids_arg);
     fprintf(f, "n_tokens: %d\n", T);
+    fprintf(f, "n_gen: %d\n", gen);
     fprintf(f, "weight_regions: %d\n", m->n_regions);
     fprintf(f, "pager: %s\n", pager);
     fclose(f);
 }
 
+/* Run every layer once over T rows. `kv` non-NULL means incremental: the rows are
+   positions pos0..pos0+T-1 in the per-layer caches. route/router are optional. */
+static int run_layers(QW3Layer *m, float *x, int T, int pos0, QW3KV *kv, int L,
+                      int *route, float *router) {
+    const int D = m->d_model, K = m->topk, E = m->n_experts;
+    QW3Out o;
+    for (int l = 0; l < L; l++) {
+        if (qwen3_bind_layer(m, l)) { fprintf(stderr, "bind layer %d failed\n", l); return -1; }
+        if (qwen3_layer_alloc(&o, m, T)) return -1;
+        int rc = kv ? qwen3_layer_kv(m, x, T, pos0, &kv[l], &o)
+                    : qwen3_layer(m, x, T, &o);
+        if (rc) { qwen3_layer_free(&o); return -1; }
+        for (int t = 0; t < T; t++)
+            for (int j = 0; j < D; j++)
+                x[(size_t)t * D + j] += o.attn[(size_t)t * D + j] + o.mlp[(size_t)t * D + j];
+        if (route)  memcpy(route  + (size_t)l * T * K, o.topk_idx, sizeof(int) * (size_t)T * K);
+        if (router) memcpy(router + (size_t)l * T * E, o.router, sizeof(float) * (size_t)T * E);
+        qwen3_layer_free(&o);
+        /* Between layers, not inside one: the 8 experts a layer selected are still being
+           used by the next token of this layer, and evicting one between two of its own
+           reads is the read amplification the policy exists to avoid. */
+        pager_enforce();
+        if (!kv) fprintf(stderr, "  layer %d/%d done\n", l + 1, L);
+    }
+    return 0;
+}
+
+/* Final norm + untied head. Overwrites x: the caller has no further use for the
+   pre-norm hidden state, and the prefill path never did. */
+static void apply_head(QW3Layer *m, float *x, int T, int pos0, float *logits, int V) {
+    const int D = m->d_model;
+    for (int t = 0; t < T; t++) {
+        if (m->pager) { pager_step(pos0 + t); pager_touch_region(m->reg_final_norm); }
+        rmsnorm(x + (size_t)t * D, x + (size_t)t * D, m->final_norm, D, m->rms_eps);
+    }
+    for (int t = 0; t < T; t++) {
+        if (m->pager) { pager_step(pos0 + t); pager_touch_region(m->reg_lm_head); }
+        if (m->lm_head.enc == QW3_ENC_Q8)
+            matmul_wx_q8(logits + (size_t)t * V, x + (size_t)t * D, (const uint8_t *)m->lm_head.p, D, V);
+        else
+            matmul_wx(logits + (size_t)t * V, x + (size_t)t * D, (const float *)m->lm_head.p, D, V);
+    }
+}
+
+static void embed_rows(QW3Layer *m, const int *ids, int T, int pos0, float *x, int D) {
+    for (int t = 0; t < T; t++) {
+        if (m->pager) { pager_step(pos0 + t); pager_touch_region(m->reg_embed); }
+        const unsigned char *row = (const unsigned char *)m->embed.p
+                                 + (size_t)ids[t] * (size_t)((D / 32) * 34);
+        if (m->embed.enc == QW3_ENC_Q8) q8_dequant_row(row, x + (size_t)t * D, D);
+        else memcpy(x + (size_t)t * D, (const float *)m->embed.p + (size_t)ids[t] * D,
+                    sizeof(float) * D);
+    }
+}
+
+/* Every artifact this driver writes is checked: a run that computes for two minutes and
+   then silently drops its output (or segfaults on a NULL FILE because the directory did
+   not exist) is worse than one that refuses to start. */
+static FILE *out_file(const char *fn) {
+    FILE *f = fopen(fn, "wb");
+    if (!f) { perror(fn); exit(1); }
+    return f;
+}
+
+static int argmax_row(const float *v, int n) {
+    int best = 0;
+    for (int i = 1; i < n; i++) if (v[i] > v[best]) best = i;
+    return best;
+}
+
+/* Physical read counter: /proc/self/io read_bytes counts block-device reads only, so it
+   is the honest check on whether a miss really went to disk (the page cache can serve a
+   pager "miss" when CP_PAGER_SYS is off, and that difference must be visible). */
+static long io_read_kb(void) {
+    FILE *f = fopen("/proc/self/io", "r");
+    long val = 0;
+    char key[64];
+    if (!f) return 0;
+    while (fscanf(f, "%63[^:]: %ld\n", key, &val) == 2)
+        if (strcmp(key, "read_bytes") == 0) break;
+    fclose(f);
+    return val / 1024;
+}
+
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 int main(int argc, char **argv) {
     if (argc < 5) {
-        fprintf(stderr, "usage: %s <model.v4cp> <n_layers> <token_id,...> <out-prefix>\n", argv[0]);
+        fprintf(stderr, "usage: %s <model.v4cp> <n_layers> <token_id,...> <out-prefix>"
+                        " [--decode N]\n", argv[0]);
         return 2;
     }
     const char *path = argv[1];
@@ -157,6 +250,12 @@ int main(int argc, char **argv) {
     snprintf(ids_arg, sizeof ids_arg, "%s", argv[3]);
     for (char *s = strtok(argv[3], ","); s && T < 64; s = strtok(NULL, ",")) ids[T++] = atoi(s);
     const char *pre = argv[4];
+    /* Greedy and measurement-only on purpose: C2 measures the paging cost of producing a
+       token, so the token itself must be the deterministic argmax. Sampling would change
+       which experts are read and belongs with a gate of its own. */
+    int gen = 0;
+    for (int i = 5; i + 1 < argc; i++)
+        if (!strcmp(argv[i], "--decode")) gen = atoi(argv[i + 1]);
 
     QW3Layer m; memset(&m, 0, sizeof m);
     if (qwen3_map(&m, path)) { fprintf(stderr, "map failed\n"); return 1; }
@@ -169,65 +268,86 @@ int main(int argc, char **argv) {
     }
 
     float *x = malloc(sizeof(float) * (size_t)T * D);
-    for (int t = 0; t < T; t++) {                    /* embedding rows, Q8 or f32 */
-        if (m.pager) { pager_step(t); pager_touch_region(m.reg_embed); }
-        const unsigned char *row = (const unsigned char *)m.embed.p + (size_t)ids[t] * (size_t)((D / 32) * 34);
-        if (m.embed.enc == QW3_ENC_Q8) q8_dequant_row(row, x + (size_t)t * D, D);
-        else memcpy(x + (size_t)t * D, (const float *)m.embed.p + (size_t)ids[t] * D, sizeof(float) * D);
-    }
-
-    int *route = malloc(sizeof(int) * (size_t)L * T * K);
-    float *router = malloc(sizeof(float) * (size_t)L * T * E);
-    QW3Out o;
-    for (int l = 0; l < L; l++) {
-        if (qwen3_bind_layer(&m, l)) { fprintf(stderr, "bind layer %d failed\n", l); return 1; }
-        if (qwen3_layer_alloc(&o, &m, T)) return 1;
-        if (qwen3_layer(&m, x, T, &o)) return 1;
-        for (int t = 0; t < T; t++)
-            for (int j = 0; j < D; j++)
-                x[(size_t)t * D + j] += o.attn[(size_t)t * D + j] + o.mlp[(size_t)t * D + j];
-        memcpy(route + (size_t)l * T * K, o.topk_idx, sizeof(int) * (size_t)T * K);
-        memcpy(router + (size_t)l * T * E, o.router, sizeof(float) * (size_t)T * E);
-        qwen3_layer_free(&o);
-        /* Between layers, not inside one: the 8 experts a layer selected are still
-           being used by the next token of this layer, and evicting one between two of
-           its own reads is the kind of read amplification the policy exists to avoid. */
-        pager_enforce();
-        fprintf(stderr, "  layer %d/%d done\n", l + 1, L);
-    }
-
-    for (int t = 0; t < T; t++) {
-        if (m.pager) { pager_step(t); pager_touch_region(m.reg_final_norm); }
-        rmsnorm(x + (size_t)t * D, x + (size_t)t * D, m.final_norm, D, m.rms_eps);
-    }
-    float *logits = malloc(sizeof(float) * (size_t)T * V);
-    for (int t = 0; t < T; t++) {
-        if (m.pager) { pager_step(t); pager_touch_region(m.reg_lm_head); }
-        if (m.lm_head.enc == QW3_ENC_Q8)
-            matmul_wx_q8(logits + (size_t)t * V, x + (size_t)t * D, (const uint8_t *)m.lm_head.p, D, V);
-        else
-            matmul_wx(logits + (size_t)t * V, x + (size_t)t * D, (const float *)m.lm_head.p, D, V);
-    }
+    embed_rows(&m, ids, T, 0, x, D);
 
     char fn[512], fn0[512];
+    if (gen > 0) {
+        /* ---- incremental decode: prefill the prompt, then one token at a time ---- */
+        const int cap = T + gen;
+        QW3KV *kv = calloc((size_t)L, sizeof *kv);
+        if (!kv) return 1;
+        for (int l = 0; l < L; l++)
+            if (qwen3_kv_alloc(&kv[l], &m, cap)) { fprintf(stderr, "kv alloc failed\n"); return 1; }
+        if (run_layers(&m, x, T, 0, kv, L, NULL, NULL)) return 1;
+
+        int   *gtok   = malloc(sizeof(int) * (size_t)gen);
+        float *glog   = malloc(sizeof(float) * (size_t)gen * V);
+        float *grow   = malloc(sizeof(float) * D);
+        double *gms   = malloc(sizeof(double) * (size_t)gen);
+        long  *gkb    = malloc(sizeof(long) * (size_t)gen);
+        if (!gtok || !glog || !grow || !gms || !gkb) return 1;
+
+        const float *last = x + (size_t)(T - 1) * D;
+        for (int s = 0; s < gen; s++) {
+            const int pos = T + s;              /* position of the token we are about to feed */
+            long io0 = io_read_kb();
+            double t0 = now_s();
+            memcpy(grow, last, sizeof(float) * D);   /* apply_head normalises in place */
+            apply_head(&m, grow, 1, pos - 1, glog + (size_t)s * V, V);
+            gtok[s] = argmax_row(glog + (size_t)s * V, V);
+            embed_rows(&m, &gtok[s], 1, pos, grow, D);
+            if (run_layers(&m, grow, 1, pos, kv, L, NULL, NULL)) return 1;
+            gms[s] = now_s() - t0;
+            gkb[s] = io_read_kb() - io0;
+            last = grow;
+            fprintf(stderr, "  token %d/%d: id %d  %.0f ms  %ld KB read\n",
+                    s + 1, gen, gtok[s], gms[s] * 1e3, gkb[s]);
+        }
+
+        if (m.pager) {
+            snprintf(fn0, sizeof fn0, "%s.pager", pre);
+            if (pager_dump_steps(fn0)) fprintf(stderr, "pager: could not write %s\n", fn0);
+            pager_report();
+        }
+        snprintf(fn, sizeof fn, "%s.logits", pre); FILE *f = out_file(fn);
+        fwrite(glog, sizeof(float), (size_t)gen * V, f); fclose(f);
+        snprintf(fn, sizeof fn, "%s.tokens", pre); f = out_file(fn);
+        fwrite(gtok, sizeof(int), (size_t)gen, f); fclose(f);
+        snprintf(fn, sizeof fn, "%s.steps", pre); f = out_file(fn);
+        fprintf(f, "# position token ms disk_kb  (one line per GENERATED token)\n");
+        for (int s = 0; s < gen; s++)
+            fprintf(f, "%d %d %.3f %ld\n", T + s, gtok[s], gms[s] * 1e3, gkb[s]);
+        fclose(f);
+        write_meta(pre, path, &m, ids_arg, T, L, "decode", gen);
+        printf("generated %d tokens:", gen);
+        for (int s = 0; s < gen; s++) printf(" %d", gtok[s]);
+        printf("\n");
+        return 0;
+    }
+
+    /* ---- prefill: all T tokens in one forward (B5 / A5 / the C1 control) ---- */
+    int *route = malloc(sizeof(int) * (size_t)L * T * K);
+    float *router = malloc(sizeof(float) * (size_t)L * T * E);
+    if (run_layers(&m, x, T, 0, NULL, L, route, router)) return 1;
+
+    float *logits = malloc(sizeof(float) * (size_t)T * V);
+    apply_head(&m, x, T, 0, logits, V);
+
     if (m.pager) {
         snprintf(fn0, sizeof fn0, "%s.pager", pre);
         if (pager_dump_steps(fn0)) fprintf(stderr, "pager: could not write %s\n", fn0);
         pager_report();
     }
 
-    snprintf(fn, sizeof fn, "%s.logits", pre); FILE *f = fopen(fn, "wb");
+    snprintf(fn, sizeof fn, "%s.logits", pre); FILE *f = out_file(fn);
     fwrite(logits, sizeof(float), (size_t)T * V, f); fclose(f);
-    snprintf(fn, sizeof fn, "%s.route", pre); f = fopen(fn, "wb");
+    snprintf(fn, sizeof fn, "%s.route", pre); f = out_file(fn);
     fwrite(route, sizeof(int), (size_t)L * T * K, f); fclose(f);
-    snprintf(fn, sizeof fn, "%s.router", pre); f = fopen(fn, "wb");
+    snprintf(fn, sizeof fn, "%s.router", pre); f = out_file(fn);
     fwrite(router, sizeof(float), (size_t)L * T * E, f); fclose(f);
-    write_meta(pre, path, &m, ids_arg, T, L);
+    write_meta(pre, path, &m, ids_arg, T, L, "prefill", 0);
 
-    for (int t = 0; t < T; t++) {
-        int best = 0;
-        for (int v = 1; v < V; v++) if (logits[(size_t)t * V + v] > logits[(size_t)t * V + best]) best = v;
-        printf("token %d: argmax %d\n", t, best);
-    }
+    for (int t = 0; t < T; t++)
+        printf("token %d: argmax %d\n", t, argmax_row(logits + (size_t)t * V, V));
     return 0;
 }

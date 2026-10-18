@@ -75,6 +75,15 @@ if [ -f weights/qwen3_30b_a3b_q8.v4cp ]; then
     out=$(python3 tools/verify_qwen3_paging.py --budget-mb 2048 2>&1); rc=$?
     echo "$out" | grep -E "^C1 PAGING" | tail -1 | sed 's/^/ /'
     [ $rc -eq 0 ] || fail=1
+
+    # C2's numbers come from an incremental decode loop, which is a second way of computing
+    # attention (KV cache, RoPE position, causal bound). Gate it the way gate 1 gates the
+    # GPT-2 incremental path: decode logits must be BIT-IDENTICAL to prefill's at the same
+    # position. Without this the regions/token table would describe an unverified path.
+    printf '  %-22s ' "qwen3_decode_step"
+    out=$(python3 tools/verify_qwen3_decode.py --gen 8 2>&1); rc=$?
+    echo "$out" | grep -E "^C2 STEP GATE" | tail -1 | sed 's/^/ /'
+    [ $rc -eq 0 ] || fail=1
 fi
 
 printf '  %-22s ' "qwen_kernels"
