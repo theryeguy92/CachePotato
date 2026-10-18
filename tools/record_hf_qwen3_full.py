@@ -84,8 +84,18 @@ def main():
     torch.set_grad_enabled(False)
     tok = AutoTokenizer.from_pretrained(args.model)
     print("loading bf16 (61 GB) — this is the step that needs the big machine", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16,
-                                                 low_cpu_mem_usage=True)
+    # transformers renamed the argument (torch_dtype -> dtype); accept either so the box does
+    # not have to match the T480's version. Silently falling back to fp32 here would need 122 GB
+    # and fail with an OOM that looks like a hardware limit rather than a keyword mismatch.
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16,
+                                                     low_cpu_mem_usage=True)
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16,
+                                                     low_cpu_mem_usage=True)
+    if next(model.parameters()).dtype != torch.bfloat16:
+        raise SystemExit(f"weights came back as {next(model.parameters()).dtype}, not bfloat16 — "
+                         "refusing to record a baseline at the wrong precision")
     model.eval()
     L = args.layers or model.config.num_hidden_layers
     print(f"loaded: {L} layers, dtype {next(model.parameters()).dtype}", flush=True)
