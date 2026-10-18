@@ -208,7 +208,7 @@ static int name_is(const char *s, unsigned len, const char *want) {
     return len == w && memcmp(s, want, w) == 0;
 }
 
-int qwen3_load_v4(QW3Layer *m, const char *path, int layer) {
+int qwen3_map(QW3Layer *m, const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror(path); return -1; }
     struct stat st;
@@ -218,35 +218,42 @@ int qwen3_load_v4(QW3Layer *m, const char *path, int layer) {
     if (base == MAP_FAILED) { perror("mmap"); return -1; }
     m->map = base; m->map_len = (size_t)st.st_size;
 
-    const uint32_t n_tens = rd32(base + 16), n_enc = rd32(base + 28);
-    const uint64_t off_enc = rd64(base + 32), off_tens = rd64(base + 40), off_data = rd64(base + 64);
+    m->n_tens = rd32(base + 16); m->n_enc = rd32(base + 28);
+    const uint64_t off_enc = rd64(base + 32);
+    m->off_tens = rd64(base + 40); m->off_data = rd64(base + 64);
 
     /* encoding index -> engine encoding code */
-    int enc_code[64];
-    {
-        const unsigned char *cur = base + off_enc;
-        for (uint32_t i = 0; i < n_enc && i < 64; i++) {
-            uint32_t id = rd32(cur); cur += 4;
-            uint8_t kind = *cur++; uint8_t scalar = *cur++; cur += 2 /*group*/; cur += 2 /*block*/;
-            cur += 3 /*sub, flags, align*/;
-            uint16_t len; memcpy(&len, cur, 2); cur += 2 + len;
-            (void)id;
-            enc_code[i] = (kind == 0) ? QW3_ENC_F32
-                        : (scalar == 3) ? QW3_ENC_Q8
-                        : (scalar == 4) ? 4 : -1;
-        }
+    const unsigned char *cur = base + off_enc;
+    for (uint32_t i = 0; i < m->n_enc && i < 64; i++) {
+        cur += 4;                                  /* id */
+        uint8_t kind = *cur++; uint8_t scalar = *cur++;
+        cur += 2; cur += 2;                        /* group, block bytes */
+        cur += 3;                                  /* sub, flags, align */
+        uint16_t len; memcpy(&len, cur, 2); cur += 2 + len;
+        m->enc_code[i] = (kind == 0) ? QW3_ENC_F32
+                       : (scalar == 3) ? QW3_ENC_Q8
+                       : (scalar == 4) ? 4 : -1;
     }
-
-    /* Metadata comes from the model's own tensors, not from a config: shape is what the file has. */
     m->exp = calloc((size_t)128 * 3, sizeof(QW3T));
     if (!m->exp) return -2;
     m->exp_owned = 1;
-    int n_experts = 0;
-    
-    const unsigned char *cur = base + off_tens;
+    m->rope_theta = 1000000.0f;
+    m->rms_eps = 1e-6f;
+    m->topk = 8;
+    m->vocab = 151936;
+    return 0;
+}
+
+/* Walk the tensor table once, resolving what this layer needs and the model-wide tensors. */
+int qwen3_bind_layer(QW3Layer *m, int layer) {
+    const unsigned char *base = m->map;
+    const unsigned char *cur = base + m->off_tens;
     uint32_t cnt = rd32(cur); cur += 4;
-    if (cnt != n_tens) { fprintf(stderr, "v4: tensor count %u != header %u\n", cnt, n_tens); return -3; }
+    if (cnt != m->n_tens) { fprintf(stderr, "v4: tensor count %u != header %u\n", cnt, m->n_tens); return -3; }
     char want[64];
+    m->ln1 = m->ln2 = NULL; m->q_norm = m->k_norm = NULL; m->final_norm = NULL;
+    m->Wq.p = m->Wk.p = m->Wv.p = m->Wo.p = m->Wgate.p = NULL;
+    m->embed.p = m->lm_head.p = NULL;
     for (uint32_t i = 0; i < cnt; i++) {
         uint16_t nlen; memcpy(&nlen, cur, 2); cur += 2;
         const char *nm = (const char *)cur; cur += nlen;
@@ -254,12 +261,15 @@ int qwen3_load_v4(QW3Layer *m, const char *path, int layer) {
         uint8_t nd = *cur++; uint32_t dims[4] = {0,0,0,0};
         for (uint8_t d = 0; d < nd; d++) { dims[d] = rd32(cur); cur += 4; }
         uint64_t off = rd64(cur); cur += 8;
-        uint64_t nb  = rd64(cur); cur += 8;
-        cur += 4 /*block*/; cur += 2 /*role*/;
-        if (eidx >= n_enc) continue;
-        int enc = enc_code[eidx];
-        const void *ptr = base + off_data + off;
-        (void)nb;
+        cur += 8;                                  /* nbytes */
+        cur += 4; cur += 2;                        /* block, role */
+        if (eidx >= m->n_enc) continue;
+        const int enc = m->enc_code[eidx];
+        const void *ptr = base + m->off_data + off;
+
+        if (name_is(nm, nlen, "embed"))     { m->embed.p = ptr; m->embed.enc = enc; continue; }
+        if (name_is(nm, nlen, "lm_head"))   { m->lm_head.p = ptr; m->lm_head.enc = enc; continue; }
+        if (name_is(nm, nlen, "final_norm")){ m->final_norm = (const float *)ptr; m->d_model = (int)dims[0]; continue; }
 
         int l = -1, e = -1, kind = -1;
         if (nlen > 7 && memcmp(nm, "expert.", 7) == 0) {
@@ -272,7 +282,6 @@ int qwen3_load_v4(QW3Layer *m, const char *path, int layer) {
                     else if (!strcmp(ks, "Wu")) kind = 1;
                     else if (!strcmp(ks, "Wd")) kind = 2;
                     if (kind >= 0) {
-                        if (e + 1 > n_experts) n_experts = e + 1;
                         m->exp[(size_t)e * 3 + kind].p = ptr;
                         m->exp[(size_t)e * 3 + kind].enc = enc;
                     }
@@ -280,34 +289,32 @@ int qwen3_load_v4(QW3Layer *m, const char *path, int layer) {
             }
             continue;
         }
-        /* per-layer tensors are named "<stem>.<layer>" */
         snprintf(want, sizeof want, ".%d", layer);
         size_t wl = strlen(want);
         if (nlen <= wl || memcmp(nm + nlen - wl, want, wl) != 0) continue;
-        unsigned stem = nlen - (unsigned)wl;
-        if      (name_is(nm, stem, "ln1"))    { m->ln1 = ptr; m->d_model = (int)dims[0]; }
-        else if (name_is(nm, stem, "ln2"))    m->ln2 = ptr;
-        else if (name_is(nm, stem, "q_norm")) { m->q_norm = ptr; m->head_dim = (int)dims[0]; }
-        else if (name_is(nm, stem, "k_norm")) m->k_norm = ptr;
+        const unsigned stem = nlen - (unsigned)wl;
+        if      (name_is(nm, stem, "ln1"))    { m->ln1 = (const float *)ptr; m->d_model = (int)dims[0]; }
+        else if (name_is(nm, stem, "ln2"))    { m->ln2 = (const float *)ptr; }
+        else if (name_is(nm, stem, "q_norm")) { m->q_norm = (const float *)ptr; m->head_dim = (int)dims[0]; }
+        else if (name_is(nm, stem, "k_norm")) { m->k_norm = (const float *)ptr; }
         else if (name_is(nm, stem, "Wgate"))  { m->Wgate.p = ptr; m->Wgate.enc = enc;
                                                 m->n_experts = (int)dims[0]; }
         else if (name_is(nm, stem, "Wq"))     { m->Wq.p = ptr; m->Wq.enc = enc;
-                                                m->n_heads = (int)(dims[0] / (m->head_dim ? m->head_dim : 1)); }
+                                                if (m->head_dim) m->n_heads = (int)(dims[0] / m->head_dim); }
         else if (name_is(nm, stem, "Wk"))     { m->Wk.p = ptr; m->Wk.enc = enc;
-                                                m->n_kv = (int)(dims[0] / (m->head_dim ? m->head_dim : 1)); }
+                                                if (m->head_dim) m->n_kv = (int)(dims[0] / m->head_dim); }
         else if (name_is(nm, stem, "Wv"))     { m->Wv.p = ptr; m->Wv.enc = enc; }
         else if (name_is(nm, stem, "Wo"))     { m->Wo.p = ptr; m->Wo.enc = enc; }
+        else if (m->d_exp == 0 && nlen > 12 && memcmp(nm, "expert.", 7) == 0) { /* handled above */ }
     }
     if (!m->ln1 || !m->Wq.p || !m->Wgate.p || !m->exp[0].p) {
         fprintf(stderr, "v4: layer %d is incomplete\n", layer);
         return -4;
     }
-    /* Geometry the file states rather than implies. */
-    m->d_exp = 0;
-    snprintf(want, sizeof want, "expert.%d.0.Wg", layer);
-    /* d_exp comes from the expert shape; take it from the gate matrix's output dim */
+    /* d_exp from an expert's gate matrix: (d_exp, d_model) — the OUTPUT dim is d_exp. */
     {
-        const unsigned char *c2 = base + off_tens + 4;
+        const unsigned char *c2 = base + m->off_tens + 4;
+        snprintf(want, sizeof want, "expert.%d.0.Wg", layer);
         for (uint32_t i = 0; i < cnt; i++) {
             uint16_t nlen; memcpy(&nlen, c2, 2); c2 += 2;
             const char *nm = (const char *)c2; c2 += nlen;
@@ -315,18 +322,15 @@ int qwen3_load_v4(QW3Layer *m, const char *path, int layer) {
             uint8_t nd = *c2++; uint32_t dims[4] = {0,0,0,0};
             for (uint8_t d = 0; d < nd; d++) { dims[d] = rd32(c2); c2 += 4; }
             c2 += 8 + 8 + 4 + 2;
-            if (eidx >= n_enc) continue;
-            if (nlen == strlen(want) && memcmp(nm, want, nlen) == 0) {
-                m->d_exp = (int)dims[0];
-                break;
-            }
+            if (eidx >= m->n_enc) continue;
+            if (nlen == strlen(want) && memcmp(nm, want, nlen) == 0) { m->d_exp = (int)dims[0]; break; }
         }
     }
-    m->rope_theta = 1000000.0f;
-    m->rms_eps = 1e-6f;
-    m->topk = 8;
-    m->vocab = 151936;
-    if (n_experts) m->n_experts = n_experts;
-    if (!m->d_exp) { fprintf(stderr, "v4: cannot determine d_exp\n"); return -5; }
-        return 0;
+    if (!m->d_exp) { fprintf(stderr, "v4: cannot determine d_exp for layer %d\n", layer); return -5; }
+    return 0;
+}
+
+int qwen3_load_v4(QW3Layer *m, const char *path, int layer) {
+    int rc = qwen3_map(m, path);
+    return rc ? rc : qwen3_bind_layer(m, layer);
 }

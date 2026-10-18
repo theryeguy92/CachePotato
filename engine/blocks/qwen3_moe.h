@@ -1,6 +1,7 @@
 #ifndef QWEN3_MOE_H
 #define QWEN3_MOE_H
 #include <stddef.h>
+#include <stdint.h>
 
 /* Qwen3-30B-A3B: one decoder layer. Three things here are new to this engine:
  *   QK-norm   per-head RMSNorm on q (n_heads) and k (n_kv) BEFORE RoPE
@@ -31,6 +32,13 @@ typedef struct {
     int exp_owned;
     const void *map;        /* whole-file mapping, owned by the caller-facing loader */
     size_t map_len;
+    /* global tensors, bound once for the whole model */
+    QW3T embed, lm_head;
+    const float *final_norm;
+    /* parsed table geometry, reused by every bind so a 48-layer run maps the file ONCE */
+    uint64_t off_tens, off_data;
+    uint32_t n_tens, n_enc;
+    int enc_code[64];   /* encoding index -> QW3_ENC_* */
 } QW3Layer;
 
 typedef struct {
@@ -50,5 +58,7 @@ int qwen3_load_blob(QW3Layer *m, const char *path, float **owned);
 
 /* CPW1 v4 loader: reads the published format, one layer at a time.
    Returns 0 on success; the file is mmapped and stays mapped for the model's lifetime. */
-int qwen3_load_v4(QW3Layer *m, const char *path, int layer);
+int qwen3_map(QW3Layer *m, const char *path);        /* mmap + read the encoding table */
+int qwen3_bind_layer(QW3Layer *m, int layer);        /* resolve one layer's tensors */
+int qwen3_load_v4(QW3Layer *m, const char *path, int layer);   /* map + bind (A5 gate) */
 #endif
