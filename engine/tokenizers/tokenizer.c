@@ -78,8 +78,7 @@ static const char *contractions[] = {"'s", "'t", "'re", "'ve", "'m", "'ll", "'d"
 
 /* BPE one chunk: bytes -> single-byte ids -> repeatedly merge the
    lowest-rank adjacent pair until nothing merges. Appends to ids. */
-static int bpe_chunk(const Tokenizer *t, const unsigned char *s, int n,
-                     int *ids, int max_ids) {
+int bpe_chunk(const Tokenizer *t, const unsigned char *s, int n, int *ids, int max_ids) {
     int tmp[512];
     if (n > 512) n = 512; /* ponytail: chunk cap; GPT-2 chunks are short */
     int len = 0;
