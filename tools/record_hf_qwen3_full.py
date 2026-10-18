@@ -91,7 +91,19 @@ def main():
     # SPREAD. Deciding this from the actual numbers rather than trying and reading the OOM.
     idx = json.load(open(Path(args.model) / "model.safetensors.index.json"))
     need = idx["metadata"]["total_size"]
-    avail = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    # MemAvailable, NOT free pages. SC_AVPHYS_PAGES is MemFree, which ignores reclaimable page
+    # cache: a box that has just read 57 GB of weights reports ~21 GB free while 58 GB is
+    # available, and the script refused a model that fits easily. On Linux, page cache IS memory
+    # you can have back.
+    def avail_ram():
+        try:
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+        except OSError:
+            pass
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    avail = avail_ram()
     vram = 0
     if torch.cuda.is_available():
         # SUM EVERY DEVICE. mem_get_info() defaults to the CURRENT device, so a two-GPU box was
