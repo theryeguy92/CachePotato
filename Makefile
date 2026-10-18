@@ -25,6 +25,12 @@ QWEN_SRC := tools/qwen_chat.c engine/blocks/qwen2.c engine/tokenizers/tokenizer.
 $(BUILD)/qwen_chat: $(QWEN_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+# Decode benchmark for A/B work (tools/ab.py drives it).
+BENCH_SRC := tools/bench_decode.c engine/blocks/qwen2.c engine/kernels/kernels.c \
+             engine/kernels/parallel.c
+$(BUILD)/bench_decode: $(BENCH_SRC)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 $(BUILD)/train: $(TRAINER)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
