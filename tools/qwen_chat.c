@@ -56,16 +56,30 @@ int main(int argc, char **argv) {
         fprintf(stderr, "assistant> ");
         int pos = n, produced = 0;
         double t2 = now();
+        double t_arg = 0, t_emit = 0, t_step = 0;
         while (produced < max_new && pos < 2047) {
+            double a0 = now();
             int best = 0;
             for (int j = 1; j < m.vocab; j++) if (logits[j] > logits[best]) best = j;
+            t_arg += now() - a0;
             if (best == IM_END) { fflush(stdout); break; }
+            double e0 = now();
             tokenizer_decode(&tk, &best, 1, stdout);
             fflush(stdout);
+            t_emit += now() - e0;
+            double s0 = now();
             if (qwen2_step(&m, c, best, pos, logits)) break;
+            t_step += now() - s0;
             pos++; produced++;
         }
         free(logits);
+        {
+            double wall = now() - t2;
+            double acc = t_step + t_arg + t_emit;
+            fprintf(stderr, "\n[loop] step %.0f | argmax %.0f | emit %.0f | "
+                    "UNACCOUNTED %.0f ms  (of %.0f ms)\n",
+                    t_step*1e3, t_arg*1e3, t_emit*1e3, (wall-acc)*1e3, wall*1e3);
+        }
         double t3 = now();
         fprintf(stderr, "\n[prefill %d tok in %.2fs (%.1f tok/s) | %d tok in %.2fs (%.2f tok/s)]\n",
                 n, t1 - t0, n / (t1 - t0), produced, t3 - t2,
