@@ -5,9 +5,11 @@
  */
 #include "qwen3_moe.h"
 #include "kernels/kernels.h"
+#include "pager/pager.h"
 
 #include <math.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -61,6 +63,21 @@ int qwen3_layer(const QW3Layer *m, const float *x, int T, QW3Out *o) {
 
     /* ---- attention: norm -> qkv -> QK-norm -> RoPE -> GQA -> o_proj ---- */
     for (int t = 0; t < T; t++) {
+        /* The pager's unit is the region, and this token is about to read six of them.
+           Demand-touch BEFORE the read: charging after it would describe the previous
+           state of the cache, which is the whole distinction between a hit and a miss.
+           Nine core regions per layer (six here, Wo, ln2, the router) plus one per
+           selected expert is 17 per layer, 816 per token across 48 layers — the
+           working set the budget is measured against. */
+        if (m->pager) {
+            pager_step(t);
+            pager_touch_region(m->reg_ln1);
+            pager_touch_region(m->reg_Wq);
+            pager_touch_region(m->reg_Wk);
+            pager_touch_region(m->reg_Wv);
+            pager_touch_region(m->reg_qnorm);
+            pager_touch_region(m->reg_knorm);
+        }
         rmsnorm(xn + (size_t)t * D, x + (size_t)t * D, m->ln1, D, m->rms_eps);
         mm(&m->Wq, q + (size_t)t * H * HD,  xn + (size_t)t * D, D, H * HD);
         mm(&m->Wk, k + (size_t)t * KV * HD, xn + (size_t)t * D, D, KV * HD);
@@ -88,11 +105,18 @@ int qwen3_layer(const QW3Layer *m, const float *x, int T, QW3Out *o) {
             }
         }
     }
-    for (int t = 0; t < T; t++)
+    for (int t = 0; t < T; t++) {
+        if (m->pager) { pager_step(t); pager_touch_region(m->reg_Wo); }
         mm(&m->Wo, o->attn + (size_t)t * D, ao + (size_t)t * H * HD, H * HD, D);
+    }
 
     /* ---- MoE: router -> softmax -> top-k -> renormalise -> gated experts ---- */
     for (int t = 0; t < T; t++) {
+        if (m->pager) {
+            pager_step(t);
+            pager_touch_region(m->reg_ln2);
+            pager_touch_region(m->reg_Wgate);
+        }
         for (int j = 0; j < D; j++) hh[j] = x[(size_t)t * D + j] + o->attn[(size_t)t * D + j];
         rmsnorm(xn + (size_t)t * D, hh, m->ln2, D, m->rms_eps);
         mm(&m->Wgate, o->router + (size_t)t * E, xn + (size_t)t * D, D, E);
@@ -116,6 +140,10 @@ int qwen3_layer(const QW3Layer *m, const float *x, int T, QW3Out *o) {
 
         for (int j = 0; j < K; j++) {
             const int e = idx[j];
+            /* One region per (layer, expert), declared by the file. This is the touch
+               that makes the experiment: 8 of 128 per layer, chosen by the router, and
+               nothing else in the layer depends on which ones. */
+            if (m->pager) pager_touch_region(m->reg_exp[e]);
             o->topk_idx[(size_t)t * K + j] = e;
             const QW3T *wg = &m->exp[(size_t)e * 3 + 0];
             const QW3T *wu = &m->exp[(size_t)e * 3 + 1];
@@ -214,13 +242,15 @@ int qwen3_map(QW3Layer *m, const char *path) {
     struct stat st;
     if (fstat(fd, &st) != 0) { close(fd); return -1; }
     const unsigned char *base = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (base == MAP_FAILED) { perror("mmap"); return -1; }
+    if (base == MAP_FAILED) { perror("mmap"); close(fd); return -1; }
     m->map = base; m->map_len = (size_t)st.st_size;
 
-    m->n_tens = rd32(base + 16); m->n_enc = rd32(base + 28);
+    m->n_tens = rd32(base + 16); m->n_regions = (int)rd32(base + 24);
+    m->n_enc = rd32(base + 28);
     const uint64_t off_enc = rd64(base + 32);
-    m->off_tens = rd64(base + 40); m->off_data = rd64(base + 64);
+    m->off_tens = rd64(base + 40);
+    const uint64_t off_reg = rd64(base + 56);
+    m->off_data = rd64(base + 64);
 
     /* encoding index -> engine encoding code */
     const unsigned char *cur = base + off_enc;
@@ -235,12 +265,64 @@ int qwen3_map(QW3Layer *m, const char *path) {
                        : (scalar == 4) ? 4 : -1;
     }
     m->exp = calloc((size_t)128 * 3, sizeof(QW3T));
-    if (!m->exp) return -2;
+    m->reg_exp = calloc((size_t)128, sizeof(int));
+    m->tensor_reg = calloc(m->n_tens ? m->n_tens : 1, sizeof(int));
+    if (!m->exp || !m->reg_exp || !m->tensor_reg) { close(fd); return -2; }
     m->exp_owned = 1;
+    for (uint32_t i = 0; i < m->n_tens; i++) m->tensor_reg[i] = -1;
     m->rope_theta = 1000000.0f;
     m->rms_eps = 1e-6f;
     m->topk = 8;
     m->vocab = 151936;
+
+    /* ---- region table: the file's own declaration of what is pageable (SPEC §8).
+       Region ids handed to the pager ARE this table's indices, so "region 1234" means
+       the same thing to the file, the loader and the report — and a touch can never
+       describe bytes the file did not declare pageable.
+       Digests are NOT checked here. tools/verify_v4_file.py owns that claim, and doing
+       it at load would read all 32.5 GB on every run, which would both destroy the
+       measurement (every region starts resident) and make a model that does not fit in
+       RAM impossible to load on the machine the pager exists for. */
+    {
+        const char *pg = getenv("CP_PAGER"), *pb = getenv("CP_BUDGET");
+        /* Off unless asked for: the unpaged run IS the control (B5), and a pager that
+           attached itself would change the memory behaviour of every existing gate. */
+        if ((pg && pg[0] == '1') || pb) {
+            long budget = LONG_MAX;                 /* active, counts, never evicts */
+            if (pb) budget = atol(pb) * 1024L * 1024L;
+            if (pager_open_v4(fd, base, (size_t)m->off_data, budget)) {
+                fprintf(stderr, "v4: pager open failed\n");
+                close(fd);
+                return -6;
+            }
+            m->pager = 1;
+        }
+    }
+    {
+        const unsigned char *reg = base + off_reg;
+        uint32_t nreg = rd32(reg); reg += 4;
+        if (nreg != (uint32_t)m->n_regions) {
+            fprintf(stderr, "v4: region table count %u != header %d\n", nreg, m->n_regions);
+            close(fd);
+            return -3;
+        }
+        for (uint32_t i = 0; i < nreg; i++) {
+            uint64_t off = rd64(reg); reg += 8;
+            uint64_t len = rd64(reg); reg += 8;
+            uint32_t lo = rd32(reg); reg += 4;
+            uint32_t hi = rd32(reg); reg += 4;
+            const uint8_t kind = *reg++;
+            reg += 2 + 4 + 4 + 8;               /* slot, member_lo/hi, digest */
+            if (m->pager && pager_add_region((size_t)off, (size_t)len, kind == 1) != (int)i) {
+                fprintf(stderr, "v4: pager region id != table index %u\n", i);
+                close(fd);
+                return -6;
+            }
+            for (uint32_t t = lo; t < hi && t < m->n_tens; t++)
+                m->tensor_reg[t] = (int)i;
+        }
+    }
+    close(fd);
     return 0;
 }
 
@@ -254,6 +336,11 @@ int qwen3_bind_layer(QW3Layer *m, int layer) {
     m->ln1 = m->ln2 = NULL; m->q_norm = m->k_norm = NULL; m->final_norm = NULL;
     m->Wq.p = m->Wk.p = m->Wv.p = m->Wo.p = m->Wgate.p = NULL;
     m->embed.p = m->lm_head.p = NULL;
+    /* region ids are per layer, so they are cleared with the pointers */
+    m->reg_ln1 = m->reg_ln2 = m->reg_qnorm = m->reg_knorm = -1;
+    m->reg_Wq = m->reg_Wk = m->reg_Wv = m->reg_Wo = m->reg_Wgate = -1;
+    m->reg_embed = m->reg_lm_head = m->reg_final_norm = -1;
+    if (m->reg_exp) for (int e = 0; e < 128; e++) m->reg_exp[e] = -1;
     for (uint32_t i = 0; i < cnt; i++) {
         uint16_t nlen; memcpy(&nlen, cur, 2); cur += 2;
         const char *nm = (const char *)cur; cur += nlen;
@@ -266,10 +353,15 @@ int qwen3_bind_layer(QW3Layer *m, int layer) {
         if (eidx >= m->n_enc) continue;
         const int enc = m->enc_code[eidx];
         const void *ptr = base + m->off_data + off;
+        const int reg = m->tensor_reg ? m->tensor_reg[i] : -1;
 
-        if (name_is(nm, nlen, "embed"))     { m->embed.p = ptr; m->embed.enc = enc; continue; }
-        if (name_is(nm, nlen, "lm_head"))   { m->lm_head.p = ptr; m->lm_head.enc = enc; continue; }
-        if (name_is(nm, nlen, "final_norm")){ m->final_norm = (const float *)ptr; m->d_model = (int)dims[0]; continue; }
+        if (name_is(nm, nlen, "embed"))     { m->embed.p = ptr; m->embed.enc = enc;
+                                              m->reg_embed = reg; continue; }
+        if (name_is(nm, nlen, "lm_head"))   { m->lm_head.p = ptr; m->lm_head.enc = enc;
+                                              m->reg_lm_head = reg; continue; }
+        if (name_is(nm, nlen, "final_norm")){ m->final_norm = (const float *)ptr;
+                                              m->d_model = (int)dims[0];
+                                              m->reg_final_norm = reg; continue; }
 
         int l = -1, e = -1, kind = -1;
         if (nlen > 7 && memcmp(nm, "expert.", 7) == 0) {
@@ -284,6 +376,10 @@ int qwen3_bind_layer(QW3Layer *m, int layer) {
                     if (kind >= 0) {
                         m->exp[(size_t)e * 3 + kind].p = ptr;
                         m->exp[(size_t)e * 3 + kind].enc = enc;
+                        /* An expert's three matrices share ONE region (the file
+                           declares a region per expert, SPEC §8), so the id is the
+                           same for Wg/Wu/Wd and only the expert index matters. */
+                        if (e >= 0 && e < 128) m->reg_exp[e] = reg;
                     }
                 }
             }
@@ -293,18 +389,22 @@ int qwen3_bind_layer(QW3Layer *m, int layer) {
         size_t wl = strlen(want);
         if (nlen <= wl || memcmp(nm + nlen - wl, want, wl) != 0) continue;
         const unsigned stem = nlen - (unsigned)wl;
-        if      (name_is(nm, stem, "ln1"))    { m->ln1 = (const float *)ptr; m->d_model = (int)dims[0]; }
-        else if (name_is(nm, stem, "ln2"))    { m->ln2 = (const float *)ptr; }
-        else if (name_is(nm, stem, "q_norm")) { m->q_norm = (const float *)ptr; m->head_dim = (int)dims[0]; }
-        else if (name_is(nm, stem, "k_norm")) { m->k_norm = (const float *)ptr; }
+        if      (name_is(nm, stem, "ln1"))    { m->ln1 = (const float *)ptr; m->d_model = (int)dims[0];
+                                                m->reg_ln1 = reg; }
+        else if (name_is(nm, stem, "ln2"))    { m->ln2 = (const float *)ptr; m->reg_ln2 = reg; }
+        else if (name_is(nm, stem, "q_norm")) { m->q_norm = (const float *)ptr; m->head_dim = (int)dims[0];
+                                                m->reg_qnorm = reg; }
+        else if (name_is(nm, stem, "k_norm")) { m->k_norm = (const float *)ptr; m->reg_knorm = reg; }
         else if (name_is(nm, stem, "Wgate"))  { m->Wgate.p = ptr; m->Wgate.enc = enc;
-                                                m->n_experts = (int)dims[0]; }
+                                                m->n_experts = (int)dims[0]; m->reg_Wgate = reg; }
         else if (name_is(nm, stem, "Wq"))     { m->Wq.p = ptr; m->Wq.enc = enc;
-                                                if (m->head_dim) m->n_heads = (int)(dims[0] / m->head_dim); }
+                                                if (m->head_dim) m->n_heads = (int)(dims[0] / m->head_dim);
+                                                m->reg_Wq = reg; }
         else if (name_is(nm, stem, "Wk"))     { m->Wk.p = ptr; m->Wk.enc = enc;
-                                                if (m->head_dim) m->n_kv = (int)(dims[0] / m->head_dim); }
-        else if (name_is(nm, stem, "Wv"))     { m->Wv.p = ptr; m->Wv.enc = enc; }
-        else if (name_is(nm, stem, "Wo"))     { m->Wo.p = ptr; m->Wo.enc = enc; }
+                                                if (m->head_dim) m->n_kv = (int)(dims[0] / m->head_dim);
+                                                m->reg_Wk = reg; }
+        else if (name_is(nm, stem, "Wv"))     { m->Wv.p = ptr; m->Wv.enc = enc; m->reg_Wv = reg; }
+        else if (name_is(nm, stem, "Wo"))     { m->Wo.p = ptr; m->Wo.enc = enc; m->reg_Wo = reg; }
         else if (m->d_exp == 0 && nlen > 12 && memcmp(nm, "expert.", 7) == 0) { /* handled above */ }
     }
     if (!m->ln1 || !m->Wq.p || !m->Wgate.p || !m->exp[0].p) {

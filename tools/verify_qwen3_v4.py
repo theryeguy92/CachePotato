@@ -71,7 +71,14 @@ def main():
         exe = td / "q3v"
         b = subprocess.run(["cc", "-O3", "-march=native", "-Iengine", "-o", str(exe), str(td / "r.c"),
                             "engine/blocks/qwen3_moe.c", "engine/kernels/kernels.c",
-                            "engine/kernels/parallel.c", "-lm", "-lpthread"],
+                            "engine/kernels/parallel.c",
+                            # the block now demand-touches file regions (C1); the pager is a
+                            # no-op without CP_PAGER, so the numbers these gates compare are
+                            # unchanged. pager.c's v2/v3 front-end pulls the GPT-2 loader in
+                            # (weights.c, and weights_v4.c for model_load_v4).
+                            "engine/pager/pager.c", "engine/core/weights.c",
+                            "engine/core/weights_v4.c",
+                            "-lm", "-lpthread"],
                            cwd=ROOT, capture_output=True, text=True)
         if b.returncode:
             print(b.stderr[-800:]); return 1

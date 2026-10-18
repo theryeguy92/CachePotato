@@ -7,7 +7,7 @@ TRAINER := engine/core/weights.c engine/core/weights_v4.c engine/kernels/kernels
 
 .PHONY: all calibrate
 
-all: $(BUILD)/cachepotato $(BUILD)/train
+all: $(BUILD)/cachepotato $(BUILD)/train $(BUILD)/qwen3_eval
 
 # Host calibration probe (Phase 8 T3): measures the memory hierarchy and emits a
 # machine profile. Not part of the engine — a separate diagnostic binary.
@@ -29,6 +29,15 @@ $(BUILD)/qwen_chat: $(QWEN_SRC)
 BENCH_SRC := tools/bench_decode.c engine/blocks/qwen2.c engine/kernels/kernels.c \
              engine/kernels/parallel.c
 $(BUILD)/bench_decode: $(BENCH_SRC)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# Qwen3-30B-A3B eval driver (B5 + C1 paging). Built but not run by `make`: it wants the
+# 32.5 GB v4 file, which only the paging work has. pager.c is linked because the block
+# demand-touches file regions; it is a no-op unless CP_PAGER is set at run time.
+QWEN3_SRC := tools/qwen3_eval.c engine/blocks/qwen3_moe.c engine/kernels/kernels.c \
+             engine/kernels/parallel.c engine/pager/pager.c engine/core/weights.c \
+             engine/core/weights_v4.c
+$(BUILD)/qwen3_eval: $(QWEN3_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 $(BUILD)/train: $(TRAINER)

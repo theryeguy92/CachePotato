@@ -39,6 +39,23 @@ typedef struct {
     uint64_t off_tens, off_data;
     uint32_t n_tens, n_enc;
     int enc_code[64];   /* encoding index -> QW3_ENC_* */
+
+    /* ---- pager attachment (C1) -------------------------------------------------
+       The pager evicts REGIONS, and a v4 file declares them (SPEC §8), so the unit of
+       the policy is a region id, not an address. qwen3_map() adds the file's regions to
+       the pager and remembers which region covers each tensor; qwen3_bind_layer() then
+       records the ids of the tensors this layer bound. At run time a touch is an array
+       index — no search, and no second description of where the bytes are, which is
+       what lets the accounting be checked against the file instead of against itself.
+       Every id is -1 when no pager is attached and pager_touch_region(-1) is a no-op,
+       so the unpaged path runs the same code with the same arithmetic. */
+    int pager;              /* 1 when a pager is attached to this mapping */
+    int n_regions;          /* regions in the file's table */
+    int *tensor_reg;        /* [n_tens]: region covering that tensor, or -1 */
+    int *reg_exp;           /* [n_experts]: region for the BOUND layer's expert e */
+    int reg_ln1, reg_ln2, reg_qnorm, reg_knorm;
+    int reg_Wq, reg_Wk, reg_Wv, reg_Wo, reg_Wgate;
+    int reg_embed, reg_lm_head, reg_final_norm;
 } QW3Layer;
 
 typedef struct {
