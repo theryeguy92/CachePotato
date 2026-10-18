@@ -18,12 +18,13 @@ typedef struct {
        tensor base for every layer is a silent bug this project has already made once. */
     const unsigned char *q_Wq, *q_Wk, *q_Wv, *q_Wo, *q_Wg, *q_Wu, *q_Wd, *q_embed;
     int quantized;
+    int q_bits;      /* 0 = f32, 8 = Q8_0, 4 = Q4_0; all quantized matrices must agree */
 } QW2;
 
 int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits);
 
 /* element `idx` of a stacked quantized group: `elems` values per index, 34 bytes per 32. */
-const unsigned char *q8_slice_at(const unsigned char *base, int idx, long elems);
+const unsigned char *q_slice_at(const unsigned char *base, int idx, long elems, int block_bytes);
 int qwen2_load_blob(QW2 *m, const char *path, float **owned);
 /* v4: geometry (heads, KV heads, head_dim, rope theta, eps) comes from the file's BLOCK TABLE. */
 int qwen2_load_v4(QW2 *m, const char *path, void **map, size_t *maplen);

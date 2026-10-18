@@ -30,8 +30,8 @@ int main(int argc, char **argv) {
     if (!c) return 1;
 
     char line[4096];
-    fprintf(stderr, "qwen2.5-0.5b — %d layers, d=%d, heads %d/%d. ctrl-D to quit.\n",
-            m.n_layers, m.d_model, m.n_heads, m.n_kv);
+    fprintf(stderr, "qwen2.5-0.5b — %d layers, d=%d, heads %d/%d, weights Q%d. ctrl-D to quit.\n",
+            m.n_layers, m.d_model, m.n_heads, m.n_kv, m.q_bits);
 
     while (1) {
         fprintf(stderr, "\nuser> ");

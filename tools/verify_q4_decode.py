@@ -83,3 +83,8 @@ if __name__ == "__main__":
 # Appended as a second mode: the DECODER is gated bit-exactly above; the MATMUL cannot be (ffp32
 # summation order), so it is gated against `dequant + matmul` at 1e-5 relative — the same standard
 # as the Q8 kernel. This is what catches a mis-signed nibble in the SIMD path.
+
+
+# NOTE: the matmul check must run with CP_THREADS>1, because that is what production uses. The
+# first version of this gate ran single-threaded, exercised the scalar fallback, and passed while
+# the AVX2 kernel returned NaN. A gate that tests a path the model never takes is not a gate.

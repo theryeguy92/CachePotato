@@ -31,8 +31,21 @@ static double qnow(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &t
 #define TICK(v) double v = qnow()
 #define TOCK(acc, v) (acc) += qnow() - (v)
 
-const unsigned char *q8_slice_at(const unsigned char *base, int idx, long elems) {
-    return base ? base + (size_t)idx * (size_t)((elems / 32) * 34) : (const unsigned char *)0;
+const unsigned char *q_slice_at(const unsigned char *base, int idx, long elems, int block_bytes) {
+    return base ? base + (size_t)idx * (size_t)((elems / 32) * block_bytes)
+                : (const unsigned char *)0;
+}
+
+/* One dispatch for both block encodings. The block size differs (34 vs 18 bytes), so slicing and
+   the kernel must be chosen together — the entire class of bug this session kept finding. */
+static inline const unsigned char *qsl(const QW2 *m, const unsigned char *base, int idx, long elems) {
+    return q_slice_at(base, idx, elems, m->q_bits == 4 ? 18 : 34);
+}
+static inline void mm_wx(const QW2 *m, float *o, const float *x, const float *w,
+                         const unsigned char *q, int nin, int nout) {
+    if (!q) matmul_wx(o, x, w, nin, nout);
+    else if (m->q_bits == 4) matmul_wx_q4(o, x, q, nin, nout);
+    else matmul_wx_q8(o, x, q, nin, nout);
 }
 
 int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits) {
@@ -53,7 +66,7 @@ int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits) {
     if (!x || !xn || !q || !k || !vv || !ao || !sc || !hh || !gg) return -2;
 
     for (int t = 0; t < T; t++) {
-        if (m->q_embed) q8_dequant_row(q8_slice_at(m->q_embed, tokens[t], (long)D),
+        if (m->q_embed) q8_dequant_row(qsl(m, m->q_embed, tokens[t], (long)D),
                                        x + (size_t)t * D, D);
         else memcpy(x + (size_t)t * D, m->embed + (size_t)tokens[t] * D, sizeof(float) * D);
     }
@@ -63,12 +76,12 @@ int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits) {
         for (int t = 0; t < T; t++)
             rmsnorm(xn + (size_t)t * D, x + (size_t)t * D, m->ln1 + (size_t)l * D, D, m->rms_eps);
         for (int t = 0; t < T; t++) {
-            matmul_wx_auto(q + (size_t)t * H * HD,  xn + (size_t)t * D, m->Wq + (size_t)l * D * D,
-                           q8_slice_at(m->q_Wq, l, (long)D * D), D, H * HD);
-            matmul_wx_auto(k + (size_t)t * KV * HD, xn + (size_t)t * D, m->Wk + (size_t)l * KV * HD * D,
-                           q8_slice_at(m->q_Wk, l, (long)KV * HD * D), D, KV * HD);
-            matmul_wx_auto(vv + (size_t)t * KV * HD, xn + (size_t)t * D, m->Wv + (size_t)l * KV * HD * D,
-                           q8_slice_at(m->q_Wv, l, (long)KV * HD * D), D, KV * HD);
+            mm_wx(m, q + (size_t)t * H * HD,  xn + (size_t)t * D, m->Wq + (size_t)l * D * D,
+                           qsl(m, m->q_Wq, l, (long)D * D), D, H * HD);
+            mm_wx(m, k + (size_t)t * KV * HD, xn + (size_t)t * D, m->Wk + (size_t)l * KV * HD * D,
+                           qsl(m, m->q_Wk, l, (long)KV * HD * D), D, KV * HD);
+            mm_wx(m, vv + (size_t)t * KV * HD, xn + (size_t)t * D, m->Wv + (size_t)l * KV * HD * D,
+                           qsl(m, m->q_Wv, l, (long)KV * HD * D), D, KV * HD);
             for (int j = 0; j < H * HD; j++)  q[(size_t)t * H * HD + j]  += m->bq[(size_t)l * H * HD + j];
             for (int j = 0; j < KV * HD; j++) {
                 k[(size_t)t * KV * HD + j]  += m->bk[(size_t)l * KV * HD + j];
@@ -97,8 +110,8 @@ int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits) {
             }
         }
         for (int t = 0; t < T; t++) {
-            matmul_wx_auto(hh, ao + (size_t)t * D, m->Wo + (size_t)l * D * D,
-                           q8_slice_at(m->q_Wo, l, (long)D * D), H * HD, D);
+            mm_wx(m, hh, ao + (size_t)t * D, m->Wo + (size_t)l * D * D,
+                           qsl(m, m->q_Wo, l, (long)D * D), H * HD, D);
             for (int j = 0; j < D; j++) x[(size_t)t * D + j] += hh[j];
         }
 
@@ -106,14 +119,14 @@ int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits) {
         for (int t = 0; t < T; t++) {
             float *xt = x + (size_t)t * D;
             rmsnorm(xn + (size_t)t * D, xt, m->ln2 + (size_t)l * D, D, m->rms_eps);
-            matmul_wx_auto(gg + (size_t)t * F, xn + (size_t)t * D, m->Wg + (size_t)l * F * D,
-                           q8_slice_at(m->q_Wg, l, (long)F * D), D, F);
-            matmul_wx_auto(hh + (size_t)t * F, xn + (size_t)t * D, m->Wu + (size_t)l * F * D,
-                           q8_slice_at(m->q_Wu, l, (long)F * D), D, F);
+            mm_wx(m, gg + (size_t)t * F, xn + (size_t)t * D, m->Wg + (size_t)l * F * D,
+                           qsl(m, m->q_Wg, l, (long)F * D), D, F);
+            mm_wx(m, hh + (size_t)t * F, xn + (size_t)t * D, m->Wu + (size_t)l * F * D,
+                           qsl(m, m->q_Wu, l, (long)F * D), D, F);
             for (int j = 0; j < F; j++)
                 gg[(size_t)t * F + j] = silu(gg[(size_t)t * F + j]) * hh[(size_t)t * F + j];
-            matmul_wx_auto(hh, gg + (size_t)t * F, m->Wd + (size_t)l * D * F,
-                           q8_slice_at(m->q_Wd, l, (long)D * F), F, D);
+            mm_wx(m, hh, gg + (size_t)t * F, m->Wd + (size_t)l * D * F,
+                           qsl(m, m->q_Wd, l, (long)D * F), F, D);
             for (int j = 0; j < D; j++) xt[j] += hh[j];
         }
     }
@@ -121,7 +134,7 @@ int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits) {
     /* final norm + tied unembedding */
     for (int t = 0; t < T; t++) {
         rmsnorm(xn + (size_t)t * D, x + (size_t)t * D, m->norm, D, m->rms_eps);
-        matmul_wx_auto(logits + (size_t)t * V, xn + (size_t)t * D, m->embed, m->q_embed, D, V);
+        mm_wx(m, logits + (size_t)t * V, xn + (size_t)t * D, m->embed, m->q_embed, D, V);
     }
     free(x); free(xn); free(q); free(k); free(vv); free(ao); free(sc); free(hh); free(gg);
     return 0;
@@ -205,6 +218,7 @@ typedef struct { char name[64]; uint64_t off, len; uint32_t dims[4]; int rank, d
  * quantized. The meaning is per-file, so it must be looked up. */
 #define MAX_ENC 8
 static int g_enc_isq8[MAX_ENC];
+static int g_enc_scalar[MAX_ENC];   /* 3 = Q8_0, 4 = Q4_0; the block size follows from it */
 
 static void parse_encodings(const unsigned char *img, uint64_t off, uint32_t n) {
     size_t o = (size_t)off;
@@ -213,10 +227,18 @@ static void parse_encodings(const unsigned char *img, uint64_t off, uint32_t n) 
         int kind = img[o++], scalar = img[o++];
         o += 4 + 3;                              /* group, block, sub, flags, align */
         uint16_t nl = (uint16_t)(img[o] | (img[o + 1] << 8)); o += 2 + nl;
-        g_enc_isq8[i] = (kind == 1 && scalar == 3);
+        g_enc_scalar[i] = scalar;
+        g_enc_isq8[i] = (kind == 1 && (scalar == 3 || scalar == 4));
     }
 }
 static int dtype_is_q8(int dtype) { return (dtype >= 0 && dtype < MAX_ENC) ? g_enc_isq8[dtype] : -1; }
+/* 8 or 4, or 0 for raw f32. Refuses an encoding it does not implement. */
+static int dtype_qbits(int dtype) {
+    if (dtype < 0 || dtype >= MAX_ENC || !g_enc_isq8[dtype]) return 0;
+    if (g_enc_scalar[dtype] == 3) return 8;
+    if (g_enc_scalar[dtype] == 4) return 4;
+    return -1;
+}
 
 static const unsigned char *find_any(const QT *t, int n, const unsigned char *base, uint64_t od,
                                     const char *nm, int *dtype) {
@@ -305,7 +327,10 @@ int qwen2_load_v4(QW2 *m, const char *path, void **map, size_t *maplen) {
     int embed_dt = 0;
     const unsigned char *embed_p = find_any(t, nt, img, od, "embed", &embed_dt);
     const float *embed = (embed_p && dtype_is_q8(embed_dt) == 0) ? (const float *)embed_p : NULL;
-    if (embed_p && dtype_is_q8(embed_dt) != 0) m->q_embed = embed_p;
+    if (embed_p && dtype_is_q8(embed_dt) != 0) {
+        m->q_embed = embed_p;
+        m->q_bits = dtype_qbits(embed_dt);
+    }
     m->embed = embed;
     if (!embed_p || !find_any(t, nt, img, od, "Wq", NULL) || !find_any(t, nt, img, od, "Wk", NULL)) {
         fprintf(stderr, "v4: missing core tensors\n"); goto bad;
@@ -344,16 +369,27 @@ int qwen2_load_v4(QW2 *m, const char *path, void **map, size_t *maplen) {
             if (dtype_is_q8(dt) == 0) { *tab[k].f = (const float *)p; *tab[k].q = NULL; }
             else {
                 *tab[k].f = NULL; *tab[k].q = p;     /* unused when quantized */
+                int bits = dtype_qbits(dt);
+                if (bits < 0) { fprintf(stderr, "v4: %s uses an unsupported encoding\n",
+                                        tab[k].nm); goto bad; }
+                /* One encoding for all quantized matrices: the dispatch picks ONE kernel, and a
+                   mixed file would run the wrong block size on half the weights. */
+                if (m->q_bits && m->q_bits != bits) {
+                    fprintf(stderr, "v4: mixed encodings (Q%d and Q%d) — not supported\n",
+                            m->q_bits, bits); goto bad;
+                }
+                m->q_bits = bits;
                 m->quantized = 1;
                 /* length must match the logical size: bytes-vs-elements has bitten twice */
                 for (uint32_t i = 0; i < nt; i++)
                     if (!strcmp(t[i].name, tab[k].nm)) {
                         long elems = 1;
                         for (int d = 0; d < t[i].rank; d++) elems *= (long)t[i].dims[d];
-                        if ((unsigned long long)t[i].len != (unsigned long long)((elems / 32) * 34)) {
+                        int bsz = dtype_qbits(dt) == 4 ? 18 : 34;
+                        if ((unsigned long long)t[i].len != (unsigned long long)((elems / 32) * bsz)) {
                             fprintf(stderr, "v4: %s has %llu bytes, expected %lld for %lld "
                                             "elements\n", tab[k].nm,
-                                    (unsigned long long)t[i].len, (long long)((elems / 32) * 34), (long long)elems);
+                                    (unsigned long long)t[i].len, (long long)((elems / 32) * bsz), (long long)elems);
                             goto bad;
                         }
                         break;
@@ -431,7 +467,7 @@ int qwen2_step(const QW2 *m, QW2Cache *c, int token, int pos, float *logits) {
     float *g = malloc(sizeof(float) * (F > D ? F : D));
     float *ao = malloc(sizeof(float) * D), *sc = malloc(sizeof(float) * (size_t)c->maxT);
     if (!x || !xn || !q || !h || !g || !ao || !sc) return -2;
-    if (m->q_embed) q8_dequant_row(q8_slice_at(m->q_embed, token, (long)D), x, D);
+    if (m->q_embed) q8_dequant_row(qsl(m, m->q_embed, token, (long)D), x, D);
     else memcpy(x, m->embed + (size_t)token * D, sizeof(float) * D);
 
     for (int l = 0; l < L; l++) {
@@ -439,12 +475,12 @@ int qwen2_step(const QW2 *m, QW2Cache *c, int token, int pos, float *logits) {
         float *kc = c->l[l].k + (size_t)pos * c->kv_dim;
         float *vc = c->l[l].v + (size_t)pos * c->kv_dim;
         rmsnorm(xn, x, m->ln1 + (size_t)l * D, D, m->rms_eps);
-        matmul_wx_auto(q, xn, m->Wq + (size_t)l * D * D, q8_slice_at(m->q_Wq, l, (long)D * D), D, H * HD);
+        mm_wx(m, q, xn, m->Wq + (size_t)l * D * D, qsl(m, m->q_Wq, l, (long)D * D), D, H * HD);
         for (int j = 0; j < H * HD; j++) q[j] += m->bq[(size_t)l * H * HD + j];
-        matmul_wx_auto(kc, xn, m->Wk + (size_t)l * c->kv_dim * D,
-                       q8_slice_at(m->q_Wk, l, (long)c->kv_dim * D), D, c->kv_dim);
-        matmul_wx_auto(vc, xn, m->Wv + (size_t)l * c->kv_dim * D,
-                       q8_slice_at(m->q_Wv, l, (long)c->kv_dim * D), D, c->kv_dim);
+        mm_wx(m, kc, xn, m->Wk + (size_t)l * c->kv_dim * D,
+                       qsl(m, m->q_Wk, l, (long)c->kv_dim * D), D, c->kv_dim);
+        mm_wx(m, vc, xn, m->Wv + (size_t)l * c->kv_dim * D,
+                       qsl(m, m->q_Wv, l, (long)c->kv_dim * D), D, c->kv_dim);
         for (int j = 0; j < c->kv_dim; j++) {
             kc[j] += m->bk[(size_t)l * c->kv_dim + j];
             vc[j] += m->bv[(size_t)l * c->kv_dim + j];
@@ -481,22 +517,22 @@ int qwen2_step(const QW2 *m, QW2Cache *c, int token, int pos, float *logits) {
                 ao[(size_t)hd * HD + e] = acc;
             }
         }
-        matmul_wx_auto(h, ao, m->Wo + (size_t)l * D * D, q8_slice_at(m->q_Wo, l, (long)D * D), H * HD, D);
+        mm_wx(m, h, ao, m->Wo + (size_t)l * D * D, qsl(m, m->q_Wo, l, (long)D * D), H * HD, D);
         for (int j = 0; j < D; j++) x[j] += h[j];
         TOCK(g_t_attn, t_a);
 
         TICK(t_m);
         rmsnorm(xn, x, m->ln2 + (size_t)l * D, D, m->rms_eps);
-        matmul_wx_auto(g, xn, m->Wg + (size_t)l * F * D, q8_slice_at(m->q_Wg, l, (long)F * D), D, F);
-        matmul_wx_auto(h, xn, m->Wu + (size_t)l * F * D, q8_slice_at(m->q_Wu, l, (long)F * D), D, F);
+        mm_wx(m, g, xn, m->Wg + (size_t)l * F * D, qsl(m, m->q_Wg, l, (long)F * D), D, F);
+        mm_wx(m, h, xn, m->Wu + (size_t)l * F * D, qsl(m, m->q_Wu, l, (long)F * D), D, F);
         for (int j = 0; j < F; j++) g[j] = silu(g[j]) * h[j];
-        matmul_wx_auto(h, g, m->Wd + (size_t)l * D * F, q8_slice_at(m->q_Wd, l, (long)D * F), F, D);
+        mm_wx(m, h, g, m->Wd + (size_t)l * D * F, qsl(m, m->q_Wd, l, (long)D * F), F, D);
         for (int j = 0; j < D; j++) x[j] += h[j];
         TOCK(g_t_mlp, t_m);
     }
     TICK(t_h);
     rmsnorm(xn, x, m->norm, D, m->rms_eps);
-    matmul_wx_auto(logits, xn, m->embed, m->q_embed, D, V);
+    mm_wx(m, logits, xn, m->embed, m->q_embed, D, V);
     TOCK(g_t_head, t_h);
     free(x); free(xn); free(q); free(h); free(g); free(ao); free(sc);
     return 0;

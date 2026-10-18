@@ -98,6 +98,9 @@ class V4Writer:
         self._use_enc(enc)
         if enc == "q8_0":
             raw, _ = _q8.encode_q8_0(a)
+        elif enc == "q4_0":
+            import q4 as _q4
+            raw, _ = _q4.encode_q4_0(a)
         elif enc == "f32":
             raw = a.tobytes()
         else:
@@ -171,7 +174,8 @@ class V4Writer:
         # One record per encoding actually used. f32 and Q8_0 have different block geometry,
         # and the loader checks each tensor's stored length against its own record.
         DESC = {"f32":  (0, 0, 0, 4, 1, 0, 4, "f32"),
-                "q8_0": (1, 3, 32, 34, 1, 3, 64, "Q8_0")}
+                "q8_0": (1, 3, 32, 34, 1, 3, 64, "Q8_0"),
+                "q4_0": (1, 4, 32, 18, 1, 3, 64, "Q4_0")}
         enc = _W()
         for i, name in enumerate(self.ENCODINGS):
             ek, esc, egrp, eblk, esub, eflag, ealign, ename = DESC[name]

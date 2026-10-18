@@ -20,7 +20,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="weights/qwen2.5-0.5b-instruct")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--quant", choices=["none", "q8_0"], default="none")
+    ap.add_argument("--quant", choices=["none", "q8_0", "q4_0"], default="none")
     ap.add_argument("--shuffle", action="store_true")
     args = ap.parse_args()
 
@@ -43,7 +43,8 @@ def main():
     tid = {}
     def add(name, arr, role, enc="f32"):
         a = np.ascontiguousarray(arr, dtype=np.float32)
-        use = "q8_0" if (enc == "q8_0" and args.quant == "q8_0") else "f32"
+        # every quantized matrix uses the file's single chosen encoding
+        use = args.quant if (enc == "q8_0" and args.quant in ("q8_0", "q4_0")) else "f32"
         tid[name] = w.add_tensor(name, a, role=role, enc=use)
 
     def stack(nm):
