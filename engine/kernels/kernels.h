@@ -19,6 +19,9 @@ void matmul_wx(float *out, const float *x, const float *w, int n_in, int n_out);
 /* Q8_0 (format/SPEC.md §6): 34-byte group = fp16 scale + 32 int8, y = q * d.
    The decoder must equal format/q8.py bit for bit (tools/verify_q8_decode.py). */
 void q8_dequant_row(const uint8_t *blocks, float *out, int n);
+/* Q4_0 (4.5 bpw): 18-byte group = fp16 scale + 32 nibbles, y = q * d with q in [-8,7]. */
+void q4_dequant_row(const uint8_t *blocks, float *out, int n);
+void matmul_wx_q4(float *out, const float *x, const uint8_t *w, int n_in, int n_out);
 void matmul_xw_q8(float *out, const float *x, const uint8_t *w,
                   const float *bias, int n_in, int n_out);
 /* Dispatch: use the Q8 kernel when a quantized block pointer is present, else fp32. Lets a

@@ -86,6 +86,11 @@ fi
 if [ $rc -eq 0 ]; then echo " PASS — Q8_0 file validates and the engine runs it"
 else echo " FAIL — see scratch/l05_q8.v4cp"; fail=1; fi
 
+printf '  %-22s ' "q4_decode"
+out=$(python3 tools/verify_q4_decode.py 2>&1); rc=$?
+echo "$out" | grep -E "^Q4 DECODER" | tail -1 | sed 's/^/ /'
+[ $rc -eq 0 ] || fail=1
+
 printf '  %-22s ' "q8_kernels"
 out=$(python3 tools/verify_q8_kernels.py 2>&1); rc=$?
 echo "$out" | grep -E "^Q8 KERNELS" | tail -1 | sed 's/^/ /'

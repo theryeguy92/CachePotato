@@ -382,3 +382,92 @@ void rope_apply(float *q, float *k, int T, int n_q_heads, int n_kv_heads, int hd
         }
     }
 }
+
+/* ---------------------------------------------------------------- Q4_0 (4.5 bpw)
+ *
+ * Group = 18 bytes: fp16 scale, then 16 bytes holding 32 signed 4-bit values (low nibble first,
+ * element 2k in the low nibble of byte k). decode: y[i] = (float)q[i] * d, q in [-8, 7].
+ *
+ * Chosen to match llama.cpp's Q4_0 range so a published checkpoint needs no re-encoding — the
+ * same rationale as Q8_0. The decoder must equal format/q4.py bit for bit
+ * (tools/verify_q4_decode.py): the scale is fp16, an exact subset of fp32, so `q * d` has exactly
+ * one correct answer and a one-nibble mistake is not a rounding detail.
+ */
+void q4_dequant_row(const uint8_t *blocks, float *out, int n) {
+    int ng = n / 32;
+    for (int g = 0; g < ng; g++) {
+        const uint8_t *blk = blocks + (size_t)g * 18;
+        float d = q8_scale(blk);          /* same fp16 reader as Q8_0 */
+        const uint8_t *q = blk + 2;
+        for (int k = 0; k < 16; k++) {
+            int lo = q[k] & 0x0F, hi = q[k] >> 4;
+            if (lo > 7) lo -= 16;         /* sign-extend the nibble */
+            if (hi > 7) hi -= 16;
+            out[g * 32 + k]      = (float)lo * d;   /* byte k low  -> element k      */
+            out[g * 32 + k + 16] = (float)hi * d;   /* byte k high -> element k + 16 */
+        }
+    }
+}
+
+#if defined(__AVX2__)
+static inline __m256 q4_sign_extend(__m256i v) {
+    return _mm256_cvtepi32_ps(_mm256_srai_epi32(_mm256_slli_epi32(v, 28), 28));
+}
+
+/* Row-quantized Q4_0, vector accumulator, one horizontal sum per row (the Q8 lesson). The
+   i / i+16 packing means the low nibbles are elements 0..15 and the high nibbles 16..31, so each
+   16-byte group yields FOUR contiguous 8-element runs and needs no gathers. */
+static void wx_q4_slice(void *v, int ilo, int ihi) {
+    WXQ8Ctx *c = v;
+    for (int i = ilo; i < ihi; i++) {
+        const uint8_t *row = c->w + (size_t)i * c->rowbytes;
+        __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+        for (int g = 0; g < c->ng; g++) {
+            const uint8_t *blk = row + (size_t)g * 18;
+            const __m256 dv = _mm256_set1_ps(q8_scale(blk));
+            const uint8_t *q = blk + 2;
+            const float *xg = c->x + g * 32;
+            __m128i b0 = _mm_loadu_si128((const __m128i *)q);        /* bytes 0..15 */
+            __m256i w0 = _mm256_cvtepu8_epi32(b0);                    /* bytes 0..7  */
+            __m256i w1 = _mm256_cvtepu8_epi32(_mm_srli_si128(b0, 8)); /* bytes 8..15 */
+            __m256 lo0 = _mm256_mul_ps(q4_sign_extend(_mm256_and_si256(w0, _mm256_set1_epi32(0x0F))), dv);
+            __m256 lo1 = _mm256_mul_ps(q4_sign_extend(_mm256_and_si256(w1, _mm256_set1_epi32(0x0F))), dv);
+            __m256 hi0 = _mm256_mul_ps(q4_sign_extend(_mm256_and_si256(_mm256_srli_epi32(w0, 4), _mm256_set1_epi32(0x0F))), dv);
+            __m256 hi1 = _mm256_mul_ps(q4_sign_extend(_mm256_and_si256(_mm256_srli_epi32(w1, 4), _mm256_set1_epi32(0x0F))), dv);
+            s0 = _mm256_fmadd_ps(lo0, _mm256_loadu_ps(xg),      s0);   /* 0..7   */
+            s1 = _mm256_fmadd_ps(lo1, _mm256_loadu_ps(xg + 8),  s1);   /* 8..15  */
+            s0 = _mm256_fmadd_ps(hi0, _mm256_loadu_ps(xg + 16), s0);   /* 16..23 */
+            s1 = _mm256_fmadd_ps(hi1, _mm256_loadu_ps(xg + 24), s1);   /* 24..31 */
+        }
+        c->out[i] = q8_hsum8(_mm256_add_ps(s0, s1));
+    }
+}
+#endif
+
+void matmul_wx_q4(float *out, const float *x, const uint8_t *w, int n_in, int n_out) {
+    const int ng = n_in / 32;
+    const size_t rowbytes = (size_t)ng * 18;
+#if defined(__AVX2__)
+    if (cp_would_parallelise((long)n_in * n_out, CP_MATMUL_MIN) && n_out > 1) {
+        WXQ8Ctx c = { out, x, w, ng, rowbytes };
+        cp_parallel_for(n_out, wx_q4_slice, &c);
+        return;
+    }
+#endif
+    for (int i = 0; i < n_out; i++) {
+        const uint8_t *row = w + (size_t)i * rowbytes;
+        float acc = 0.0f;
+        for (int g = 0; g < ng; g++) {
+            float d = q8_scale(row + (size_t)g * 18);
+            const uint8_t *q = row + (size_t)g * 18 + 2;
+            for (int k = 0; k < 16; k++) {
+                int lo = q[k] & 0x0F, hi = q[k] >> 4;
+                if (lo > 7) lo -= 16;
+                if (hi > 7) hi -= 16;
+                acc += ((float)lo * d) * x[g * 32 + k];
+                acc += ((float)hi * d) * x[g * 32 + k + 16];
+            }
+        }
+        out[i] = acc;
+    }
+}

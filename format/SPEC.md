@@ -168,6 +168,28 @@ range that includes it decodes one LSB away from every other implementation of t
 
 The layout matches llama.cpp's Q8_0 so published checkpoints need no re-encoding (§6 option 1).
 
+**Q4_0 (scalar 4) — DEFINED here, 2026-10-17.** 18-byte group, 32 elements:
+
+| bytes | content |
+|---|---|
+| 0..1 | `d`, an fp16 scale, little-endian |
+| 2..17 | 16 bytes; byte `k` holds element `k` in its **low** nibble and element `k+16` in its **high** nibble |
+
+Decode is `y[i] = (float)q[i] * d` with `q` in `[-8, 7]`. Encoding is `d = max|x| / 8`
+(fp16-rounded **first**), `q = clamp(round(x/d), -8, 7)`.
+
+The `k` / `k+16` pairing is llama.cpp's Q4_0, and it was chosen for a measured reason: the first
+attempt paired consecutive elements, which makes every SIMD vector of nibbles need a **stride-2
+gather of x**. With `k`/`k+16` the low nibbles are one contiguous run (0..15) and the high nibbles
+another (16..31), matching the x layout, so the AVX2 path needs no gathers at all.
+
+Unlike Q8_0, `-8` IS used here, because llama.cpp's Q4_0 uses it — matching published checkpoints
+was judged more valuable than symmetry, and the gate pins the behaviour either way.
+
+4-bit is a **quality** decision as well as a size one: at 4.5 bpw the round-trip error is ~12% of
+peak (measured), so a Q4 port is Tier C and must be gated on routing/argmax agreement, never on
+exactness.
+
 *Exactness:* the scale is fp16, an exact subset of fp32, so `q * d` has **exactly one** correct
 fp32 answer. The decoder is therefore gated bit-exactly, C against Python
 (`tools/verify_q8_decode.py`), with no tolerance. The *matmul* over decoded values is not
