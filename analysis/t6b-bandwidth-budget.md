@@ -67,3 +67,44 @@ The plan was "AVX2 on the fp32 paths". Measured, that is the *second* lever:
   model achieves it, not how fast it goes when it does.
 - Two arithmetic errors were made and caught writing this note (dividing instead of multiplying
   bytes/token by tok/s, twice). The numbers above were recomputed from the definition.
+
+---
+
+# Measured, with a validated rig: the Q8 inner loop is NOT latency-bound
+
+The Q8 kernels run at ~9 GB/s against a ~13 GB/s ceiling. Two hypotheses were tested and both are
+now answered (2026-10-17), using `tools/ab.py` — which was itself validated first (identical
+binaries → "no winner"; AVX2 vs `-mno-avx2` → 3.7× detected at p=0.031).
+
+**Hypothesis 1: the per-32-element horizontal sum.** *Confirmed, big win.* The row loop summed 8
+lanes once per group (152 per row for a 4864-wide matrix, each a 32-byte store plus 7 scalar adds).
+Accumulating in a vector across the whole row and summing once took Wd from 0.81 → 0.50 ms and the
+tied head from 24.6 → 16.1 ms; end to end 10 → 13.5 tok/s.
+
+**Hypothesis 2: the serial FMA chain into one accumulator.** *Refuted.* Two accumulators, alternating
+groups, halves the chain to `ng/2` dependent FMAs. Interleaved A/B, 8 pairs, 16 tokens:
+
+    A baseline   median 58.54 ms/token  [51.40..65.05]
+    B two-acc    median 57.17 ms/token  [51.61..73.61]
+    paired: median delta -0.72 ms, B faster in 4/8 pairs   -> WITHIN NOISE
+
+A coin flip. The loop is **not** bound by the accumulator dependency chain, so `-O3`'s scheduling
+already covers it. Not shipped; the variant is reproducible by applying the same two-accumulator
+patch to `wx_q8_slice`.
+
+## What this implies for the remaining ~30% of headroom
+
+If the inner loop is not latency-bound and not instruction-bound at the margin, the limit is
+**memory**: 9 GB/s is what this machine delivers for a streaming 4.6 MB matrix at 4 threads with a
+20% throttled clock. Instruction-level work will not move it, which leaves exactly one lever that
+will: **fewer bytes — 4-bit** (another ~2× on the expert/MLP traffic).
+
+That also means T6c's 4-bit encoding is not merely a size decision; on this evidence it is the
+*remaining performance* decision.
+
+## A caveat about resolvability
+
+The paired spread is large (38%) and the effect size we can resolve is roughly 5%+ at 8 pairs.
+Anything smaller than that is currently unmeasurable on a throttling laptop without pinning CPU
+frequency, which needs root. **Do not chase sub-5% inner-loop changes here** — the rig will call
+them noise, correctly, and time spent on them is wasted.
