@@ -94,8 +94,14 @@ def main():
     avail = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
     vram = 0
     if torch.cuda.is_available():
-        free_b, _ = torch.cuda.mem_get_info()
-        vram = free_b
+        # SUM EVERY DEVICE. mem_get_info() defaults to the CURRENT device, so a two-GPU box was
+        # measured as if it had one — 25 GB instead of 48 GB — and the script refused a model that
+        # actually fits. Reported per device so the number can be checked against nvidia-smi.
+        for d in range(torch.cuda.device_count()):
+            free_b, total_b = torch.cuda.mem_get_info(d)
+            vram += free_b
+            print(f"  cuda:{d} {torch.cuda.get_device_name(d)}: "
+                  f"free {free_b/1e9:.1f} / {total_b/1e9:.1f} GB", flush=True)
     print(f"weights {need/1e9:.1f} GB | RAM available {avail/1e9:.1f} GB | "
           f"VRAM free {vram/1e9:.1f} GB", flush=True)
     place = args.device_map
