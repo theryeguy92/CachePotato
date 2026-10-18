@@ -281,3 +281,106 @@ int qwen2_load_v4(QW2 *m, const char *path, void **map, size_t *maplen) {
 bad:
     free(t); munmap(img, fsz); return -1;
 }
+
+/* ---------------------------------------------------------------- KV cache (GQA)
+ *
+ * The full-sequence forward is O(T^2) in prefill, which is fine once and wrong per token. Chat
+ * needs one token at a time against a cache. The cache is sized (maxT, n_kv*head_dim) per layer:
+ * GQA means only n_kv heads are stored, so it is 7x smaller than an MHA cache for this model —
+ * which matters more on the T480 than the arithmetic does.
+ */
+typedef struct { float *k, *v; } QW2LayerCache;
+
+struct QW2Cache { int maxT, n_layers, kv_dim; QW2LayerCache *l; };
+
+QW2Cache *qwen2_cache_alloc(const QW2 *m, int maxT) {
+    QW2Cache *c = calloc(1, sizeof *c);
+    if (!c) return NULL;
+    c->maxT = maxT; c->n_layers = m->n_layers; c->kv_dim = m->n_kv * m->head_dim;
+    c->l = calloc((size_t)m->n_layers, sizeof *c->l);
+    if (!c->l) { free(c); return NULL; }
+    for (int i = 0; i < m->n_layers; i++) {
+        c->l[i].k = calloc((size_t)maxT * c->kv_dim, sizeof(float));
+        c->l[i].v = calloc((size_t)maxT * c->kv_dim, sizeof(float));
+        if (!c->l[i].k || !c->l[i].v) return NULL;
+    }
+    return c;
+}
+
+void qwen2_cache_free(QW2Cache *c) {
+    if (!c) return;
+    for (int i = 0; i < c->n_layers; i++) { free(c->l[i].k); free(c->l[i].v); }
+    free(c->l); free(c);
+}
+
+int qwen2_step(const QW2 *m, QW2Cache *c, int token, int pos, float *logits) {
+    const int D = m->d_model, H = m->n_heads, KV = m->n_kv, HD = m->head_dim;
+    const int F = m->d_ff, V = m->vocab, L = m->n_layers, rep = H / KV;
+    if (pos < 0 || pos >= c->maxT) return -1;
+
+    float *x = malloc(sizeof(float) * D), *xn = malloc(sizeof(float) * D);
+    float *q = malloc(sizeof(float) * H * HD), *h = malloc(sizeof(float) * (F > D ? F : D));
+    float *g = malloc(sizeof(float) * (F > D ? F : D));
+    float *ao = malloc(sizeof(float) * D), *sc = malloc(sizeof(float) * (size_t)c->maxT);
+    if (!x || !xn || !q || !h || !g || !ao || !sc) return -2;
+    memcpy(x, m->embed + (size_t)token * D, sizeof(float) * D);
+
+    for (int l = 0; l < L; l++) {
+        float *kc = c->l[l].k + (size_t)pos * c->kv_dim;
+        float *vc = c->l[l].v + (size_t)pos * c->kv_dim;
+        rmsnorm(xn, x, m->ln1 + (size_t)l * D, D, m->rms_eps);
+        matmul_wx(q, xn, m->Wq + (size_t)l * D * D, D, H * HD);
+        for (int j = 0; j < H * HD; j++) q[j] += m->bq[(size_t)l * H * HD + j];
+        matmul_wx(kc, xn, m->Wk + (size_t)l * c->kv_dim * D, D, c->kv_dim);
+        matmul_wx(vc, xn, m->Wv + (size_t)l * c->kv_dim * D, D, c->kv_dim);
+        for (int j = 0; j < c->kv_dim; j++) {
+            kc[j] += m->bk[(size_t)l * c->kv_dim + j];
+            vc[j] += m->bv[(size_t)l * c->kv_dim + j];
+        }
+        /* RoPE for ONE position: same formula as rope_apply, applied to q and the new k */
+        for (int hh = 0; hh < 2; hh++) {
+            float *base = hh ? kc : q;
+            int nh = hh ? KV : H;
+            for (int i = 0; i < HD / 2; i++) {
+                float inv = powf(m->rope_theta, -2.0f * (float)i / (float)HD);
+                float ang = (float)pos * inv, cc = cosf(ang), ss = sinf(ang);
+                for (int hd = 0; hd < nh; hd++) {
+                    float *v = base + (size_t)hd * HD;
+                    float a = v[i], b = v[i + HD / 2];
+                    v[i] = a * cc - b * ss;
+                    v[i + HD / 2] = b * cc + a * ss;
+                }
+            }
+        }
+        for (int hd = 0; hd < H; hd++) {
+            const int kh = hd / rep;
+            const float *qh = q + (size_t)hd * HD;
+            for (int j = 0; j <= pos; j++) {
+                const float *kj = c->l[l].k + (size_t)j * c->kv_dim + (size_t)kh * HD;
+                float s = 0.0f;
+                for (int e = 0; e < HD; e++) s += qh[e] * kj[e];
+                sc[j] = s / sqrtf((float)HD);
+            }
+            softmax(sc, pos + 1);
+            for (int e = 0; e < HD; e++) {
+                float acc = 0.0f;
+                for (int j = 0; j <= pos; j++)
+                    acc += sc[j] * c->l[l].v[(size_t)j * c->kv_dim + (size_t)kh * HD + e];
+                ao[(size_t)hd * HD + e] = acc;
+            }
+        }
+        matmul_wx(h, ao, m->Wo + (size_t)l * D * D, H * HD, D);
+        for (int j = 0; j < D; j++) x[j] += h[j];
+
+        rmsnorm(xn, x, m->ln2 + (size_t)l * D, D, m->rms_eps);
+        matmul_wx(g, xn, m->Wg + (size_t)l * F * D, D, F);
+        matmul_wx(h, xn, m->Wu + (size_t)l * F * D, D, F);
+        for (int j = 0; j < F; j++) g[j] = silu(g[j]) * h[j];
+        matmul_wx(h, g, m->Wd + (size_t)l * D * F, F, D);
+        for (int j = 0; j < D; j++) x[j] += h[j];
+    }
+    rmsnorm(xn, x, m->norm, D, m->rms_eps);
+    matmul_wx(logits, xn, m->embed, D, V);
+    free(x); free(xn); free(q); free(h); free(g); free(ao); free(sc);
+    return 0;
+}
