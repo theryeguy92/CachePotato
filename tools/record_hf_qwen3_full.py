@@ -16,7 +16,7 @@ which machine can run this, not the recording.
 RECORD ONCE. If a gate fails later, fix the code — do not regenerate this file to make a test pass.
 The script runs the model twice and refuses to write unless both runs agree bit for bit.
 """
-import argparse, json, sys
+import argparse, json, os, sys
 from pathlib import Path
 import numpy as np
 import torch
@@ -33,7 +33,7 @@ PROMPTS = [
 ]
 
 def capture(model, tok, prompt, layers, want_intermediates):
-    ids = tok(prompt, return_tensors="pt").input_ids
+    ids = tok(prompt, return_tensors="pt").input_ids.to(model.device)
     rec, sites = {}, []
     handles = []
     def hook(name):
@@ -78,21 +78,49 @@ def main():
     ap.add_argument("--out", default="data/traces/qwen3_30b_a3b_full.npz")
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--intermediate-prompt", default=PROMPTS[0])
+    ap.add_argument("--device-map", choices=["auto", "cpu", "spread", "cuda"],
+                    default="auto", help="auto decides from the measured RAM/VRAM")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer, AutoModelForCausalLM
     torch.set_grad_enabled(False)
     tok = AutoTokenizer.from_pretrained(args.model)
-    print("loading bf16 (61 GB) — this is the step that needs the big machine", flush=True)
+
+    # PLACEMENT. bf16 is 61.1 GB. A box with 61 GB of RAM has 58 GB available, so the model
+    # cannot live in RAM — but it does not need to: 48 GB of VRAM plus RAM holds it, if it is
+    # SPREAD. Deciding this from the actual numbers rather than trying and reading the OOM.
+    idx = json.load(open(Path(args.model) / "model.safetensors.index.json"))
+    need = idx["metadata"]["total_size"]
+    avail = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    vram = 0
+    if torch.cuda.is_available():
+        free_b, _ = torch.cuda.mem_get_info()
+        vram = free_b
+    print(f"weights {need/1e9:.1f} GB | RAM available {avail/1e9:.1f} GB | "
+          f"VRAM free {vram/1e9:.1f} GB", flush=True)
+    place = args.device_map
+    if place == "auto":
+        place = "cpu" if need < avail * 0.92 else "spread"
+    if place in ("spread", "cuda") and not torch.cuda.is_available():
+        raise SystemExit(f"model needs {need/1e9:.1f} GB but only {avail/1e9:.1f} GB RAM is "
+                         "available and there is no GPU — cannot place it without changing "
+                         "what the baseline is (quantizing), which needs a decision, not a retry")
+    if place == "spread" and need > avail + vram * 0.9:
+        raise SystemExit(f"cannot fit {need/1e9:.1f} GB in {avail/1e9:.1f} GB RAM + "
+                         f"{vram/1e9:.1f} GB VRAM")
+    print(f"placing: {place}", flush=True)
+    extra = {}
+    if place in ("spread", "cuda"):
+        extra["device_map"] = "auto" if place == "spread" else "cuda:0"
     # transformers renamed the argument (torch_dtype -> dtype); accept either so the box does
     # not have to match the T480's version. Silently falling back to fp32 here would need 122 GB
     # and fail with an OOM that looks like a hardware limit rather than a keyword mismatch.
     try:
         model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16,
-                                                     low_cpu_mem_usage=True)
+                                                     low_cpu_mem_usage=True, **extra)
     except TypeError:
         model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16,
-                                                     low_cpu_mem_usage=True)
+                                                     low_cpu_mem_usage=True, **extra)
     if next(model.parameters()).dtype != torch.bfloat16:
         raise SystemExit(f"weights came back as {next(model.parameters()).dtype}, not bfloat16 — "
                          "refusing to record a baseline at the wrong precision")
