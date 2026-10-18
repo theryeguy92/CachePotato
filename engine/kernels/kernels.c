@@ -360,13 +360,14 @@ float silu(float x) { return x / (1.0f + expf(-x)); }
  * same thing as HF's duplicated-table + rotate_half formulation.
  *
  * theta is the RoPE base (1e6 for Qwen2.5), taken from the file rather than assumed. */
-void rope_apply(float *q, float *k, int T, int n_q_heads, int n_kv_heads, int hd, float theta) {
+void rope_apply_from(float *q, float *k, int T, int pos0, int n_q_heads, int n_kv_heads,
+                     int hd, float theta) {
     const int half = hd / 2;
     for (int t = 0; t < T; t++) {
         for (int i = 0; i < half; i++) {
             /* inv_freq = theta^(-2i/hd); angle = pos * inv_freq */
             float inv = powf(theta, -2.0f * (float)i / (float)hd);
-            float ang = (float)t * inv;
+            float ang = (float)(pos0 + t) * inv;
             float c = cosf(ang), s = sinf(ang);
             float *rows[2] = { q + (size_t)t * n_q_heads * hd, k + (size_t)t * n_kv_heads * hd };
             int nh[2] = { n_q_heads, n_kv_heads };
@@ -381,6 +382,10 @@ void rope_apply(float *q, float *k, int T, int n_q_heads, int n_kv_heads, int hd
             }
         }
     }
+}
+
+void rope_apply(float *q, float *k, int T, int n_q_heads, int n_kv_heads, int hd, float theta) {
+    rope_apply_from(q, k, T, 0, n_q_heads, n_kv_heads, hd, theta);
 }
 
 /* ---------------------------------------------------------------- Q4_0 (4.5 bpw)

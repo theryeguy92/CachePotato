@@ -45,21 +45,46 @@ static void head_rmsnorm(float *v, int rows, int hd, const float *g, float eps) 
     }
 }
 
+int qwen3_kv_alloc(QW3KV *kv, const QW3Layer *m, int cap) {
+    kv->k = malloc(sizeof(float) * (size_t)cap * m->n_kv * m->head_dim);
+    kv->v = malloc(sizeof(float) * (size_t)cap * m->n_kv * m->head_dim);
+    kv->cap = cap;
+    if (!kv->k || !kv->v) { free(kv->k); free(kv->v); kv->k = kv->v = NULL; kv->cap = 0; return -1; }
+    return 0;
+}
+
+void qwen3_kv_free(QW3KV *kv) {
+    free(kv->k); free(kv->v);
+    memset(kv, 0, sizeof *kv);
+}
+
 int qwen3_layer(const QW3Layer *m, const float *x, int T, QW3Out *o) {
+    QW3KV tmp;
+    if (qwen3_kv_alloc(&tmp, m, T)) return -1;
+    int rc = qwen3_layer_kv(m, x, T, 0, &tmp, o);
+    qwen3_kv_free(&tmp);
+    return rc;
+}
+
+int qwen3_layer_kv(const QW3Layer *m, const float *x, int T, int pos0, QW3KV *cache, QW3Out *o) {
     const int D = m->d_model, H = m->n_heads, KV = m->n_kv, HD = m->head_dim;
     const int E = m->n_experts, K = m->topk, F = m->d_exp, rep = H / KV;
+    if (!cache || pos0 < 0 || T <= 0 || pos0 + T > cache->cap) {
+        fprintf(stderr, "qwen3: kv range %d+%d outside cache cap %d\n", pos0, T,
+                cache ? cache->cap : 0);
+        return -1;
+    }
     float *xn = malloc(sizeof(float) * (size_t)T * D);
     float *q = malloc(sizeof(float) * (size_t)T * H * HD);
-    float *k = malloc(sizeof(float) * (size_t)T * KV * HD);
-    float *v = malloc(sizeof(float) * (size_t)T * KV * HD);
     float *ao = malloc(sizeof(float) * (size_t)T * H * HD);  /* NOT xn: H*HD is 2x D */
-    float *sc = malloc(sizeof(float) * (size_t)T);
+    /* attention can run over pos0+T positions, not just the new ones */
+    float *sc = malloc(sizeof(float) * (size_t)(pos0 + T));
     float *hh = malloc(sizeof(float) * (size_t)(F > D ? F : D));
     float *gu = malloc(sizeof(float) * (size_t)(F > D ? F : D));
     float *probs = malloc(sizeof(float) * E);
     int *idx = malloc(sizeof(int) * (size_t)K);
     float *wt = malloc(sizeof(float) * (size_t)T * K);
-    if (!xn || !q || !k || !v || !ao || !sc || !hh || !gu || !probs || !idx || !wt) return -1;
+    if (!xn || !q || !ao || !sc || !hh || !gu || !probs || !idx || !wt) return -1;
 
     /* ---- attention: norm -> qkv -> QK-norm -> RoPE -> GQA -> o_proj ---- */
     for (int t = 0; t < T; t++) {
@@ -70,7 +95,7 @@ int qwen3_layer(const QW3Layer *m, const float *x, int T, QW3Out *o) {
            selected expert is 17 per layer, 816 per token across 48 layers — the
            working set the budget is measured against. */
         if (m->pager) {
-            pager_step(t);
+            pager_step(pos0 + t);
             pager_touch_region(m->reg_ln1);
             pager_touch_region(m->reg_Wq);
             pager_touch_region(m->reg_Wk);
@@ -80,40 +105,43 @@ int qwen3_layer(const QW3Layer *m, const float *x, int T, QW3Out *o) {
         }
         rmsnorm(xn + (size_t)t * D, x + (size_t)t * D, m->ln1, D, m->rms_eps);
         mm(&m->Wq, q + (size_t)t * H * HD,  xn + (size_t)t * D, D, H * HD);
-        mm(&m->Wk, k + (size_t)t * KV * HD, xn + (size_t)t * D, D, KV * HD);
-        mm(&m->Wv, v + (size_t)t * KV * HD, xn + (size_t)t * D, D, KV * HD);
+        mm(&m->Wk, cache->k + (size_t)(pos0 + t) * KV * HD, xn + (size_t)t * D, D, KV * HD);
+        mm(&m->Wv, cache->v + (size_t)(pos0 + t) * KV * HD, xn + (size_t)t * D, D, KV * HD);
         head_rmsnorm(q + (size_t)t * H * HD,  H,  HD, m->q_norm, m->rms_eps);
-        head_rmsnorm(k + (size_t)t * KV * HD, KV, HD, m->k_norm, m->rms_eps);
+        head_rmsnorm(cache->k + (size_t)(pos0 + t) * KV * HD, KV, HD, m->k_norm, m->rms_eps);
     }
-    rope_apply(q, k, T, H, KV, HD, m->rope_theta);
+    /* the new rows start at pos0, so token n is rotated at position n */
+    rope_apply_from(q, cache->k + (size_t)pos0 * KV * HD, T, pos0, H, KV, HD, m->rope_theta);
 
     for (int h = 0; h < H; h++) {
         const int kh = h / rep;
         for (int i = 0; i < T; i++) {
             const float *qi = q + ((size_t)i * H + h) * HD;
-            for (int j = 0; j <= i; j++) {
-                const float *kj = k + ((size_t)j * KV + kh) * HD;
+            const int last = pos0 + i;          /* causal: every position up to here */
+            for (int j = 0; j <= last; j++) {
+                const float *kj = cache->k + ((size_t)j * KV + kh) * HD;
                 float s = 0.0f;
                 for (int e = 0; e < HD; e++) s += qi[e] * kj[e];
                 sc[j] = s / sqrtf((float)HD);
             }
-            softmax(sc, i + 1);
+            softmax(sc, last + 1);
             for (int e = 0; e < HD; e++) {
                 float acc = 0.0f;
-                for (int j = 0; j <= i; j++) acc += sc[j] * v[((size_t)j * KV + kh) * HD + e];
+                for (int j = 0; j <= last; j++)
+                    acc += sc[j] * cache->v[((size_t)j * KV + kh) * HD + e];
                 ao[(size_t)i * H * HD + (size_t)h * HD + e] = acc;
             }
         }
     }
     for (int t = 0; t < T; t++) {
-        if (m->pager) { pager_step(t); pager_touch_region(m->reg_Wo); }
+        if (m->pager) { pager_step(pos0 + t); pager_touch_region(m->reg_Wo); }
         mm(&m->Wo, o->attn + (size_t)t * D, ao + (size_t)t * H * HD, H * HD, D);
     }
 
     /* ---- MoE: router -> softmax -> top-k -> renormalise -> gated experts ---- */
     for (int t = 0; t < T; t++) {
         if (m->pager) {
-            pager_step(t);
+            pager_step(pos0 + t);
             pager_touch_region(m->reg_ln2);
             pager_touch_region(m->reg_Wgate);
         }
@@ -155,7 +183,7 @@ int qwen3_layer(const QW3Layer *m, const float *x, int T, QW3Out *o) {
             for (int i = 0; i < D; i++) o->mlp[(size_t)t * D + i] += wt[(size_t)t * K + j] * hh[i];
         }
     }
-    free(xn); free(q); free(k); free(v); free(ao); free(sc); free(hh); free(gu); free(probs); free(idx); free(wt);
+    free(xn); free(q); free(ao); free(sc); free(hh); free(gu); free(probs); free(idx); free(wt);
     return 0;
 }
 

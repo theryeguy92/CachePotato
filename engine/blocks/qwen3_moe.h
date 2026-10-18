@@ -65,10 +65,24 @@ typedef struct {
     int   *topk_idx;    /* (T, topk) selected experts, descending probability */
 } QW3Out;
 
+/* KV cache for incremental decode. The layout is the prefill path's (pos, n_kv*head_dim)
+   array unchanged, so both entry points read the same bytes in the same order and the
+   step gate can demand BIT-IDENTITY instead of a tolerance. cap is in positions. */
+typedef struct { float *k, *v; int cap; } QW3KV;
+
 int qwen3_layer_alloc(QW3Out *o, const QW3Layer *m, int T);
 void qwen3_layer_free(QW3Out *o);
 void qwen3_layer_free_weights(QW3Layer *m);
+
+/* Prefill: T new tokens at positions 0..T-1, no cache kept afterwards. */
 int qwen3_layer(const QW3Layer *m, const float *x, int T, QW3Out *o);
+
+/* Incremental: T new tokens at positions pos0..pos0+T-1, attending to everything in
+   `cache` at positions < pos0+T (the new rows are written before attention). pos0 = 0
+   and T = the whole sequence is exactly qwen3_layer — same code, not a second copy. */
+int qwen3_layer_kv(const QW3Layer *m, const float *x, int T, int pos0, QW3KV *cache, QW3Out *o);
+int qwen3_kv_alloc(QW3KV *kv, const QW3Layer *m, int cap);
+void qwen3_kv_free(QW3KV *kv);
 
 /* Flat-blob loader: the arithmetic gate. Host-endian, no tables. */
 int qwen3_load_blob(QW3Layer *m, const char *path, float **owned);
