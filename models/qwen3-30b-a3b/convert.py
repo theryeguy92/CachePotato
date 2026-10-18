@@ -28,6 +28,8 @@ def main():
     ap.add_argument("--shard1", action="store_true", help="only layers present in shard 1")
     ap.add_argument("--layers", type=int, default=None, help="override the layer count")
     ap.add_argument("--quant", choices=["none", "q8_0"], default="none")
+    ap.add_argument("--manifest", default=None,
+                    help="write name/offset/size so the payloads can be checked against the source")
     args = ap.parse_args()
 
     md = ROOT / args.model
@@ -39,10 +41,20 @@ def main():
     total_layers = cfg["num_hidden_layers"]
 
     from safetensors import safe_open
-    shard1 = safe_open(str(md / "model-00001-of-00016.safetensors"), framework="pt")
+    # A1: 48 layers span ALL 16 shards. Opening shard 1 only was a shard-shaped converter:
+    # it worked for the gate and would have failed on the first tensor outside that file.
+    index = json.load(open(md / "model.safetensors.index.json"))
+    weight_map = index["weight_map"]
+    _handles = {}
+    def _h(name):
+        sh = weight_map[name]
+        if sh not in _handles:
+            _handles[sh] = safe_open(str(md / sh), framework="pt")
+        return _handles[sh]
+    shard1 = None
     # A shard boundary can cut MID-LAYER: shard 1 contains layer 2's experts but not its norms,
     # so counting distinct layer indices overstates what is usable. Only COMPLETE layers count.
-    keys = set(shard1.keys())
+    keys = set(weight_map.keys())
     need = ("input_layernorm.weight", "post_attention_layernorm.weight",
             "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
             "self_attn.o_proj.weight", "self_attn.q_norm.weight", "self_attn.k_norm.weight",
@@ -59,7 +71,8 @@ def main():
         raise SystemExit("convert: no complete layer in shard 1")
 
     def t(name):
-        return shard1.get_tensor(name).float().numpy()
+        # the tensor, from whichever shard holds it
+        return _h(name).get_tensor(name).float().numpy()
 
     import importlib.util, sys as _s
     _spec = importlib.util.spec_from_file_location("format_q8", str(ROOT / "format/q8.py"))
@@ -67,6 +80,8 @@ def main():
 
     w = V.V4Writer()
     tid = {}
+
+    _src = {}
 
     def nbytes_for(shape, enc):
         n = 1
@@ -88,6 +103,7 @@ def main():
             return _q8.encode_q8_0(a)[0] if _u == "q8_0" else a.tobytes()
         tid[name] = w.add_tensor_lazy(name, shape, nbytes_for(shape, use),
                                      role=role, enc=use, source=source)
+        _src[name] = (src_name, tuple(int(x) for x in shape), use)
 
     # embedding table (also the shard-1 input); the model's head is UNTIED
     add("embed", (Voc, D), "model.embed_tokens.weight", V.R_EMBED, enc="q8_0")
@@ -107,6 +123,12 @@ def main():
                 add(f"expert.{l}.{e}.{nm}", shp, p + f"mlp.experts.{e}.{key}.weight",
                     V.R_EXPERT, enc="q8_0")
 
+    # A2: `model.norm` (final RMSNorm) and `lm_head` live in the LAST shard and were never
+    # emitted, because the converter only ever opened shard 1. Without them the artifact loads,
+    # has 48 correct layers, and cannot produce a single logit — and this model's head is UNTIED,
+    # so there is no embedding to fall back on. A silent hole, not a crash.
+    add("final_norm", (D,), "model.norm.weight", V.R_NORM)
+    add("lm_head", (Voc, D), "lm_head.weight", V.R_HEAD, enc="q8_0")
     w.add_block(V.KIND_EMBED, 0xFFFFFFFF, refs=[tid["embed"]], params=[Voc, D, 0])
     for l in range(L):
         # attention: params are (n_heads, n_kv_heads, head_dim, rope_theta, qk_norm, sliding_window).
@@ -133,6 +155,16 @@ def main():
     order = [i for i in order if w.tensors[i]["enc"] == "f32"] + \
             [i for i in order if w.tensors[i]["enc"] != "f32"]
     info = w.write(args.out, layout=order)
+    if args.manifest:
+        man = []
+        for i, tt in enumerate(w.tensors):
+            nm = tt["name"]
+            if nm in _src:
+                src, shp, use = _src[nm]
+                man.append(dict(name=nm, src=src, shape=list(shp), enc=use,
+                                offset=int(tt["offset"]), nbytes=int(w._nbytes(tt))))
+        json.dump(dict(off_data=info["off_data"], tensors=man), open(args.manifest, "w"), indent=0)
+        print(f"  manifest: {args.manifest} ({len(man)} tensors)")
     out = Path(args.out)
     print(f"convert: {out} ({out.stat().st_size/1e6:.0f} MB) | tensors {info['tensors']} "
           f"blocks {info['blocks']} regions {info['regions']}")
