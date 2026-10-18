@@ -164,6 +164,18 @@ def main():
         print(f"  {suf:9s} {len(a):>10d} bytes unpaged vs unlimited-budget pager: "
               f"{'BIT-IDENTICAL' if same else 'DIFFERS'}")
 
+    # Which machine made this claim. A byte-equality result names the CPU that produced
+    # it: the same source on another CPU is functionally equal and bitwise different.
+    meta = {}
+    mp = Path(str(pre) + "_unlimited.meta")
+    if mp.exists():
+        for line in mp.read_text().splitlines():
+            if ":" in line and not line.startswith("#"):
+                k, v = line.split(":", 1)
+                meta[k.strip()] = v.strip()
+        print(f"  machine: {meta.get('cpu', '?')} | isa {meta.get('isa', '?')} | "
+              f"git {meta.get('git', '?')}")
+
     # ---- accounting against the file, not against the pager
     tens, regs = read_tables(args.model)
     L, K = 48, 8

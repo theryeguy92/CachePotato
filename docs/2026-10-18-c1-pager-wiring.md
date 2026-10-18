@@ -105,6 +105,27 @@ built from `HEAD`'s `pager.c`, same input, `CP_BUDGET=200` on the v3 file:
 ```
 identical in both, as was the generated text; only tok/s differed.
 
+## Artifacts carry their machine
+
+A baseline that cannot name its machine cannot say which claim it supports. Every
+`qwen3_eval` run now writes `<prefix>.meta` next to its traces:
+
+```
+host: T480
+cpu: Intel(R) Core(TM) i5-8250U CPU @ 1.60GHz
+isa: avx2 fma sse4.2
+compiler: 16.2.1 20260810
+git: af22acf
+model_bytes: 32479225664
+pager: CP_BUDGET=512 MB
+```
+
+`isa` is the line that matters: it reports what the compiler actually selected
+(`__AVX2__`, `__FMA__`, `__AVX512F__`), not what `-march` requested. The AI server reports
+`avx512f`; the T480 does not. That is the mechanism behind the logits difference in the
+table above, and it is now visible in the artifact rather than left to be inferred from
+`-march=native`.
+
 ## What C1 does not decide
 
 - **C2 measurement** (tok/s, regions/token, bytes/token, hit rate; cold and warm at 2, 4
