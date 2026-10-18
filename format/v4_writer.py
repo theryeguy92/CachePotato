@@ -227,13 +227,34 @@ class V4Writer:
         hb += struct.pack("<IIII", 0, 0, 0, 0)
         assert len(hb) == HDR_BYTES
 
-        out = bytearray(hb) + enc.b + tens.b + blk.b + reg.b
-        out += b"\0" * (off_data - len(out))
-        for i in sorted(range(len(self.tensors)), key=lambda k: self.tensors[k]["offset"]):
-            t = self.tensors[i]
-            assert len(out) == off_data + t["offset"], (len(out), t["offset"], t["name"])
-            out += t["raw"] + b"\0" * t["pad"]
+        # STREAM to disk instead of building the file in a bytearray. The previous version held
+        # the entire output in memory ON TOP of every tensor's bytes, so peak usage was twice the
+        # file size — which made a two-layer Qwen3-30B-A3B test file OOM on a 16 GB machine, and
+        # would make any model larger than RAM impossible to write at all. That is the project's
+        # own premise failing in its own tool, so it is fixed before anything larger is attempted.
+        total = off_data
+        for t in self.tensors:
+            total = max(total, off_data + t["offset"] + len(t["raw"]) + t["pad"])
 
-        Path(path).write_bytes(bytes(out))
-        return dict(bytes=len(out), off_data=off_data, tensors=len(self.tensors),
+        with open(path, "wb") as f:
+            written = 0
+            def put(b):
+                nonlocal written
+                f.write(b)
+                written += len(b)
+
+            put(hb); put(enc.b); put(tens.b); put(blk.b); put(reg.b)
+            if written > off_data:
+                raise ValueError(f"tables end at {written}, past off_data {off_data}")
+            put(b"\0" * (off_data - written))
+            for i in sorted(range(len(self.tensors)), key=lambda k: self.tensors[k]["offset"]):
+                t = self.tensors[i]
+                if written != off_data + t["offset"]:
+                    raise ValueError(f"{t['name']}: at {written}, expected "
+                                     f"{off_data + t['offset']}")
+                put(t["raw"]); put(b"\0" * t["pad"])
+            if written != total:
+                raise ValueError(f"file ends at {written}, expected {total}")
+
+        return dict(bytes=total, off_data=off_data, tensors=len(self.tensors),
                     blocks=len(self.blocks), regions=len(self.regions))

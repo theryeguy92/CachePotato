@@ -33,3 +33,27 @@ Not fixed. The shard-1 wiring test is blocked on it, not on the C side: the C la
 against real weights through the flat blob (`tools/verify_qwen3_blocks.py`, rel ~2e-06), so what
 remains unproven is the *format* path for this model, and the blocker is the writer's memory model
 rather than anything about Qwen3.
+
+## Update — half fixed (2026-10-17)
+
+**Output streaming: DONE.** `write()` no longer builds the file in a `bytearray`; it writes tables,
+then each payload in offset order, checking every offset against the computed layout. Peak output
+memory is now one tensor instead of the whole file. `--layers 1` of the real model now converts and
+validates:
+
+    convert: scratch/qwen3_l1.v4cp (3737 MB) | tensors 394 blocks 3 regions 138
+    V4 FORMAT: PASS (structure, regions, digests)
+
+and an existing port still verifies byte-identically after the change (`v4_values: PASS`), so the
+streaming path did not alter the format it emits.
+
+**Still blocking the full 48-layer checkpoint: `add_tensor` MATERIALISES every payload.**
+`raw=raw` keeps each tensor's bytes from `add_tensor()` until `write()`, so peak memory is still the
+sum of all tensors — ~61 GB fp32, ~32 GB at Q8, ~16 GB at 4.5 bpw. For a model whose whole point is
+being larger than RAM, the writer must accept a *source* (path + offset, or a callable) and fetch
+bytes at write time. That is the remaining change, and it is the same shape of fix as the output
+streaming: never hold more than one tensor.
+
+Interaction to remember when it is done: region digests cover payload bytes and the region table
+precedes the payload, so a lazy writer either reads payloads twice or writes placeholder digests and
+patches them by seeking back. The second is one pass and the file is already seekable.
