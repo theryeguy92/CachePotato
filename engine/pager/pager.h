@@ -1,7 +1,7 @@
 #ifndef PAGER_H
 #define PAGER_H
 
-#include "weights.h"
+#include "core/weights.h"
 
 /* Experiment 2 / Phase 7: region residency tracking + LRU eviction under a RAM
    budget (CP_BUDGET=<MB>). Regions are the granularity the POLICY reasons about,

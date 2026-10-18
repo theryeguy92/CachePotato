@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 199309L /* clock_gettime with -std=c11 */
+#define _GNU_SOURCE         /* strdup/strtok_r with -std=c11 */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,19 +10,31 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "instr.h"
-#include "model.h"
-#include "pager.h"
-#include "tokenizer.h"
-#include "weights.h"
+#include "core/instr.h"
+#include "core/model.h"
+#include "pager/pager.h"
+#include "core/replay.h"
+#include "tokenizers/tokenizer.h"
+#include "core/weights.h"
 
 #define EOS_TOKEN 50256 /* GPT-2 <|endoftext|> */
+
+/* Lambda used when the file does not carry one. CPW1 v3 stores lambda in its header because
+   serving at a different lambda routes differently. v4 has no home for it yet (recorded as
+   an open spec question), so verification of a v4 file must be told the value:
+   CP_V4_LAMBDA=0.5. Default 0.0 keeps a missing value visible rather than silently wrong. */
+static float model_lambda(const Model *m) {
+    const char *s = getenv("CP_V4_LAMBDA");
+    if (s) return (float)atof(s);
+    return m->hdr.version == 4 ? 0.0f : m->h3.lam;
+}
 #define MAX_NEW 40
 
 /* --- decoding config -------------------------------------------------------
    Both Phase 6 arms degenerate into phrase loops under long GREEDY decoding
    (bench/results/routing/2026-09-25-quality-q2.md), so the REPL defaults to nucleus
    sampling. --greedy restores the previous behaviour. */
+static const char *g_record_trace = NULL; /* --record-trace: RTP1 out (bench mode) */
 static double g_temp = 0.8;
 static double g_top_p = 0.95;
 static int g_max_new = 128;
@@ -200,8 +213,8 @@ static int moe_sel_mode(const char *path, const char *tokbin, long start, int T,
     Model m;
     if (model_load(&m, path) != 0)
         return 1;
-    if (!m.is_v3 || !m.w.is_moe) {
-        fprintf(stderr, "%s is not a CPW1 v3 MoE file\n", path);
+    if (!m.w.is_moe) {
+        fprintf(stderr, "%s has no MoE layout (is_moe=0)\n", path);
         return 1;
     }
     FILE *f = fopen(tokbin, "rb");
@@ -222,7 +235,7 @@ static int moe_sel_mode(const char *path, const char *tokbin, long start, int T,
     if (!raw || !toks || !sel || !logits) { fprintf(stderr, "oom\n"); return 1; }
 
     double t0 = now_s();
-    forward_moe(&m, toks, T, logits, sel, m.h3.lam);
+    forward_moe(&m, toks, T, logits, sel, model_lambda(&m));
     double dt = now_s() - t0;
 
     FILE *o = fopen(out_path, "wb");
@@ -231,6 +244,12 @@ static int moe_sel_mode(const char *path, const char *tokbin, long start, int T,
     fwrite(&T, sizeof(int), 1, o);
     fwrite(&K, sizeof(int), 1, o);
     fwrite(sel, sizeof(int), (size_t)nm * T * K, o);
+    /* APPENDED (2026-10-16): the full logits block, T x vocab floats. Additive by design —
+       existing readers take a count and ignore trailing bytes, so verify_cpw1_v3.py is
+       unaffected. It exists because the routing trace alone cannot check numerics: a port
+       needs to compare the engine's logits against its reference at the trained lambda, and
+       the plain CLI prints those at lambda=0 (forward() predates the locality bias). */
+    fwrite(logits, sizeof(float), (size_t)T * m.hdr.vocab, o);
     fclose(o);
 
     int best = 0;
@@ -239,11 +258,77 @@ static int moe_sel_mode(const char *path, const char *tokbin, long start, int T,
     fprintf(stderr,
             "moe-sel: %d MoE layers x %d tokens x top-%d, lam=%.3f, %.1fs "
             "(%.0f tok/s) | next-argmax %d -> %s\n",
-            nm, T, K, m.h3.lam, dt, dt > 0 ? T / dt : 0.0, best, out_path);
+            nm, T, K, model_lambda(&m), dt, dt > 0 ? T / dt : 0.0, best, out_path);
 
     free(raw); free(toks); free(sel); free(logits);
     model_free(&m);
     return 0;
+}
+
+/* --- Phase 8 T2: pager residency replay --------------------------------------
+   Why this exists: analysis/traffic.py models this policy in Python and
+   under-predicts the engine's measured expert hit rate by 5-26 points, so it could
+   not be trusted to answer "which port, at what budget". src/replay.c implements the
+   residency policy directly and runs a full sweep in milliseconds, so the model and
+   the simulator can be compared against each other AND against the engine.
+
+   Two readings worth knowing before quoting a number:
+     - `reads`  = distinct cold region loads = physical I/O (the metric that matters
+                  on a latency-bound device);
+     - the engine-counter line = what pager.c itself would report, which counts one
+                  miss per expert TOUCH and so over-counts once a region holds >1 expert.
+   --ps-reset 1 turns on EOS resets; the default is 0 because the pager does NOT reset
+   at a sequence boundary (see replay.h). Getting that wrong made every benchmark look
+   ~35x worse than the engine. */
+static int pager_sim_mode(const char *trace_path, long budget_bytes, long region_bytes,
+                          long expert_bytes, long core_bytes, int limit_windows,
+                          int reset_on_eos, const char *sweep) {
+    ReplayTrace t;
+    if (replay_load(&t, trace_path) != 0)
+        return 1;
+    ReplayConfig cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.budget_bytes = budget_bytes;
+    cfg.core_bytes = core_bytes;
+    cfg.region_bytes = region_bytes > 0 ? region_bytes : expert_bytes;
+    cfg.expert_bytes = expert_bytes;
+    cfg.limit_windows = limit_windows;
+    cfg.reset_on_eos = reset_on_eos;
+
+    fprintf(stderr, "trace : %s — %d MoE slots x %d windows x %d tokens, top-%d, "
+            "N=%d, eos=%d\n", trace_path, t.h.n_slots, t.h.n_windows, t.h.window_len,
+            t.h.topk, t.h.n_exp, t.h.eos);
+    fprintf(stderr, "sim   : budget %ld MB, core %ld MB, region %ld B, expert %ld B, "
+            "reset_on_eos=%d%s\n", budget_bytes >> 20, core_bytes >> 20, cfg.region_bytes,
+            expert_bytes, reset_on_eos,
+            limit_windows ? "  (limited windows)" : "");
+
+    int rc = 0;
+    if (sweep && *sweep) {
+        printf("  %8s %6s %8s %9s %11s %10s\n", "budget", "cap", "hit%",
+               "reads/tok", "MB/token", "evictions");
+        char *spec = strdup(sweep), *save = NULL;
+        for (char *tok = strtok_r(spec, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+            ReplayConfig c = cfg;
+            c.budget_bytes = atol(tok) * 1024L * 1024L;
+            ReplayStats st;
+            if (replay_run(&t, &c, &st) != 0) { rc = 1; break; }
+            printf("  %8ld %6d %8.2f %9.3f %11.2f %10ld\n",
+                   c.budget_bytes >> 20, st.cap,
+                   st.acc ? 100.0 * (double)st.hits / (double)st.acc : 0.0,
+                   st.tokens ? (double)st.loads / (double)st.tokens : 0.0,
+                   st.tokens ? (double)st.loads * st.group * c.expert_bytes
+                               / (double)st.tokens / 1e6 : 0.0,
+                   st.evictions);
+        }
+        free(spec);
+    } else {
+        ReplayStats st;
+        if (replay_run(&t, &cfg, &st) != 0) rc = 1;
+        else replay_report(&st, &cfg);
+    }
+    replay_free(&t);
+    return rc;
 }
 
 /* --- Gate 1: incremental (KV-cached) vs full-sequence equivalence -----------
@@ -253,8 +338,8 @@ static int moe_sel_mode(const char *path, const char *tokbin, long start, int T,
 static int step_check_mode(const char *path, const char *tokbin, long start, int T) {
     Model m;
     if (model_load(&m, path) != 0) return 1;
-    if (!m.is_v3 || !m.w.is_moe) {
-        fprintf(stderr, "%s is not a CPW1 v3 MoE file\n", path);
+    if (!m.w.is_moe) {
+        fprintf(stderr, "%s has no MoE layout (is_moe=0)\n", path);
         return 1;
     }
     const int V = m.hdr.vocab, nm = m.w.n_moe, K = m.w.topk;
@@ -280,10 +365,11 @@ static int step_check_mode(const char *path, const char *tokbin, long start, int
         fprintf(stderr, "oom\n"); return 1;
     }
 
-    forward_moe(&m, toks, T, logA, selA, m.h3.lam);
+    forward_moe(&m, toks, T, logA, selA, model_lambda(&m));
 
     RunState rs;
     runstate_alloc(&rs, &m);
+    rs.lam = model_lambda(&m);   /* keep the incremental path on the same lambda as the reference */
     runstate_reset_sequence(&rs, &m);
     rs.moe_sel_out = selB;
     rs.moe_sel_stride = T;
@@ -322,7 +408,7 @@ static int step_check_mode(const char *path, const char *tokbin, long start, int
             }
     }
 
-    printf("step-check: T=%d  moe_layers=%d  top-%d  lam=%.3f\n", T, nm, K, m.h3.lam);
+    printf("step-check: T=%d  moe_layers=%d  top-%d  lam=%.3f\n", T, nm, K, model_lambda(&m));
     printf("  logits  : max|delta| = %.3e   argmax mismatches %d/%d\n", dmax, am, T);
     printf("  routing : %d / %zu selections differ\n", sm, nsel);
     printf("  speed   : %.1f tok/s (%.1fs for %d tokens, incremental)\n",
@@ -346,8 +432,8 @@ static int gen_check_mode(const char *path, const char *tokbin, long start,
                           int prompt_T, int N) {
     Model m;
     if (model_load(&m, path) != 0) return 1;
-    if (!m.is_v3 || !m.w.is_moe) {
-        fprintf(stderr, "%s is not a CPW1 v3 MoE file\n", path);
+    if (!m.w.is_moe) {
+        fprintf(stderr, "%s has no MoE layout (is_moe=0)\n", path);
         return 1;
     }
     const int V = m.hdr.vocab, nm = m.w.n_moe, K = m.w.topk;
@@ -369,6 +455,7 @@ static int gen_check_mode(const char *path, const char *tokbin, long start,
     int *idsA = malloc((size_t)N * sizeof(int));
     RunState rs;
     runstate_alloc(&rs, &m);
+    rs.lam = model_lambda(&m);   /* keep the incremental path on the same lambda as the reference */
     runstate_reset_sequence(&rs, &m);
     rs.moe_sel_out = selA;
     rs.moe_sel_stride = Lmax;
@@ -390,7 +477,7 @@ static int gen_check_mode(const char *path, const char *tokbin, long start,
     int id_mm = 0, sel_mm = 0, first_bad = -1;
     for (int i = 0; i < N; i++) {
         int P = prompt_T + i;
-        forward_moe(&m, seq, P, logits, selB, m.h3.lam);
+        forward_moe(&m, seq, P, logits, selB, model_lambda(&m));
         const float *row = logits + (size_t)(P - 1) * V;
         int best = 0;
         for (int j = 1; j < V; j++) if (row[j] > row[best]) best = j;
@@ -408,7 +495,7 @@ static int gen_check_mode(const char *path, const char *tokbin, long start,
     for (int i = 0; i < prompt_T; i++) if (seq[i] == EOS_TOKEN) eos_prompt++;
 
     printf("gen-check: prompt %d tokens, %d generated greedily, lam=%.3f\n",
-           prompt_T, N, m.h3.lam);
+           prompt_T, N, model_lambda(&m));
     printf("  generated ids    : %d / %d differ from full-sequence%s\n",
            id_mm, N, id_mm ? "   <-- DIVERGENCE" : "");
     printf("  last-pos routing : %d / %d selections differ\n", sel_mm, nm * N * K);
@@ -425,6 +512,39 @@ static int gen_check_mode(const char *path, const char *tokbin, long start,
     free(raw); free(seq); free(selA); free(idsA); free(selB); free(logits);
     model_free(&m);
     return ok ? 0 : 1;
+}
+
+/* --- RTP1 trace writer (Phase 8 T2) -----------------------------------------
+   Written by bench_mode when --record-trace is given, so that the trace and the
+   pager counters describe THE SAME execution. That is the whole point: the older
+   traces were recorded over independent 512-token windows, so replaying them could
+   not reproduce the bench hit rate — the two had different reset structures. Format
+   matches src/replay.h / tools/npz_to_rtp1.py. */
+static int write_rtp1(const char *path, const int32_t *tokens, const int16_t *sel,
+                      int n_slots, int n_windows, int window_len, int topk,
+                      int n_exp, int eos) {
+    ReplayHeader h;
+    memset(&h, 0, sizeof h);
+    h.magic = RPY_MAGIC;
+    h.version = 1;
+    h.lam_bits = 0;   /* provenance slot; the bench may serve any lambda */
+    h.n_slots = n_slots; h.n_windows = n_windows; h.window_len = window_len;
+    h.topk = topk; h.n_exp = n_exp; h.eos = eos;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); return -1; }
+    int rc = 0;
+    if (fwrite(&h, sizeof h, 1, f) != 1) rc = -1;
+    if (rc == 0 && fwrite(tokens, sizeof(int32_t),
+                          (size_t)n_windows * window_len, f)
+                       != (size_t)n_windows * window_len) rc = -1;
+    if (rc == 0) {
+        size_t n = (size_t)n_slots * n_windows * window_len * topk;
+        if (fwrite(sel, sizeof(int16_t), n, f) != n) rc = -1;
+    }
+    fclose(f);
+    if (rc != 0) fprintf(stderr, "%s: trace write failed\n", path);
+    return rc;
 }
 
 /* --- Q3 benchmark (protocol pre-registered in Phase-7-Integration § Part 3) --
@@ -499,6 +619,21 @@ static int bench_mode(const char *path, const char *tokbin, long start,
     runstate_alloc(&rs, &m);
     double *tps = malloc((size_t)n_prompts * sizeof(double));
 
+    /* Write a routing trace from THIS run when asked, so the trace and the pager
+       counters describe the same execution. 560 = prompt_T + gen_N; positions past
+       an early EOS are padded with EOS and never touch the pager in the replay
+       either, so the trace stays rectangular for the RTP1 reader. */
+    const int WPI = prompt_T + gen_N, nslots = m.w.is_moe ? m.w.n_moe : 0;
+    int32_t *rt = NULL; int16_t *rs_sel = NULL;
+    if (g_record_trace && m.w.is_moe) {
+        rt = malloc((size_t)n_prompts * WPI * sizeof(int32_t));
+        rs_sel = calloc((size_t)nslots * n_prompts * WPI * m.w.topk, sizeof(int16_t));
+        if (!rt || !rs_sel) { fprintf(stderr, "trace: oom\n"); return 1; }
+        rs.moe_sel_out = malloc((size_t)nslots * WPI * m.w.topk * sizeof(int));
+        if (!rs.moe_sel_out) { fprintf(stderr, "trace: oom\n"); return 1; }
+        rs.moe_sel_stride = WPI;
+    }
+
     /* Prime the page cache before any timing. Without this, run-to-run drift —
        whatever the PREVIOUS run happened to leave cached — dwarfs the effect
        being measured (three identical runs measured 8.13 / 8.78 / 10.67 tok/s).
@@ -514,22 +649,35 @@ static int bench_mode(const char *path, const char *tokbin, long start,
     }
 
     fprintf(stderr, "bench: %s\n  prompt_T=%d gen_N=%d n_prompts=%d lam=%.3f\n",
-            path, prompt_T, gen_N, n_prompts, m.h3.lam);
+            path, prompt_T, gen_N, n_prompts, model_lambda(&m));
     for (int i = 0; i < n_prompts; i++) {
         runstate_reset_sequence(&rs, &m);
         long o = offs[i];
-        for (int t = 0; t < prompt_T; t++)
+        for (int t = 0; t < prompt_T; t++) {
+            if (rt) rt[(size_t)i * WPI + t] = ids[o + t];
             forward_step(&m, &rs, ids[o + t], t);
+        }
         double t0 = now_s();
         int pos = prompt_T;
         for (int g = 0; g < gen_N && pos < m.hdr.n_ctx; g++, pos++) {
             int best = 0;
             for (int j = 1; j < V; j++)
                 if (rs.logits[j] > rs.logits[best]) best = j;
+            if (rt) rt[(size_t)i * WPI + pos] = best;
             forward_step(&m, &rs, best, pos);
         }
         double dt = now_s() - t0;
         int ng = pos - prompt_T;
+        if (rt) {
+            for (int t = pos; t < WPI; t++)           /* pad to a rectangle */
+                rt[(size_t)i * WPI + t] = EOS_TOKEN;
+            for (int s = 0; s < nslots; s++)
+                for (int t = 0; t < WPI; t++)
+                    for (int k = 0; k < m.w.topk; k++)
+                        rs_sel[((size_t)s * n_prompts + i) * WPI * m.w.topk
+                               + (size_t)t * m.w.topk + k] =
+                            (int16_t)rs.moe_sel_out[((size_t)s * WPI + t) * m.w.topk + k];
+        }
         tps[i] = dt > 0 ? ng / dt : 0.0;
         /* Sampled AFTER dt is taken, at the prompt boundary only: telemetry
            must never sit between the clock start and the clock stop. */
@@ -560,6 +708,16 @@ static int bench_mode(const char *path, const char *tokbin, long start,
     printf("BENCH_RESULT mean=%.4f sd=%.4f ci_lo=%.4f ci_hi=%.4f n=%d file=%s\n",
            mean, sd, lo, hi, n, path);
     pager_report();
+
+    if (rt) {
+        int rc = write_rtp1(g_record_trace, rt, rs_sel, nslots, n_prompts, WPI,
+                            m.w.topk, m.w.n_exp, EOS_TOKEN);
+        fprintf(stderr, "  trace: %s — %d slots x %d prompts x %d tokens, top-%d%s\n",
+                g_record_trace, nslots, n_prompts, WPI, m.w.topk,
+                rc ? "  (WRITE FAILED)" : "");
+        free(rt); free(rs_sel); free(rs.moe_sel_out);
+        rs.moe_sel_out = NULL;
+    }
 
     runstate_free(&rs, &m);
     free(tps); free(offs);
@@ -600,6 +758,16 @@ int main(int argc, char **argv) {
     const char *bn_bin = NULL;
     long bn_start = 0;
     int bn_prompt = 0, bn_gen = 0, bn_prompts = 0;
+    int pager_sim = 0;
+    const char *ps_trace = NULL;
+    long ps_budget = 512L * 1024 * 1024, ps_region = 0, ps_expert = 1183488L;
+    /* 317.7 MiB is the engine's own measured resident core footprint (pager_report's
+       resident line), not the hand-computed region sum (340.3 MiB): the two differ
+       because not every non-expert region is resident when the budget binds. Using the
+       computed figure under-provisioned expert capacity and made tight-budget hit rates
+       look ~10 points worse than the engine. */
+    long ps_core = 318L * 1024 * 1024, ps_limit = 0, ps_reset = 0;
+    const char *ps_sweep = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc)
@@ -610,6 +778,26 @@ int main(int argc, char **argv) {
             g_max_new = atoi(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc)
             rng_seed(strtoull(argv[++i], NULL, 10));
+        else if (strcmp(argv[i], "--record-trace") == 0 && i + 1 < argc)
+            g_record_trace = argv[++i];
+        else if (strcmp(argv[i], "--pager-sim") == 0 && i + 1 < argc) {
+            ps_trace = argv[++i];
+            pager_sim = 1;
+        }
+        else if (strcmp(argv[i], "--ps-budget") == 0 && i + 1 < argc)
+            ps_budget = atol(argv[++i]) * 1024L * 1024L;
+        else if (strcmp(argv[i], "--ps-region") == 0 && i + 1 < argc)
+            ps_region = atol(argv[++i]);          /* bytes; 0 = one expert */
+        else if (strcmp(argv[i], "--ps-expert") == 0 && i + 1 < argc)
+            ps_expert = atol(argv[++i]);
+        else if (strcmp(argv[i], "--ps-core") == 0 && i + 1 < argc)
+            ps_core = atol(argv[++i]) * 1024L * 1024L;
+        else if (strcmp(argv[i], "--ps-limit") == 0 && i + 1 < argc)
+            ps_limit = atol(argv[++i]);
+        else if (strcmp(argv[i], "--ps-reset") == 0 && i + 1 < argc)
+            ps_reset = atol(argv[++i]);
+        else if (strcmp(argv[i], "--ps-sweep") == 0 && i + 1 < argc)
+            ps_sweep = argv[++i];
         else if (strcmp(argv[i], "--greedy") == 0)
             g_temp = 0.0;
         else if (strcmp(argv[i], "--bench") == 0 && i + 5 < argc) {
@@ -649,6 +837,10 @@ int main(int argc, char **argv) {
         else if (T < 256)
             tokens[T++] = atoi(argv[i]);
     }
+
+    if (pager_sim)
+        return pager_sim_mode(ps_trace, ps_budget, ps_region, ps_expert, ps_core,
+                              (int)ps_limit, (int)ps_reset, ps_sweep);
 
     if (bench)
         return bench_mode(path, bn_bin, bn_start, bn_prompt, bn_gen, bn_prompts);

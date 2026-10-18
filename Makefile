@@ -1,14 +1,34 @@
 CC      ?= cc
-CFLAGS  ?= -O3 -march=native -Wall -Wextra -std=c11
-LDLIBS  ?= -lm
+CFLAGS  ?= -O3 -march=native -Wall -Wextra -std=c11 -Iengine
+LDLIBS  ?= -lm -lpthread
 BUILD   := build
-ENGINE  := src/weights.c src/kernels.c src/model.c src/tokenizer.c src/instr.c src/pager.c
-TRAINER := src/weights.c src/kernels.c src/train.c
+ENGINE  := engine/core/weights.c engine/core/weights_v4.c engine/kernels/kernels.c engine/core/model.c engine/tokenizers/tokenizer.c engine/core/instr.c engine/pager/pager.c engine/core/replay.c engine/blocks/attention_mha.c engine/blocks/ffn_dense.c engine/blocks/moe_routed.c engine/kernels/parallel.c
+TRAINER := engine/core/weights.c engine/core/weights_v4.c engine/kernels/kernels.c src/train.c engine/kernels/parallel.c
+
+.PHONY: all calibrate
 
 all: $(BUILD)/cachepotato $(BUILD)/train
 
+# Host calibration probe (Phase 8 T3): measures the memory hierarchy and emits a
+# machine profile. Not part of the engine — a separate diagnostic binary.
+calibrate: tools/calibrate.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/calibrate $< -lm -lpthread
+
 $(BUILD)/cachepotato: src/main.c $(ENGINE)
 	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# Qwen2.5 chat CLI. The v4 weight file is built separately (see models/qwen2.5-0.5b/MODEL.md).
+QWEN_SRC := tools/qwen_chat.c engine/blocks/qwen2.c engine/tokenizers/tokenizer.c \
+            engine/tokenizers/tokenizer_qwen.c engine/kernels/kernels.c engine/kernels/parallel.c
+$(BUILD)/qwen_chat: $(QWEN_SRC)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# Decode benchmark for A/B work (tools/ab.py drives it).
+BENCH_SRC := tools/bench_decode.c engine/blocks/qwen2.c engine/kernels/kernels.c \
+             engine/kernels/parallel.c
+$(BUILD)/bench_decode: $(BENCH_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 $(BUILD)/train: $(TRAINER)

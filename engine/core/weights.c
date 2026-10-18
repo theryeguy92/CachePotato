@@ -165,13 +165,27 @@ void layout_weights_v3(Weights *w, const HeaderV3 *h, float *ptr) {
     w->moe_from = h->moe_from;
 }
 
+/* Q8_0 byte length for `elems` values (groups of 32, 34 bytes each). */
+long q8_bytes_for(long elems) { return (elems / 32) * 34; }
+
+const unsigned char *expert_block_q8(const Weights *w, int slot, int e) {
+    return w->experts_q8 ? w->experts_q8[(size_t)slot * w->n_exp + e] : NULL;
+}
+
+const float *expert_bias_ptr(const Weights *w, int slot, int e) {
+    return w->expert_bias ? w->expert_bias[(size_t)slot * w->n_exp + e] : NULL;
+}
+
 float *expert_block(const Weights *w, int slot, int e) {
     return w->experts
          + ((size_t)slot * w->n_exp + e) * expert_floats(w->d_model, w->exp_hid);
 }
 
 int moe_layer_at(const Model *m, int l) {
-    return (m->is_v3 && m->w.is_moe && l >= m->w.moe_from && l < m->hdr.n_layer - 1);
+    /* w.is_moe is set by every MoE-capable loader (v3 and v4); is_v3 was never the right
+       predicate, and requiring it made every v4 MoE layer dispatch to the DENSE path --
+       so sel_out was never written and the gate read uninitialised memory. */
+    return (m->w.is_moe && l >= m->w.moe_from && l < m->hdr.n_layer - 1);
 }
 
 static void map_weights(Model *m) {
@@ -195,6 +209,11 @@ int model_load(Model *m, const char *path) {
     if (read(m->fd, &magic, 4) != 4 || read(m->fd, &version, 4) != 4) {
         fprintf(stderr, "couldn't read magic/version\n");
         return -1;
+    }
+    if (magic == 0x34575043u) {           /* "CPW4" — the self-describing format */
+        close(m->fd);
+        m->fd = -1;
+        return model_load_v4(m, path);
     }
     if (magic != CP_MAGIC) {
         fprintf(stderr, "bad magic 0x%08x — not a CPW1 weight file\n", magic);
@@ -251,6 +270,8 @@ int model_load(Model *m, const char *path) {
 }
 
 void model_free(Model *m) {
+    free(m->v4_scratch);          /* v4 engine-layout copy, if any */
+    m->v4_scratch = NULL;
     free(m->w.moe_slot);
     free(m->w.dense_slot);
     m->w.moe_slot = m->w.dense_slot = NULL;

@@ -51,6 +51,18 @@ typedef struct {
     float *Wr, *br;               /* router:   (n_moe, d, N) / (n_moe, N) */
     float *W1s, *b1s, *W2s, *b2s; /* shared:   (n_moe, d, d) / (n_moe, d) */
     float *experts;               /* routed:   (n_moe, N, expert_floats)  */
+    /* Quantized experts (Q8_0). When `experts_q8` is non-NULL the routed experts are read
+       from the file's blocks on the fly and `experts` is unused: that is the difference
+       between a quantized model that FITS and one that only has a smaller file. Layout per
+       expert: q8(W1) then q8(W2); biases live separately (b1 then b2) because a bias must not
+       share a group scale with weights. */
+    /* Quantized non-expert matrices. NULL when the file stores that tensor as f32; the
+       forward pass dispatches on presence, so a block never learns its own dtype. Biases are
+       always f32: a bias must not share a group scale with its matrix. */
+    const unsigned char *q_Wq, *q_Wk, *q_Wv, *q_Wo;
+    const unsigned char *q_W1, *q_W2, *q_W1s, *q_W2s, *q_Wr;
+    const unsigned char **experts_q8;   /* [n_moe * N] -> q8(W1)|q8(W2) */
+    const float **expert_bias;          /* [n_moe * N] -> b1[EH] then b2[D] */
     int is_moe;
     int d_model, n_moe, n_exp, exp_hid, topk, moe_from;
     int *moe_slot;                /* (n_layer) layer -> MoE slot  (-1 if dense) */
@@ -65,6 +77,12 @@ typedef struct {
     int fd;
     float *data;      /* mmap base */
     size_t file_size;
+    float *v4_scratch; /* v4 only: the engine-layout copy of the tensors. A v4 file makes no
+                         promise about tensor order, and the forward pass indexes per-layer
+                         arrays by stride, so the loader copies each tensor into its slot
+                         (~701 MB for the current model) rather than assuming layout. A
+                         v4-native forward pass would remove the copy; that is a later
+                         change, and this one keeps the acceptance test about the FILE. */
 } Model;
 
 /* Load + validate + mmap the weight file (CPW1 v2 or v3). Returns 0 on success,
@@ -86,6 +104,15 @@ long expected_floats_v3(const HeaderV3 *h);
 long expert_floats(int d_model, int exp_hid);
 /* pointer to one (MoE slot, expert) block — one pager region */
 float *expert_block(const Weights *w, int slot, int e);
+const unsigned char *expert_block_q8(const Weights *w, int slot, int e);
+const float *expert_bias_ptr(const Weights *w, int slot, int e);
+long q8_bytes_for(long elems);
+/* A multi-layer quantized group is ONE tensor; index `idx` of it starts `idx` blocks in.
+   Passing the tensor base for every layer is a silent bug: every layer reads layer 0 and the
+   model runs with plausible-looking garbage (routing fell to 10.7% this way). */
+static inline const unsigned char *q8_slice(const unsigned char *base, int idx, long elems) {
+    return base ? base + (size_t)idx * (size_t)q8_bytes_for(elems) : (const unsigned char *)0;
+}
 /* true when engine layer l uses a sparse FFN */
 int moe_layer_at(const Model *m, int l);
 
@@ -95,3 +122,6 @@ int moe_layer_at(const Model *m, int l);
 void model_evict_all(Model *m);
 
 #endif
+
+/* --- CPW1 v4 (format/SPEC.md) --- */
+#include "weights_v4.h"
