@@ -65,6 +65,18 @@ if [ -f weights/qwen3-30b-a3b/model-00001-of-00016.safetensors ]; then
     [ $rc -eq 0 ] || fail=1
 fi
 
+# C1 paging. THE gate for the pager: at an unlimited budget the output must be
+# BIT-IDENTICAL to the unpaged run, and at a budget tight enough to evict it must still
+# be (eviction drops pages of a file mapping; it must not change what they say). The
+# 2048 MB budget was chosen because it evicts on the recorded prompt — a run with zero
+# evictions would test the counters and not the policy. Skipped without the 32.5 GB file.
+if [ -f weights/qwen3_30b_a3b_q8.v4cp ]; then
+    printf '  %-22s ' "qwen3_paging_c1"
+    out=$(python3 tools/verify_qwen3_paging.py --budget-mb 2048 2>&1); rc=$?
+    echo "$out" | grep -E "^C1 PAGING" | tail -1 | sed 's/^/ /'
+    [ $rc -eq 0 ] || fail=1
+fi
+
 printf '  %-22s ' "qwen_kernels"
 out=$(python3 tools/verify_qwen_kernels.py 2>&1); rc=$?
 echo "$out" | grep -E "^QWEN KERNELS" | tail -1 | sed 's/^/ /'
