@@ -33,6 +33,11 @@ fi
 
 # First port (models/gpt2-moe). Skipped unless its checkpoint exists, since weights are
 # gitignored. Converts the checkpoint to v4, then runs the port's own gate.
+printf '  %-22s ' "qwen_kernels"
+out=$(python3 tools/verify_qwen_kernels.py 2>&1); rc=$?
+echo "$out" | grep -E "^QWEN KERNELS" | tail -1 | sed 's/^/ /'
+[ $rc -eq 0 ] || fail=1
+
 printf '  %-22s ' "q8_file"
 out=$(python3 models/gpt2-moe/convert.py --ckpt weights/moe-scale-run/l05/model_only.pt \
         --out scratch/l05_q8.v4cp --quant q8_0 2>&1); rc=$?

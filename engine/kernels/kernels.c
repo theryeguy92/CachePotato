@@ -299,3 +299,53 @@ void matmul_wx_q8(float *out, const float *x, const uint8_t *w, int n_in, int n_
         out[i] = acc;
     }
 }
+
+/* ---------------------------------------------------------------- Qwen2.5 primitives
+ *
+ * Three things this engine has never had. Each is gated against the independent numpy
+ * reference (models/qwen2.5-0.5b/reference.py) on random data, because a `read the config`
+ * mistake here is silent: an RMSNorm implemented as LayerNorm still runs and still produces
+ * fluent text.
+ */
+
+/* RMSNorm: x / sqrt(mean(x^2) + eps) * g.  NO mean subtraction, NO bias. This is the single
+   easiest block to get wrong by reusing a LayerNorm, and the failure is invisible in output. */
+void rmsnorm(float *out, const float *x, const float *g, int n, float eps) {
+    float ss = 0.0f;
+    for (int i = 0; i < n; i++) ss += x[i] * x[i];
+    float inv = 1.0f / sqrtf(ss / (float)n + eps);
+    for (int i = 0; i < n; i++) out[i] = x[i] * inv * g[i];
+}
+
+/* SiLU (swish): x * sigmoid(x). */
+float silu(float x) { return x / (1.0f + expf(-x)); }
+
+/* RoPE, applied in place to q and k.
+ *
+ * Layout: q is (T, n_q_heads, hd), k is (T, n_kv_heads, hd), row-major. Only the FIRST half of
+ * each head's cos/sin table is needed: the pair (i, i + hd/2) rotates together, which is the
+ * same thing as HF's duplicated-table + rotate_half formulation.
+ *
+ * theta is the RoPE base (1e6 for Qwen2.5), taken from the file rather than assumed. */
+void rope_apply(float *q, float *k, int T, int n_q_heads, int n_kv_heads, int hd, float theta) {
+    const int half = hd / 2;
+    for (int t = 0; t < T; t++) {
+        for (int i = 0; i < half; i++) {
+            /* inv_freq = theta^(-2i/hd); angle = pos * inv_freq */
+            float inv = powf(theta, -2.0f * (float)i / (float)hd);
+            float ang = (float)t * inv;
+            float c = cosf(ang), s = sinf(ang);
+            float *rows[2] = { q + (size_t)t * n_q_heads * hd, k + (size_t)t * n_kv_heads * hd };
+            int nh[2] = { n_q_heads, n_kv_heads };
+            for (int r = 0; r < 2; r++) {
+                float *base = rows[r];
+                for (int h = 0; h < nh[r]; h++) {
+                    float *v = base + (size_t)h * hd;
+                    float a = v[i], b = v[i + half];
+                    v[i]        = a * c - b * s;
+                    v[i + half] = b * c + a * s;
+                }
+            }
+        }
+    }
+}

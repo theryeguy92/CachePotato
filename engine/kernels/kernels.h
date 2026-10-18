@@ -25,6 +25,12 @@ void matmul_xw_q8(float *out, const float *x, const uint8_t *w,
    block stay representation-agnostic — it never learns whether its weights are quantized. */
 void matmul_xw_auto(float *out, const float *x, const float *w, const uint8_t *q8,
                     const float *bias, int n_in, int n_out);
+
+/* Qwen2.5 primitives (see the block in kernels.c): RMSNorm has no mean and no bias, RoPE
+   rotates pairs within a head, SiLU gates a SwiGLU. */
+void  rmsnorm(float *out, const float *x, const float *g, int n, float eps);
+float silu(float x);
+void  rope_apply(float *q, float *k, int T, int n_q_heads, int n_kv_heads, int hd, float theta);
 void matmul_wx_q8(float *out, const float *x, const uint8_t *w, int n_in, int n_out);
 
 #endif
