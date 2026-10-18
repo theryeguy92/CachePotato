@@ -74,7 +74,8 @@ def capture(model, tok, prompt, layers, want_intermediates):
             tv, ti = torch.topk(p, 8, dim=-1)
             rec[f"L{i}.top8"] = ti.numpy().astype(np.int64)
             rec[f"L{i}.top8_w"] = (tv / tv.sum(-1, keepdim=True)).numpy().astype(np.float32)
-    return ids[0].numpy().astype(np.int64), logits, rec, sites
+    # ids live on the model's device (required once the model is split), so bring them back
+    return ids[0].detach().cpu().numpy().astype(np.int64), logits, rec, sites
 
 def main():
     ap = argparse.ArgumentParser()
