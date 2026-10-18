@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -209,6 +210,24 @@ static FILE *out_file(const char *fn) {
     return f;
 }
 
+/* Cold start: drop every cached page of the model file so a run begins from the same state
+   as every other run. Without this, "cold" is a property of what ran before it — which is
+   exactly the confound the first C2 slice had. Needs no privileges: POSIX_FADV_DONTNEED on
+   a file we have open discards its clean page-cache pages (they are re-read on demand). */
+static void drop_file_pages(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { perror(path); return; }
+    struct stat st;
+    if (fstat(fd, &st) == 0) {
+        if (posix_fadvise(fd, 0, (off_t)st.st_size, POSIX_FADV_DONTNEED) != 0)
+            fprintf(stderr, "cold start: posix_fadvise failed for %s\n", path);
+        else
+            fprintf(stderr, "cold start: dropped page cache for %lld MB of %s\n",
+                    (long long)st.st_size / (1024 * 1024), path);
+    }
+    close(fd);
+}
+
 static int argmax_row(const float *v, int n) {
     int best = 0;
     for (int i = 1; i < n; i++) if (v[i] > v[best]) best = i;
@@ -257,6 +276,9 @@ int main(int argc, char **argv) {
     for (int i = 5; i + 1 < argc; i++)
         if (!strcmp(argv[i], "--decode")) gen = atoi(argv[i + 1]);
 
+    const char *cold = getenv("CP_COLD_START");
+    if (cold && cold[0] == '1') drop_file_pages(path);
+
     QW3Layer m; memset(&m, 0, sizeof m);
     if (qwen3_map(&m, path)) { fprintf(stderr, "map failed\n"); return 1; }
     if (qwen3_bind_layer(&m, 0)) return 1;          /* geometry (d_model, head_dim, ...) */
@@ -278,7 +300,13 @@ int main(int argc, char **argv) {
         if (!kv) return 1;
         for (int l = 0; l < L; l++)
             if (qwen3_kv_alloc(&kv[l], &m, cap)) { fprintf(stderr, "kv alloc failed\n"); return 1; }
-        if (run_layers(&m, x, T, 0, kv, L, NULL, NULL)) return 1;
+        {   /* the prefill is reported separately: it is prompt processing, not decode, and
+               its reads are what leave the cache in whatever state the decode loop starts in */
+            long io0 = io_read_kb(); double t0 = now_s();
+            if (run_layers(&m, x, T, 0, kv, L, NULL, NULL)) return 1;
+            fprintf(stderr, "prefill: %.0f ms, %ld KB read\n",
+                    (now_s() - t0) * 1e3, io_read_kb() - io0);
+        }
 
         int   *gtok   = malloc(sizeof(int) * (size_t)gen);
         float *glog   = malloc(sizeof(float) * (size_t)gen * V);
