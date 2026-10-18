@@ -3,6 +3,7 @@
  * Ported against models/qwen3-30b-a3b/reference.py, which is itself gated to ~1e-7 against the
  * published weights. So a disagreement here is this file's fault, not the model's.
  */
+#define _GNU_SOURCE             /* madvise(MADV_RANDOM) with -std=c11 */
 #include "qwen3_moe.h"
 #include "kernels/kernels.h"
 #include "pager/pager.h"
@@ -272,6 +273,19 @@ int qwen3_map(QW3Layer *m, const char *path) {
     const unsigned char *base = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (base == MAP_FAILED) { perror("mmap"); close(fd); return -1; }
     m->map = base; m->map_len = (size_t)st.st_size;
+    /* CP_NO_READAHEAD=1 turns off the kernel's sequential readahead for this mapping.
+       Under a pager that drops regions on eviction, readahead is speculative bytes that
+       get thrown away and read again: the C2 8 GB run reads 1.9x what it fetches, and the
+       excess tracks evictions. This is the switch that tests that, and the candidate fix.
+       Off by default — it changes read behaviour, so it is a decision, not a default. */
+    {
+        const char *nr = getenv("CP_NO_READAHEAD");
+        if (nr && nr[0] == '1' && madvise((void *)base, (size_t)st.st_size, MADV_RANDOM) != 0)
+            fprintf(stderr, "v4: MADV_RANDOM failed (%m)\n");
+        else if (nr && nr[0] == '1')
+            fprintf(stderr, "v4: readahead disabled (MADV_RANDOM over %zu MB)\n",
+                    (size_t)st.st_size / (1024 * 1024));
+    }
 
     m->n_tens = rd32(base + 16); m->n_regions = (int)rd32(base + 24);
     m->n_enc = rd32(base + 28);
