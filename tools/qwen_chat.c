@@ -71,6 +71,12 @@ int main(int argc, char **argv) {
                 n, t1 - t0, n / (t1 - t0), produced, t3 - t2,
                 produced ? produced / (t3 - t2) : 0.0);
     }
+    if (getenv("CP_PROF")) {
+        extern double g_t_attn, g_t_mlp, g_t_head;
+        double tot = g_t_attn + g_t_mlp + g_t_head;
+        fprintf(stderr, "\n[profile] attention %.1f ms  mlp %.1f ms  head %.1f ms  "
+                        "= %.1f ms of compute\n", g_t_attn*1e3, g_t_mlp*1e3, g_t_head*1e3, tot*1e3);
+    }
     qwen2_cache_free(c);
 
     return 0;

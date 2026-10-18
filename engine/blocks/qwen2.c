@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 /* qwen2.c — a complete Qwen2 forward pass in C, as a PORT PROOF.
  *
  * Why a separate file rather than bending the GPT-2 `Weights` struct: this model needs RMSNorm,
@@ -18,6 +19,17 @@
 #include <string.h>
 
 #define MAX_T 4096
+
+/* Instrumentation for the REAL forward pass. The synthetic per-shape benchmark measured
+   L3-resident bandwidth (one 4.6 MB matrix in a loop); the model streams 525 MB with no reuse,
+   so the synthetic figure was optimistic and the "17 ms residual" was really extra DRAM time.
+   These counters time the actual step. */
+#include <time.h>
+double g_t_attn, g_t_mlp, g_t_head, g_t_norm;
+static double qnow(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                           return ts.tv_sec + ts.tv_nsec * 1e-9; }
+#define TICK(v) double v = qnow()
+#define TOCK(acc, v) (acc) += qnow() - (v)
 
 const unsigned char *q8_slice_at(const unsigned char *base, int idx, long elems) {
     return base ? base + (size_t)idx * (size_t)((elems / 32) * 34) : (const unsigned char *)0;
@@ -423,6 +435,7 @@ int qwen2_step(const QW2 *m, QW2Cache *c, int token, int pos, float *logits) {
     else memcpy(x, m->embed + (size_t)token * D, sizeof(float) * D);
 
     for (int l = 0; l < L; l++) {
+        TICK(t_a);
         float *kc = c->l[l].k + (size_t)pos * c->kv_dim;
         float *vc = c->l[l].v + (size_t)pos * c->kv_dim;
         rmsnorm(xn, x, m->ln1 + (size_t)l * D, D, m->rms_eps);
@@ -470,16 +483,21 @@ int qwen2_step(const QW2 *m, QW2Cache *c, int token, int pos, float *logits) {
         }
         matmul_wx_auto(h, ao, m->Wo + (size_t)l * D * D, q8_slice_at(m->q_Wo, l, (long)D * D), H * HD, D);
         for (int j = 0; j < D; j++) x[j] += h[j];
+        TOCK(g_t_attn, t_a);
 
+        TICK(t_m);
         rmsnorm(xn, x, m->ln2 + (size_t)l * D, D, m->rms_eps);
         matmul_wx_auto(g, xn, m->Wg + (size_t)l * F * D, q8_slice_at(m->q_Wg, l, (long)F * D), D, F);
         matmul_wx_auto(h, xn, m->Wu + (size_t)l * F * D, q8_slice_at(m->q_Wu, l, (long)F * D), D, F);
         for (int j = 0; j < F; j++) g[j] = silu(g[j]) * h[j];
         matmul_wx_auto(h, g, m->Wd + (size_t)l * D * F, q8_slice_at(m->q_Wd, l, (long)D * F), F, D);
         for (int j = 0; j < D; j++) x[j] += h[j];
+        TOCK(g_t_mlp, t_m);
     }
+    TICK(t_h);
     rmsnorm(xn, x, m->norm, D, m->rms_eps);
     matmul_wx_auto(logits, xn, m->embed, m->q_embed, D, V);
+    TOCK(g_t_head, t_h);
     free(x); free(xn); free(q); free(h); free(g); free(ao); free(sc);
     return 0;
 }
