@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""record_hf_qwen3_full.py — the FULL 48-layer baseline for Qwen3-30B-A3B. Run on a big-RAM box.
+
+Records, from the published checkpoint:
+  * logits for a fixed set of prompts (argmax agreement is the Tier-C quality target);
+  * per-layer intermediates for ONE short prompt (the block-by-block debugging target);
+  * the ROUTING TRACE — top-8 selections and weights, every layer, every token. This is the
+    analogue of gpt2-moe's `sel`: the artifact a Tier-B layout must leave unchanged, and the
+    strongest single check this port will have.
+
+MEMORY. The weights at bf16 are 61 GB; at fp32 they would be 122 GB. This loads bf16 and therefore
+computes in bf16 — which is the honest baseline for a machine that cannot hold the fp32 model. The
+intermediates for a 5-token prompt are a few MB because T is small; it is the WEIGHTS that decide
+which machine can run this, not the recording.
+
+RECORD ONCE. If a gate fails later, fix the code — do not regenerate this file to make a test pass.
+The script runs the model twice and refuses to write unless both runs agree bit for bit.
+"""
+import argparse, json, sys
+from pathlib import Path
+import numpy as np
+import torch
+
+INTERMEDIATE_SITES = ("input_layernorm", "self_attn.q_proj", "self_attn.k_proj",
+                      "self_attn.v_proj", "self_attn.q_norm", "self_attn.k_norm",
+                      "self_attn", "post_attention_layernorm", "mlp.gate", "mlp")
+
+PROMPTS = [
+    "The capital of France is",
+    "def fibonacci(n):",
+    "In 1929, the stock market",
+    "Explain why the sky is blue in one sentence.",
+]
+
+def capture(model, tok, prompt, layers, want_intermediates):
+    ids = tok(prompt, return_tensors="pt").input_ids
+    rec, sites = {}, []
+    handles = []
+    def hook(name):
+        def fn(mod, inp, out):
+            o = out[0] if isinstance(out, (tuple, list)) else out
+            if torch.is_tensor(o):
+                rec[name] = o.detach().float().to("cpu").numpy().copy()
+        return fn
+    if want_intermediates:
+        for i in range(layers):
+            for sub in INTERMEDIATE_SITES:
+                mod = model.model.layers[i]
+                ok = True
+                for part in sub.split("."):
+                    if not hasattr(mod, part): ok = False; break
+                    mod = getattr(mod, part)
+                if not ok:
+                    continue
+                handles.append(mod.register_forward_hook(hook(f"L{i}.{sub}")))
+                sites.append(f"L{i}.{sub}")
+    with torch.no_grad():
+        out = model(ids)
+    for h in handles:
+        h.remove()
+    logits = out.logits.float().to("cpu").numpy()
+    # routing trace derived from the router logits with Qwen3's documented rule
+    if want_intermediates:
+        for i in range(layers):
+            key = f"L{i}.mlp.gate"
+            if key not in rec:
+                continue
+            lg = torch.from_numpy(rec[key]).float()
+            p = torch.softmax(lg, dim=-1)
+            tv, ti = torch.topk(p, 8, dim=-1)
+            rec[f"L{i}.top8"] = ti.numpy().astype(np.int64)
+            rec[f"L{i}.top8_w"] = (tv / tv.sum(-1, keepdim=True)).numpy().astype(np.float32)
+    return ids[0].numpy().astype(np.int64), logits, rec, sites
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="weights/qwen3-30b-a3b")
+    ap.add_argument("--out", default="data/traces/qwen3_30b_a3b_full.npz")
+    ap.add_argument("--layers", type=int, default=None)
+    ap.add_argument("--intermediate-prompt", default=PROMPTS[0])
+    args = ap.parse_args()
+
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    torch.set_grad_enabled(False)
+    tok = AutoTokenizer.from_pretrained(args.model)
+    print("loading bf16 (61 GB) — this is the step that needs the big machine", flush=True)
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16,
+                                                 low_cpu_mem_usage=True)
+    model.eval()
+    L = args.layers or model.config.num_hidden_layers
+    print(f"loaded: {L} layers, dtype {next(model.parameters()).dtype}", flush=True)
+
+    # pass 1: intermediates + routing trace for one short prompt
+    ids, logits, rec, sites = capture(model, tok, args.intermediate_prompt, L, True)
+    print(f"  intermediates: {len(sites)} sites, {len(rec)} arrays", flush=True)
+    trace = {f"L{i}.top8": rec[f"L{i}.top8"] for i in range(L) if f"L{i}.top8" in rec}
+    if len(trace) != L:
+        raise SystemExit(f"routing trace incomplete: {len(trace)}/{L} layers")
+
+    # pass 2: determinism. Same prompt, same weights — must agree bit for bit.
+    ids2, logits2, rec2, _ = capture(model, tok, args.intermediate_prompt, L, True)
+    if not (np.array_equal(ids, ids2) and np.array_equal(logits, logits2)):
+        raise SystemExit("NOT DETERMINISTIC: two runs of the same prompt differ. "
+                         "A baseline that is not reproducible is not a baseline.")
+    print("  determinism: two runs bit-identical", flush=True)
+
+    # all prompts: logits only
+    ids_by_prompt, logits_by_prompt = {"p0": ids}, {"p0": logits}
+    for k, p in enumerate(PROMPTS[1:], 1):
+        i2, l2, _, _ = capture(model, tok, p, L, False)
+        ids_by_prompt[f"p{k}"] = i2; logits_by_prompt[f"p{k}"] = l2
+        print(f"  prompt p{k}: {len(i2)} tokens, argmax {int(l2[0, -1].argmax())}", flush=True)
+
+    payload = dict(rec)
+    payload["logits_p0"] = logits
+    payload["input_ids_p0"] = ids
+    for k in ids_by_prompt:
+        payload[f"input_ids_{k}"] = ids_by_prompt[k]
+        payload[f"logits_{k}"] = logits_by_prompt[k]
+    payload["prompts"] = np.array(json.dumps(PROMPTS))
+    payload["meta"] = np.array(json.dumps({
+        "model": "Qwen/Qwen3-30B-A3B", "dtype": "bfloat16", "layers": L,
+        "intermediate_prompt": args.intermediate_prompt,
+        "note": "baseline: logits, per-layer intermediates, routing trace. Do not regenerate."}))
+    out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out, **payload)
+    print(f"wrote {out} ({out.stat().st_size/1e6:.1f} MB, {len(payload)} arrays)")
+    print("B3 COMPLETE")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
