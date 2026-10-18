@@ -24,7 +24,8 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = ROOT / "weights/qwen3-30b-a3b"
 OUT = ROOT / "data/traces/qwen3_30b_a3b_shard1.npz"
-NLAYERS = 2
+NLAYERS = 1   # one layer is enough to gate the blocks, and halving it halves the peak
+              # memory when the 128 experts are folded into the fused runtime layout
 PROMPT = "The capital of France is"
 
 def main():
@@ -35,9 +36,29 @@ def main():
     cfg = AutoConfig.from_pretrained(MODEL)
     cfg.num_hidden_layers = NLAYERS
     cfg.tie_word_embeddings = False
-    model = AutoModelForCausalLM.from_config(cfg).eval()
+    # FORCE fp32. `from_config` honours the config's `torch_dtype: bfloat16`, and the first
+    # recording was therefore bf16-precision: q_proj disagreed with an fp32 reference by 3.4e-03,
+    # which is bf16 rounding, not a bug. The port computes in fp32, so the target must too.
+    model = AutoModelForCausalLM.from_config(cfg, torch_dtype=torch.float32).eval()
     sd = load_file(str(MODEL / "model-00001-of-00016.safetensors"))
     # keep only what this truncated model has, and report what is missing
+    # THE CHECKPOINT AND THE RUNTIME DISAGREE ON EXPERT LAYOUT, and filtering by key name
+    # silently dropped every expert weight: the checkpoint ships one tensor per expert
+    # (`experts.N.gate_proj.weight`), while transformers 5.x keeps them FUSED
+    # (`experts.gate_up_proj (128,1536,2048)`, `experts.down_proj (128,2048,768)`).
+    # The first recording therefore had randomly-initialised experts and an `mlp` target with
+    # peak 0.012 where the true output is ~1.9 — plausible-looking garbage. Fold them explicitly.
+    import numpy as _np
+    for i in range(NLAYERS):
+        gu = _np.stack([_np.concatenate([sd[f"model.layers.{i}.mlp.experts.{e}.gate_proj.weight"].float().numpy(),
+                                         sd[f"model.layers.{i}.mlp.experts.{e}.up_proj.weight"].float().numpy()], 0)
+                        for e in range(cfg.num_experts)])
+        sd[f"model.layers.{i}.mlp.experts.gate_up_proj"] = torch.from_numpy(gu)
+        del gu
+        dn = _np.stack([sd[f"model.layers.{i}.mlp.experts.{e}.down_proj.weight"].float().numpy()
+                        for e in range(cfg.num_experts)])
+        sd[f"model.layers.{i}.mlp.experts.down_proj"] = torch.from_numpy(dn)
+        del dn
     want = set(model.state_dict().keys())
     have = {k: v for k, v in sd.items() if k in want}
     missing = sorted(want - set(have))
