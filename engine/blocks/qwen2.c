@@ -40,8 +40,11 @@ int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits) {
     float *gg = malloc(sizeof(float) * (size_t)T * (F > D ? F : D));
     if (!x || !xn || !q || !k || !vv || !ao || !sc || !hh || !gg) return -2;
 
-    for (int t = 0; t < T; t++)
-        memcpy(x + (size_t)t * D, m->embed + (size_t)tokens[t] * D, sizeof(float) * D);
+    for (int t = 0; t < T; t++) {
+        if (m->q_embed) q8_dequant_row(q8_slice_at(m->q_embed, tokens[t], (long)D),
+                                       x + (size_t)t * D, D);
+        else memcpy(x + (size_t)t * D, m->embed + (size_t)tokens[t] * D, sizeof(float) * D);
+    }
 
     for (int l = 0; l < L; l++) {
         /* ---- attention ---- */
@@ -106,7 +109,7 @@ int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits) {
     /* final norm + tied unembedding */
     for (int t = 0; t < T; t++) {
         rmsnorm(xn + (size_t)t * D, x + (size_t)t * D, m->norm, D, m->rms_eps);
-        matmul_wx(logits + (size_t)t * V, xn + (size_t)t * D, m->embed, D, V);
+        matmul_wx_auto(logits + (size_t)t * V, xn + (size_t)t * D, m->embed, m->q_embed, D, V);
     }
     free(x); free(xn); free(q); free(k); free(vv); free(ao); free(sc); free(hh); free(gg);
     return 0;
@@ -184,6 +187,25 @@ static uint64_t rd64(const unsigned char *p) {
 
 typedef struct { char name[64]; uint64_t off, len; uint32_t dims[4]; int rank, dtype; } QT;
 
+/* `dtype` in a tensor record is an INDEX INTO THE FILE'S ENCODING TABLE, not a convention.
+ * Assuming 0 == f32 held only while f32 happened to be the first encoding written; once the
+ * embedding was quantized first, the table became [q8_0, f32] and every f32 tensor read as
+ * quantized. The meaning is per-file, so it must be looked up. */
+#define MAX_ENC 8
+static int g_enc_isq8[MAX_ENC];
+
+static void parse_encodings(const unsigned char *img, uint64_t off, uint32_t n) {
+    size_t o = (size_t)off;
+    for (uint32_t i = 0; i < n && i < MAX_ENC; i++) {
+        o += 4;                                  /* id */
+        int kind = img[o++], scalar = img[o++];
+        o += 4 + 3;                              /* group, block, sub, flags, align */
+        uint16_t nl = (uint16_t)(img[o] | (img[o + 1] << 8)); o += 2 + nl;
+        g_enc_isq8[i] = (kind == 1 && scalar == 3);
+    }
+}
+static int dtype_is_q8(int dtype) { return (dtype >= 0 && dtype < MAX_ENC) ? g_enc_isq8[dtype] : -1; }
+
 static const unsigned char *find_any(const QT *t, int n, const unsigned char *base, uint64_t od,
                                     const char *nm, int *dtype) {
     for (int i = 0; i < n; i++)
@@ -197,7 +219,7 @@ static const unsigned char *find_any(const QT *t, int n, const unsigned char *ba
 static const float *find_q(const QT *t, int n, const unsigned char *base, uint64_t od, const char *nm) {
     for (int i = 0; i < n; i++)
         if (!strcmp(t[i].name, nm)) {
-            if (t[i].dtype != 0) return NULL;   /* not f32 in this file */
+            if (dtype_is_q8(t[i].dtype)) return NULL;   /* not f32 in this file */
             return (const float *)(base + od + t[i].off);
         }
     return NULL;
@@ -216,6 +238,7 @@ int qwen2_load_v4(QW2 *m, const char *path, void **map, size_t *maplen) {
 
     const uint32_t nt = rd32(img + 16), nb = rd32(img + 20);
     const uint64_t ot = rd64(img + 40), ob = rd64(img + 48), od = rd64(img + 64);
+    parse_encodings(img, rd64(img + 32), rd32(img + 28));
 
     /* ---- tensor table (records follow a u32 count: SPEC §5) ---- */
     QT *t = calloc(nt ? nt : 1, sizeof *t);
@@ -266,10 +289,13 @@ int qwen2_load_v4(QW2 *m, const char *path, void **map, size_t *maplen) {
     }
 
     /* ---- geometry cross-check against the tensors themselves ---- */
-    const float *embed = find_q(t, nt, img, od, "embed");
-    /* existence check only: these may be f32 OR Q8, so the f32-only finder would report a
-       quantized file as missing its core tensors. */
-    if (!embed || !find_any(t, nt, img, od, "Wq", NULL) || !find_any(t, nt, img, od, "Wk", NULL)) {
+    /* embed may be f32 or Q8: the tied head is the biggest single tensor in the file. */
+    int embed_dt = 0;
+    const unsigned char *embed_p = find_any(t, nt, img, od, "embed", &embed_dt);
+    const float *embed = (embed_p && dtype_is_q8(embed_dt) == 0) ? (const float *)embed_p : NULL;
+    if (embed_p && dtype_is_q8(embed_dt) != 0) m->q_embed = embed_p;
+    m->embed = embed;
+    if (!embed_p || !find_any(t, nt, img, od, "Wq", NULL) || !find_any(t, nt, img, od, "Wk", NULL)) {
         fprintf(stderr, "v4: missing core tensors\n"); goto bad;
     }
     m->vocab = (int)t[0].dims[0];
@@ -284,7 +310,6 @@ int qwen2_load_v4(QW2 *m, const char *path, void **map, size_t *maplen) {
         goto bad;
     }
 
-    m->embed = embed;
     m->norm = find_q(t, nt, img, od, "norm");
     m->ln1  = find_q(t, nt, img, od, "ln1");
     m->ln2  = find_q(t, nt, img, od, "ln2");
@@ -304,7 +329,7 @@ int qwen2_load_v4(QW2 *m, const char *path, void **map, size_t *maplen) {
             int dt = 0;
             const unsigned char *p = find_any(t, nt, img, od, tab[k].nm, &dt);
             if (!p) { fprintf(stderr, "v4: missing %s\n", tab[k].nm); goto bad; }
-            if (dt == 0) { *tab[k].f = (const float *)p; *tab[k].q = NULL; }
+            if (dtype_is_q8(dt) == 0) { *tab[k].f = (const float *)p; *tab[k].q = NULL; }
             else {
                 *tab[k].f = NULL; *tab[k].q = p;     /* unused when quantized */
                 m->quantized = 1;
@@ -324,9 +349,27 @@ int qwen2_load_v4(QW2 *m, const char *path, void **map, size_t *maplen) {
             }
         }
     }
-    if (!m->norm || !m->ln1 || !m->ln2 || !m->bq || !m->bk || !m->bv ||
-        !(m->Wo || m->q_Wo) || !(m->Wg || m->q_Wg) || !(m->Wu || m->q_Wu) ||
-        !(m->Wd || m->q_Wd)) { fprintf(stderr, "v4: missing tensor(s)\n"); goto bad; }
+    {
+        const char *miss[12]; int nm = 0;
+        if (!m->norm) miss[nm++] = "norm";
+        if (!m->ln1) miss[nm++] = "ln1";
+        if (!m->ln2) miss[nm++] = "ln2";
+        if (!m->bq) miss[nm++] = "bq";
+        if (!m->bk) miss[nm++] = "bk";
+        if (!m->bv) miss[nm++] = "bv";
+        if (!(m->Wo || m->q_Wo)) miss[nm++] = "Wo";
+        if (!(m->Wg || m->q_Wg)) miss[nm++] = "Wg";
+        if (!(m->Wu || m->q_Wu)) miss[nm++] = "Wu";
+        if (!(m->Wd || m->q_Wd)) miss[nm++] = "Wd";
+        if (!(m->embed || m->q_embed)) miss[nm++] = "embed";
+        if (nm) {
+            /* name them: "missing tensor(s)" sent me looking at the wrong field once already */
+            fprintf(stderr, "v4: missing tensor(s):");
+            for (int i = 0; i < nm; i++) fprintf(stderr, " %s", miss[i]);
+            fprintf(stderr, "\n");
+            goto bad;
+        }
+    }
 
     free(t);
     *map = img; *maplen = fsz;
@@ -376,7 +419,8 @@ int qwen2_step(const QW2 *m, QW2Cache *c, int token, int pos, float *logits) {
     float *g = malloc(sizeof(float) * (F > D ? F : D));
     float *ao = malloc(sizeof(float) * D), *sc = malloc(sizeof(float) * (size_t)c->maxT);
     if (!x || !xn || !q || !h || !g || !ao || !sc) return -2;
-    memcpy(x, m->embed + (size_t)token * D, sizeof(float) * D);
+    if (m->q_embed) q8_dequant_row(q8_slice_at(m->q_embed, token, (long)D), x, D);
+    else memcpy(x, m->embed + (size_t)token * D, sizeof(float) * D);
 
     for (int l = 0; l < L; l++) {
         float *kc = c->l[l].k + (size_t)pos * c->kv_dim;
@@ -435,7 +479,7 @@ int qwen2_step(const QW2 *m, QW2Cache *c, int token, int pos, float *logits) {
         for (int j = 0; j < D; j++) x[j] += h[j];
     }
     rmsnorm(xn, x, m->norm, D, m->rms_eps);
-    matmul_wx(logits, xn, m->embed, D, V);
+    matmul_wx_auto(logits, xn, m->embed, m->q_embed, D, V);
     free(x); free(xn); free(q); free(h); free(g); free(ao); free(sc);
     return 0;
 }

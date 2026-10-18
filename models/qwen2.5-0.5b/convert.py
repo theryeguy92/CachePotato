@@ -49,7 +49,10 @@ def main():
     def stack(nm):
         return np.stack([sd[f"model.layers.{l}.{nm}"].astype(np.float32) for l in range(L)])
 
-    add("embed", sd["model.embed_tokens.weight"], V.R_EMBED)
+    # The tied head is 151936 x 896 and is 27% of the model: quantizing it is the largest
+    # single byte saving left. It is also the embedding table, so the LOOKUP path must
+    # dequantize one row per token.
+    add("embed", sd["model.embed_tokens.weight"], V.R_EMBED, enc="q8_0")
     add("norm", sd["model.norm.weight"], V.R_NORM)
     add("ln1", stack("input_layernorm.weight"), V.R_NORM)
     add("ln2", stack("post_attention_layernorm.weight"), V.R_NORM)

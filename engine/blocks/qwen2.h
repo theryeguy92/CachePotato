@@ -16,7 +16,7 @@ typedef struct {
        f32 pointer is authoritative. Per-layer slicing is done with q8_slice_at() because a
        multi-layer quantized group is ONE tensor: layer l starts l blocks in, and passing the
        tensor base for every layer is a silent bug this project has already made once. */
-    const unsigned char *q_Wq, *q_Wk, *q_Wv, *q_Wo, *q_Wg, *q_Wu, *q_Wd;
+    const unsigned char *q_Wq, *q_Wk, *q_Wv, *q_Wo, *q_Wg, *q_Wu, *q_Wd, *q_embed;
     int quantized;
 } QW2;
 
