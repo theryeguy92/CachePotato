@@ -46,6 +46,7 @@ def main():
     print(f"  cosine   {cos:.8f}")
 
     route = np.fromfile(prefix + ".route", dtype="<i4").reshape(L, T, -1)
+    router = np.fromfile(prefix + ".router", dtype="<f4").reshape(L, T, -1)
     bad_layers = []
     for l in range(L):
         if f"L{l}.mlp.gate" not in z:
@@ -100,18 +101,6 @@ def main():
             print(f"  drift    worst router correlation layer {lw} at {cw:.5f}, "
                   f"its mass {mw*100:.3f}%  -> {'tie cluster, not a bug' if mw > 0.95 else 'INVESTIGATE'}")
 
-    router = np.fromfile(prefix + ".router", dtype="<f4").reshape(L, T, -1)
-    worst = None
-    for l in range(L):
-        k = f"L{l}.mlp.gate"
-        if k not in z:
-            continue
-        a, b = router[l].ravel().astype(np.float64), z[k].astype(np.float64).ravel()
-        c = float(np.corrcoef(a, b)[0, 1]) if a.std() > 0 and b.std() > 0 else float("nan")
-        if worst is None or c < worst[1]:
-            worst = (l, c)
-    if worst:
-        print(f"  router   worst layer correlation {worst[1]:.5f} (layer {worst[0]})")
     print()
     # THE BAR IS SET TO CATCH STRUCTURAL ERRORS, NOT TO RANK QUANTIZATION NOISE. Argmax must be
     # exact on every token: that is the output-level claim and a wrong block cannot satisfy it.
