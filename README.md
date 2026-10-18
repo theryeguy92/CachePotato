@@ -209,7 +209,10 @@ floor is 8–17%, and the effect is content-dependent across the three document 
 
 ## Build & run
 
-The engine needs only a C11 compiler and `libm` — no BLAS, no Python at runtime.
+The engine needs only a C11 compiler, `libm` and **POSIX threads** — no BLAS, no Python at
+runtime, no third-party libraries. (pthread was added on 2026-10-17 for the bit-identical
+threaded kernels; it is a platform C library, not a package, but it is a real link
+dependency and the rule says so here rather than leaving the claim quietly false.)
 
 ```sh
 make          # builds build/cachepotato (engine) and build/train (C trainer)
