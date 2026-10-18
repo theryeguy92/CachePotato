@@ -4,7 +4,7 @@
 
 # CachePotato
 
-**Running a spare language model on a "potato". Co-designing a sparse language model and the memory-hierarchy engine.**
+**Running a sparse language model on a "potato". Co-designing a sparse language model and the memory-hierarchy engine.**
 
 [![Language](https://img.shields.io/badge/language-C11-555555?style=flat-square&logo=c&logoColor=white)](#build--run)
 [![Dependencies](https://img.shields.io/badge/third--party%20deps-none-brightgreen?style=flat-square)](#build--run)
@@ -22,10 +22,13 @@
 
 ---
 
-## Prior art, and credit where it is due
+## Influence and credit for the project
+
+First I would like to thank contributors and developers for `Colibri` and `Hummingbird`, they influenced
+this project and inspired me to work on this project. Please check them out.
 
 The idea of treating SSD, RAM and VRAM as one managed hierarchy and streaming MoE expert
-weights from disk is **not original to this project**. Two projects came first and shaped it:
+weights from disk is **not original to this project**.
 
 - **[Colibri](https://github.com/JustVugg/colibri)** — a highly specialized C engine that runs
   very large MoE models (hundreds of billions of parameters) on consumer machines by streaming
@@ -39,20 +42,15 @@ weights from disk is **not original to this project**. Two projects came first a
 **What is shared.** The core thesis — a zero-dependency-ish C runtime that pages expert weights
 under a RAM budget so a model larger than memory can still run — is shared with both.
 
-**What this project adds, and what it does not claim.** CachePotato bets on a different
+**What this project adds.** CachePotato bets on a different
 *mechanism*: it treats the **on-disk layout of the weights** as a compilation target (expert
 ordering, region grouping, alignment) rather than only as a runtime caching policy, and it
-insists that such a reordering be **proved a symmetry** — routing bit-identical, logits exact —
+insists that such a reordering be **proved a symmetry**: routing bit-identical, logits exact —
 before it is relied on. Alongside that, the project's port contract requires every model to ship
 an *independent* reference implementation and a recorded baseline that must never be regenerated
-to make a failing test pass. Those two things — layout-as-compilation with a proven symmetry, and
-verification structured to catch a shared misunderstanding — are the contributions worth
+to make a failing test pass. Those two things: layout-as-compilation with a proven symmetry, and
+verification structured to catch a shared misunderstanding are the contributions worth
 defending.
-
-**What this project does not claim:** novelty of the memory-hierarchy idea, breadth of stack, or
-production readiness. Hummingbird is substantially further along as a product (frontends,
-server, backends, a real MoE adapter); this project is further along only on provable correctness
-for what it does run.
 
 ---
 
@@ -170,7 +168,7 @@ framework that produced the model; and a `verify/gate.py`. The independence is t
 2026-09-25 two implementations agreed with each other, disagreed with the frozen spec, and every
 gate passed. A reference that shares code with the thing it checks cannot catch that.
 
-### The two ports
+### The two ports (More to come soon)
 
 | port | tier | size | what it proves |
 |---|---|---|---|
@@ -186,7 +184,7 @@ bias), **RoPE**, **grouped-query attention** (14 query heads against 2 KV heads)
 FFN** (SwiGLU, three matrices). It also required a Qwen2 tokenizer, which is not GPT-2's: it is a
 Unicode-aware pre-tokenizer plus BPE plus special tokens.
 
-### Verification, in the order it was built
+### Verification & the order it was built
 
 Every step is a gate in [`tools/run_gates.sh`](tools/run_gates.sh) (16 gates, all passing).
 
@@ -206,7 +204,7 @@ Recording the per-layer intermediates *before* writing any C was the single most
 with only final logits, a wrong RoPE is indistinguishable from a wrong attention block twenty-four
 layers later. With intermediates, every failure names its block.
 
-### What it measured, and what changed because of it
+### What it measured, and what changed
 
 **The binding resource is bytes, not FLOPs.** Single-token decode is a GEMV: every weight is read
 once and used once. Qwen2.5-0.5B at fp32 reads **2.52 GB per token** and ran at **2.90 tok/s =
