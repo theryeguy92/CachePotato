@@ -37,7 +37,7 @@ def main():
     bad += bool(missing)
 
     # 3. weights are a distribution, and the trace agrees with the router logits
-    sum_err = 0.0; set_mismatch = []; w_err = 0.0
+    sum_err = 0.0; set_mismatch = []; w_err = 0.0; ties = 0
     for i in range(L):
         k8, kw, kg = f"L{i}.top8", f"L{i}.top8_w", f"L{i}.mlp.gate"
         if k8 not in keys:
@@ -47,15 +47,31 @@ def main():
         if kg in keys:
             lg = z[kg]
             p = np.exp(lg - lg.max(-1, keepdims=True)); p /= p.sum(-1, keepdims=True)
-            order = np.argsort(-p, axis=-1, kind="stable")[:, :8]
-            for a, b in zip(order.tolist(), z[k8].tolist()):
-                if set(a) != set(b):
+            # TIES ARE EXPECTED, NOT AN ERROR. Router logits are recorded in bf16 (~8 mantissa
+            # bits), so at 128 experts two probabilities can be EXACTLY equal — and then "the top
+            # 8" has no single answer. A selected set is valid if every chosen expert is at least
+            # as likely as the 8th largest, and no unchosen expert is strictly more likely than
+            # that threshold. Demanding one exact set called 5 of 48 layers broken while the
+            # recorded WEIGHTS matched softmax to 1e-7 — the giveaway that the indices were right.
+            kth = np.sort(p, axis=-1)[:, -8]
+            for ti in range(p.shape[0]):
+                rec = set(z[k8][ti].tolist())
+                thr = kth[ti]
+                chosen_ok = all(p[ti, j] >= thr - 1e-12 for j in rec)
+                above = {j for j in range(p.shape[1]) if p[ti, j] > thr + 1e-12}
+                unchosen_ok = above <= rec
+                n_above_sel = sum(1 for j in rec if p[ti, j] > thr + 1e-12)
+                if not (chosen_ok and unchosen_ok) or n_above_sel != len(above):
                     set_mismatch.append(i); break
+                if len(above) < len(rec):
+                    ties += 1
             got = np.take_along_axis(p, z[k8], -1)
             want = got / got.sum(-1, keepdims=True)
             w_err = max(w_err, float(np.abs(want - w).max()))
     print(f"  routing weights sum to 1 (max |err|): {sum_err:.2e}")
-    print(f"  trace vs recorded router logits: {'AGREE (all layers)' if not set_mismatch else f'MISMATCH in {set_mismatch[:5]}'}")
+    print(f"  trace vs recorded router logits: "
+          f"{'AGREE (all layers)' if not set_mismatch else f'MISMATCH in {set_mismatch[:5]}'}"
+          + (f"  [{ties} selections resolved by a tie]" if ties else ""))
     print(f"  weights vs softmax+renormalise (max |err|): {w_err:.2e}")
     bad += (sum_err > 1e-4) or bool(set_mismatch) or (w_err > 1e-4)
 
