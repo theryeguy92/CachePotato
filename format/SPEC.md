@@ -216,10 +216,19 @@ fields, then kind-specific fields. Blocks appear in execution order.
 | `0x01` | `embedding` | token table | — |
 | `0x02` | `norm` | weight, bias | `eps_bits` (f32 bit pattern), `kind` (0 layernorm, 1 rmsnorm) |
 | `0x10` | `attention` | Wq,bq,Wk,bk,Wv,bv,Wo,bo | `n_heads`, `n_kv_heads`, `head_dim`, `rope_theta_bits`, `qk_norm`, `sliding_window` |
-| `0x11` | `dense_ffn` | W1,b1,W2,b2 | `act` (0 gelu_tanh, 1 silu, 2 relu2), `d_ff`, `dense_index`, `dense_packed` |
+| `0x11` | `dense_ffn` | **`gated == 0`**: W1,b1,W2,b2. **`gated == 1`**: Wg,Wu,Wd (no biases) | `act` (0 gelu_tanh, 1 silu, 2 relu2), `d_ff`, `dense_index`, `dense_packed`, **`gated`** |
 | `0x20` | `moe` | router W,b; shared W1,b1,W2,b2; routed expert blocks | `n_experts`, `top_k`, `scoring` (0 softmax, 1 sigmoid), `norm_topk_prob`, `routed_scaling_bits`, `latent_size`, `n_shared`, `shared_overlap`, `group_limited` (`n_group`, `topk_group`) |
 | `0x21` | `moe_latent` | as `moe`, plus down/up latent projections | `latent_size` ≠ 0 and the latent projections present |
 | `0x30` | `ssm` (mamba) | `in_proj`, `out_proj`, conv, `A_log`, `D`, `dt_bias` | `n_heads`, `head_dim`, `state_size`, `conv_kernel`, `chunk_size`, `dt_min_bits`, `dt_max_bits` |
+
+**`gated` (added 2026-10-17, for the Qwen2.5 port).** A gated FFN computes
+`down(act(gate(x)) * up(x))` — three matrices, and the GLU's two halves are multiplied
+elementwise before the down projection. It is an explicit parameter rather than something a
+loader infers from a tensor's first dimension: the format's value is that a block says what it
+is, and shape-based inference reintroduces exactly the implicit convention that produced the
+v4 payload-order bug. When `gated == 1`, `input_refs` is `[Wg, Wu, Wd]` and carries **no bias
+tensors** — a gated FFN in this spec has no biases, and a model that has them must use
+`gated == 0` or a future kind. A loader that sees `gated == 1` with four refs must refuse.
 
 `dense_packed` exists because a model can legitimately hold *packed dense FFN weights on a
 layer at a MoE position* — weights that exist in the checkpoint and are never executed, only
