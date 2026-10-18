@@ -142,3 +142,142 @@ int qwen2_load_blob(QW2 *m, const char *path, float **owned) {
     m->Wd = p; p += (long)L * D * F;
     return 0;
 }
+
+/* ---------------------------------------------------------------- v4 loader
+ *
+ * Reads a CPW1 v4 file and fills QW2 from its TABLES — the model's geometry (heads, KV heads,
+ * head_dim, rope theta, eps) comes from the block params, not from constants in this file. That
+ * is the difference between an engine that runs a port and an engine that runs a model it was
+ * compiled for.
+ *
+ * Only raw f32 tensors are accepted here; a quantized tensor is refused rather than decoded into
+ * a layout, because QW2 indexes fp32 pointers. Q8 support for this path is a separate step.
+ */
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <stdint.h>
+
+#define KIND_ATTN 0x10
+#define KIND_DENSE 0x11
+#define KIND_NORM 0x02
+
+static uint32_t rd32(const unsigned char *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint64_t rd64(const unsigned char *p) {
+    uint64_t lo = rd32(p), hi = rd32(p + 4);
+    return lo | (hi << 32);
+}
+
+typedef struct { char name[64]; uint64_t off, len; uint32_t dims[4]; int rank, dtype; } QT;
+
+static const float *find_q(const QT *t, int n, const unsigned char *base, uint64_t od, const char *nm) {
+    for (int i = 0; i < n; i++)
+        if (!strcmp(t[i].name, nm)) {
+            if (t[i].dtype != 0) return NULL;   /* not f32 in this file */
+            return (const float *)(base + od + t[i].off);
+        }
+    return NULL;
+}
+
+int qwen2_load_v4(QW2 *m, const char *path, void **map, size_t *maplen) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { perror(path); return -1; }
+    struct stat st;
+    if (fstat(fd, &st)) { close(fd); return -1; }
+    size_t fsz = (size_t)st.st_size;
+    unsigned char *img = mmap(NULL, fsz, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (img == MAP_FAILED) { perror("mmap"); return -1; }
+    if (fsz < 88 || rd32(img) != 0x34575043u) { munmap(img, fsz); return -1; }
+
+    const uint32_t nt = rd32(img + 16), nb = rd32(img + 20);
+    const uint64_t ot = rd64(img + 40), ob = rd64(img + 48), od = rd64(img + 64);
+
+    /* ---- tensor table (records follow a u32 count: SPEC §5) ---- */
+    QT *t = calloc(nt ? nt : 1, sizeof *t);
+    if (!t) { munmap(img, fsz); return -2; }
+    size_t o = (size_t)ot;
+    uint32_t cnt = rd32(img + o); o += 4;
+    if (cnt != nt) { fprintf(stderr, "v4: tensor count %u != header %u\n", cnt, nt); goto bad; }
+    for (uint32_t i = 0; i < nt; i++) {
+        uint16_t nl = (uint16_t)(img[o] | (img[o + 1] << 8)); o += 2;
+        if (nl >= sizeof t[i].name) goto bad;
+        memcpy(t[i].name, img + o, nl); t[i].name[nl] = 0; o += nl;
+        t[i].dtype = (int)rd32(img + o); o += 4;
+        t[i].rank = img[o]; o += 1;
+        for (int d = 0; d < t[i].rank && d < 4; d++) { t[i].dims[d] = rd32(img + o); o += 4; }
+        o += 4 * (size_t)(t[i].rank > 4 ? 0 : 0);      /* dims already consumed above */
+        t[i].off = rd64(img + o); o += 8;
+        t[i].len = rd64(img + o); o += 8;
+        o += 4 + 2;
+    }
+
+    /* ---- block table: geometry from the file, not from constants ---- */
+    int n_heads = 0, n_kv = 0, hd = 0, seen_attn = 0, gated_seen = 0;
+    float theta = 0.0f, eps = 0.0f;
+    o = (size_t)ob;
+    uint32_t cntb = rd32(img + o); o += 4;
+    if (cntb != nb) { fprintf(stderr, "v4: block count %u != header %u\n", cntb, nb); goto bad; }
+    for (uint32_t i = 0; i < nb; i++) {
+        int kind = img[o]; o += 1;
+        o += 4;                                        /* layer index */
+        int nrefs = img[o]; o += 1 + 4 * (size_t)nrefs;
+        int npar = img[o]; o += 1;
+        uint32_t par[8] = {0};
+        for (int k = 0; k < npar && k < 8; k++) { par[k] = rd32(img + o); o += 4; }
+        if (kind == KIND_ATTN && !seen_attn) {
+            n_heads = (int)par[0]; n_kv = (int)par[1]; hd = (int)par[2];
+            memcpy(&theta, &par[3], 4);
+            seen_attn = 1;
+        } else if (kind == KIND_DENSE && npar >= 5 && par[4] == 1) {
+            gated_seen = 1;
+        } else if (kind == KIND_NORM && !eps) {
+            memcpy(&eps, &par[0], 4);
+        }
+    }
+    if (!seen_attn || !gated_seen) {
+        fprintf(stderr, "v4: not a Qwen2-shaped file (attention=%d gated_ffn=%d)\n",
+                seen_attn, gated_seen);
+        goto bad;
+    }
+
+    /* ---- geometry cross-check against the tensors themselves ---- */
+    const float *embed = find_q(t, nt, img, od, "embed");
+    const float *Wq = find_q(t, nt, img, od, "Wq");
+    const float *Wk = find_q(t, nt, img, od, "Wk");
+    if (!embed || !Wq || !Wk) { fprintf(stderr, "v4: missing core tensors\n"); goto bad; }
+    m->vocab = (int)t[0].dims[0];
+    for (uint32_t i = 0; i < nt; i++) if (!strcmp(t[i].name, "embed")) { m->vocab = (int)t[i].dims[0]; m->d_model = (int)t[i].dims[1]; }
+    for (uint32_t i = 0; i < nt; i++) if (!strcmp(t[i].name, "Wk")) m->n_layers = (int)t[i].dims[0];
+    m->n_heads = n_heads; m->n_kv = n_kv; m->head_dim = hd;
+    m->rope_theta = theta; m->rms_eps = eps;
+    for (uint32_t i = 0; i < nt; i++) if (!strcmp(t[i].name, "Wg")) m->d_ff = (int)t[i].dims[1];
+    if (n_heads * hd != m->d_model) {
+        fprintf(stderr, "v4: attention params say %d heads x %d = %d, but d_model is %d\n",
+                n_heads, hd, n_heads * hd, m->d_model);
+        goto bad;
+    }
+
+    m->embed = embed;
+    m->norm = find_q(t, nt, img, od, "norm");
+    m->ln1  = find_q(t, nt, img, od, "ln1");
+    m->ln2  = find_q(t, nt, img, od, "ln2");
+    m->Wq = Wq;  m->bq = find_q(t, nt, img, od, "bq");
+    m->Wk = Wk;  m->bk = find_q(t, nt, img, od, "bk");
+    m->Wv = find_q(t, nt, img, od, "Wv"); m->bv = find_q(t, nt, img, od, "bv");
+    m->Wo = find_q(t, nt, img, od, "Wo");
+    m->Wg = find_q(t, nt, img, od, "Wg");
+    m->Wu = find_q(t, nt, img, od, "Wu");
+    m->Wd = find_q(t, nt, img, od, "Wd");
+    if (!m->norm || !m->ln1 || !m->ln2 || !m->bq || !m->bk || !m->bv || !m->Wo ||
+        !m->Wg || !m->Wu || !m->Wd) { fprintf(stderr, "v4: missing tensor(s)\n"); goto bad; }
+
+    free(t);
+    *map = img; *maplen = fsz;
+    return 0;
+bad:
+    free(t); munmap(img, fsz); return -1;
+}

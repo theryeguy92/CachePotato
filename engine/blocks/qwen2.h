@@ -1,5 +1,6 @@
 #ifndef QWEN2_H
 #define QWEN2_H
+#include <stddef.h>
 /* Qwen2 forward: RMSNorm + RoPE + GQA + SwiGLU + tied unembedding. */
 typedef struct {
     int n_layers, d_model, n_heads, n_kv, head_dim, d_ff, vocab;
@@ -14,4 +15,6 @@ typedef struct {
 
 int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits);
 int qwen2_load_blob(QW2 *m, const char *path, float **owned);
+/* v4: geometry (heads, KV heads, head_dim, rope theta, eps) comes from the file's BLOCK TABLE. */
+int qwen2_load_v4(QW2 *m, const char *path, void **map, size_t *maplen);
 #endif
