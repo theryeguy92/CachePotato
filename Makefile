@@ -19,6 +19,12 @@ $(BUILD)/cachepotato: src/main.c $(ENGINE)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+# Qwen2.5 chat CLI. The v4 weight file is built separately (see models/qwen2.5-0.5b/MODEL.md).
+QWEN_SRC := tools/qwen_chat.c engine/blocks/qwen2.c engine/tokenizers/tokenizer.c \
+            engine/tokenizers/tokenizer_qwen.c engine/kernels/kernels.c engine/kernels/parallel.c
+$(BUILD)/qwen_chat: $(QWEN_SRC)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 $(BUILD)/train: $(TRAINER)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)

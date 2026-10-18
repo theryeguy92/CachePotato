@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 /* qwen_chat.c — a real conversation with Qwen2.5-0.5B through the engine.
  *
  * Prompt -> ChatML -> tokenize -> prefill (KV cache) -> greedy decode to <|im_end|>.
