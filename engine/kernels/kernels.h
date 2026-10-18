@@ -32,5 +32,8 @@ void  rmsnorm(float *out, const float *x, const float *g, int n, float eps);
 float silu(float x);
 void  rope_apply(float *q, float *k, int T, int n_q_heads, int n_kv_heads, int hd, float theta);
 void matmul_wx_q8(float *out, const float *x, const uint8_t *w, int n_in, int n_out);
+/* Same dispatch as matmul_xw_auto, for the W@x layout (every Qwen projection). */
+void matmul_wx_auto(float *out, const float *x, const float *w, const uint8_t *q8,
+                    int n_in, int n_out);
 
 #endif

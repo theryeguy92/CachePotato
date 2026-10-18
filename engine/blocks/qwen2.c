@@ -19,6 +19,10 @@
 
 #define MAX_T 4096
 
+const unsigned char *q8_slice_at(const unsigned char *base, int idx, long elems) {
+    return base ? base + (size_t)idx * (size_t)((elems / 32) * 34) : (const unsigned char *)0;
+}
+
 int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits) {
     const int D = m->d_model, H = m->n_heads, KV = m->n_kv, HD = m->head_dim;
     const int F = m->d_ff, V = m->vocab, L = m->n_layers;
@@ -44,9 +48,12 @@ int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits) {
         for (int t = 0; t < T; t++)
             rmsnorm(xn + (size_t)t * D, x + (size_t)t * D, m->ln1 + (size_t)l * D, D, m->rms_eps);
         for (int t = 0; t < T; t++) {
-            matmul_wx(q + (size_t)t * H * HD,  xn + (size_t)t * D, m->Wq + (size_t)l * D * D, D, H * HD);
-            matmul_wx(k + (size_t)t * KV * HD, xn + (size_t)t * D, m->Wk + (size_t)l * KV * HD * D, D, KV * HD);
-            matmul_wx(vv + (size_t)t * KV * HD, xn + (size_t)t * D, m->Wv + (size_t)l * KV * HD * D, D, KV * HD);
+            matmul_wx_auto(q + (size_t)t * H * HD,  xn + (size_t)t * D, m->Wq + (size_t)l * D * D,
+                           q8_slice_at(m->q_Wq, l, (long)D * D), D, H * HD);
+            matmul_wx_auto(k + (size_t)t * KV * HD, xn + (size_t)t * D, m->Wk + (size_t)l * KV * HD * D,
+                           q8_slice_at(m->q_Wk, l, (long)KV * HD * D), D, KV * HD);
+            matmul_wx_auto(vv + (size_t)t * KV * HD, xn + (size_t)t * D, m->Wv + (size_t)l * KV * HD * D,
+                           q8_slice_at(m->q_Wv, l, (long)KV * HD * D), D, KV * HD);
             for (int j = 0; j < H * HD; j++)  q[(size_t)t * H * HD + j]  += m->bq[(size_t)l * H * HD + j];
             for (int j = 0; j < KV * HD; j++) {
                 k[(size_t)t * KV * HD + j]  += m->bk[(size_t)l * KV * HD + j];
@@ -75,7 +82,8 @@ int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits) {
             }
         }
         for (int t = 0; t < T; t++) {
-            matmul_wx(hh, ao + (size_t)t * D, m->Wo + (size_t)l * D * D, H * HD, D);
+            matmul_wx_auto(hh, ao + (size_t)t * D, m->Wo + (size_t)l * D * D,
+                           q8_slice_at(m->q_Wo, l, (long)D * D), H * HD, D);
             for (int j = 0; j < D; j++) x[(size_t)t * D + j] += hh[j];
         }
 
@@ -83,11 +91,14 @@ int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits) {
         for (int t = 0; t < T; t++) {
             float *xt = x + (size_t)t * D;
             rmsnorm(xn + (size_t)t * D, xt, m->ln2 + (size_t)l * D, D, m->rms_eps);
-            matmul_wx(gg + (size_t)t * F, xn + (size_t)t * D, m->Wg + (size_t)l * F * D, D, F);
-            matmul_wx(hh + (size_t)t * F, xn + (size_t)t * D, m->Wu + (size_t)l * F * D, D, F);
+            matmul_wx_auto(gg + (size_t)t * F, xn + (size_t)t * D, m->Wg + (size_t)l * F * D,
+                           q8_slice_at(m->q_Wg, l, (long)F * D), D, F);
+            matmul_wx_auto(hh + (size_t)t * F, xn + (size_t)t * D, m->Wu + (size_t)l * F * D,
+                           q8_slice_at(m->q_Wu, l, (long)F * D), D, F);
             for (int j = 0; j < F; j++)
                 gg[(size_t)t * F + j] = silu(gg[(size_t)t * F + j]) * hh[(size_t)t * F + j];
-            matmul_wx(hh, gg + (size_t)t * F, m->Wd + (size_t)l * D * F, F, D);
+            matmul_wx_auto(hh, gg + (size_t)t * F, m->Wd + (size_t)l * D * F,
+                           q8_slice_at(m->q_Wd, l, (long)D * F), F, D);
             for (int j = 0; j < D; j++) xt[j] += hh[j];
         }
     }
@@ -173,6 +184,16 @@ static uint64_t rd64(const unsigned char *p) {
 
 typedef struct { char name[64]; uint64_t off, len; uint32_t dims[4]; int rank, dtype; } QT;
 
+static const unsigned char *find_any(const QT *t, int n, const unsigned char *base, uint64_t od,
+                                    const char *nm, int *dtype) {
+    for (int i = 0; i < n; i++)
+        if (!strcmp(t[i].name, nm)) {
+            if (dtype) *dtype = t[i].dtype;
+            return base + od + t[i].off;
+        }
+    return NULL;
+}
+
 static const float *find_q(const QT *t, int n, const unsigned char *base, uint64_t od, const char *nm) {
     for (int i = 0; i < n; i++)
         if (!strcmp(t[i].name, nm)) {
@@ -246,9 +267,11 @@ int qwen2_load_v4(QW2 *m, const char *path, void **map, size_t *maplen) {
 
     /* ---- geometry cross-check against the tensors themselves ---- */
     const float *embed = find_q(t, nt, img, od, "embed");
-    const float *Wq = find_q(t, nt, img, od, "Wq");
-    const float *Wk = find_q(t, nt, img, od, "Wk");
-    if (!embed || !Wq || !Wk) { fprintf(stderr, "v4: missing core tensors\n"); goto bad; }
+    /* existence check only: these may be f32 OR Q8, so the f32-only finder would report a
+       quantized file as missing its core tensors. */
+    if (!embed || !find_any(t, nt, img, od, "Wq", NULL) || !find_any(t, nt, img, od, "Wk", NULL)) {
+        fprintf(stderr, "v4: missing core tensors\n"); goto bad;
+    }
     m->vocab = (int)t[0].dims[0];
     for (uint32_t i = 0; i < nt; i++) if (!strcmp(t[i].name, "embed")) { m->vocab = (int)t[i].dims[0]; m->d_model = (int)t[i].dims[1]; }
     for (uint32_t i = 0; i < nt; i++) if (!strcmp(t[i].name, "Wk")) m->n_layers = (int)t[i].dims[0];
@@ -265,15 +288,45 @@ int qwen2_load_v4(QW2 *m, const char *path, void **map, size_t *maplen) {
     m->norm = find_q(t, nt, img, od, "norm");
     m->ln1  = find_q(t, nt, img, od, "ln1");
     m->ln2  = find_q(t, nt, img, od, "ln2");
-    m->Wq = Wq;  m->bq = find_q(t, nt, img, od, "bq");
-    m->Wk = Wk;  m->bk = find_q(t, nt, img, od, "bk");
-    m->Wv = find_q(t, nt, img, od, "Wv"); m->bv = find_q(t, nt, img, od, "bv");
-    m->Wo = find_q(t, nt, img, od, "Wo");
-    m->Wg = find_q(t, nt, img, od, "Wg");
-    m->Wu = find_q(t, nt, img, od, "Wu");
-    m->Wd = find_q(t, nt, img, od, "Wd");
-    if (!m->norm || !m->ln1 || !m->ln2 || !m->bq || !m->bk || !m->bv || !m->Wo ||
-        !m->Wg || !m->Wu || !m->Wd) { fprintf(stderr, "v4: missing tensor(s)\n"); goto bad; }
+    m->bq = find_q(t, nt, img, od, "bq");
+    m->bk = find_q(t, nt, img, od, "bk");
+    m->bv = find_q(t, nt, img, od, "bv");
+    /* The seven large matrices may be f32 or Q8_0, independently. Each tensor carries its own
+       encoding, so a file can mix them (e.g. quantized projections, exact embeddings). */
+    {
+        struct { const char *nm; const float **f; const unsigned char **q; } tab[] = {
+            {"Wq", &m->Wq, &m->q_Wq}, {"Wk", &m->Wk, &m->q_Wk},
+            {"Wv", &m->Wv, &m->q_Wv}, {"Wo", &m->Wo, &m->q_Wo},
+            {"Wg", &m->Wg, &m->q_Wg}, {"Wu", &m->Wu, &m->q_Wu},
+            {"Wd", &m->Wd, &m->q_Wd},
+        };
+        for (size_t k = 0; k < sizeof tab / sizeof tab[0]; k++) {
+            int dt = 0;
+            const unsigned char *p = find_any(t, nt, img, od, tab[k].nm, &dt);
+            if (!p) { fprintf(stderr, "v4: missing %s\n", tab[k].nm); goto bad; }
+            if (dt == 0) { *tab[k].f = (const float *)p; *tab[k].q = NULL; }
+            else {
+                *tab[k].f = NULL; *tab[k].q = p;     /* unused when quantized */
+                m->quantized = 1;
+                /* length must match the logical size: bytes-vs-elements has bitten twice */
+                for (uint32_t i = 0; i < nt; i++)
+                    if (!strcmp(t[i].name, tab[k].nm)) {
+                        long elems = 1;
+                        for (int d = 0; d < t[i].rank; d++) elems *= (long)t[i].dims[d];
+                        if ((unsigned long long)t[i].len != (unsigned long long)((elems / 32) * 34)) {
+                            fprintf(stderr, "v4: %s has %llu bytes, expected %lld for %lld "
+                                            "elements\n", tab[k].nm,
+                                    (unsigned long long)t[i].len, (long long)((elems / 32) * 34), (long long)elems);
+                            goto bad;
+                        }
+                        break;
+                    }
+            }
+        }
+    }
+    if (!m->norm || !m->ln1 || !m->ln2 || !m->bq || !m->bk || !m->bv ||
+        !(m->Wo || m->q_Wo) || !(m->Wg || m->q_Wg) || !(m->Wu || m->q_Wu) ||
+        !(m->Wd || m->q_Wd)) { fprintf(stderr, "v4: missing tensor(s)\n"); goto bad; }
 
     free(t);
     *map = img; *maplen = fsz;
@@ -329,10 +382,12 @@ int qwen2_step(const QW2 *m, QW2Cache *c, int token, int pos, float *logits) {
         float *kc = c->l[l].k + (size_t)pos * c->kv_dim;
         float *vc = c->l[l].v + (size_t)pos * c->kv_dim;
         rmsnorm(xn, x, m->ln1 + (size_t)l * D, D, m->rms_eps);
-        matmul_wx(q, xn, m->Wq + (size_t)l * D * D, D, H * HD);
+        matmul_wx_auto(q, xn, m->Wq + (size_t)l * D * D, q8_slice_at(m->q_Wq, l, (long)D * D), D, H * HD);
         for (int j = 0; j < H * HD; j++) q[j] += m->bq[(size_t)l * H * HD + j];
-        matmul_wx(kc, xn, m->Wk + (size_t)l * c->kv_dim * D, D, c->kv_dim);
-        matmul_wx(vc, xn, m->Wv + (size_t)l * c->kv_dim * D, D, c->kv_dim);
+        matmul_wx_auto(kc, xn, m->Wk + (size_t)l * c->kv_dim * D,
+                       q8_slice_at(m->q_Wk, l, (long)c->kv_dim * D), D, c->kv_dim);
+        matmul_wx_auto(vc, xn, m->Wv + (size_t)l * c->kv_dim * D,
+                       q8_slice_at(m->q_Wv, l, (long)c->kv_dim * D), D, c->kv_dim);
         for (int j = 0; j < c->kv_dim; j++) {
             kc[j] += m->bk[(size_t)l * c->kv_dim + j];
             vc[j] += m->bv[(size_t)l * c->kv_dim + j];
@@ -369,14 +424,14 @@ int qwen2_step(const QW2 *m, QW2Cache *c, int token, int pos, float *logits) {
                 ao[(size_t)hd * HD + e] = acc;
             }
         }
-        matmul_wx(h, ao, m->Wo + (size_t)l * D * D, H * HD, D);
+        matmul_wx_auto(h, ao, m->Wo + (size_t)l * D * D, q8_slice_at(m->q_Wo, l, (long)D * D), H * HD, D);
         for (int j = 0; j < D; j++) x[j] += h[j];
 
         rmsnorm(xn, x, m->ln2 + (size_t)l * D, D, m->rms_eps);
-        matmul_wx(g, xn, m->Wg + (size_t)l * F * D, D, F);
-        matmul_wx(h, xn, m->Wu + (size_t)l * F * D, D, F);
+        matmul_wx_auto(g, xn, m->Wg + (size_t)l * F * D, q8_slice_at(m->q_Wg, l, (long)F * D), D, F);
+        matmul_wx_auto(h, xn, m->Wu + (size_t)l * F * D, q8_slice_at(m->q_Wu, l, (long)F * D), D, F);
         for (int j = 0; j < F; j++) g[j] = silu(g[j]) * h[j];
-        matmul_wx(h, g, m->Wd + (size_t)l * D * F, F, D);
+        matmul_wx_auto(h, g, m->Wd + (size_t)l * D * F, q8_slice_at(m->q_Wd, l, (long)D * F), F, D);
         for (int j = 0; j < D; j++) x[j] += h[j];
     }
     rmsnorm(xn, x, m->norm, D, m->rms_eps);

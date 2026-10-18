@@ -259,6 +259,12 @@ void matmul_xw_q8(float *out, const float *x, const uint8_t *w,
 
 /* out[i] = sum_k W[i][k] * x[k], W row-quantized. Same accumulation order as the fp32
  * version (groups in order, elements within a group in order); only the values differ. */
+void matmul_wx_auto(float *out, const float *x, const float *w, const uint8_t *q8,
+                    int n_in, int n_out) {
+    if (q8) matmul_wx_q8(out, x, q8, n_in, n_out);
+    else    matmul_wx(out, x, w, n_in, n_out);
+}
+
 typedef struct { float *out; const float *x; const uint8_t *w; int ng; size_t rowbytes; } WXQ8Ctx;
 
 static void wx_q8_slice(void *v, int ilo, int ihi) {

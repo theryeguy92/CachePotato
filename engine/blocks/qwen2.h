@@ -11,9 +11,19 @@ typedef struct {
     const float *Wk, *bk, *Wv, *bv;         /* (L, n_kv*hd, D) / (L, n_kv*hd) */
     const float *Wo;                        /* (L, D, D) */
     const float *Wg, *Wu, *Wd;              /* (L, d_ff, D) / (L, D, d_ff) */
+
+    /* Q8_0 variants of the same matrices, when the file stores them quantized. NULL means the
+       f32 pointer is authoritative. Per-layer slicing is done with q8_slice_at() because a
+       multi-layer quantized group is ONE tensor: layer l starts l blocks in, and passing the
+       tensor base for every layer is a silent bug this project has already made once. */
+    const unsigned char *q_Wq, *q_Wk, *q_Wv, *q_Wo, *q_Wg, *q_Wu, *q_Wd;
+    int quantized;
 } QW2;
 
 int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits);
+
+/* element `idx` of a stacked quantized group: `elems` values per index, 34 bytes per 32. */
+const unsigned char *q8_slice_at(const unsigned char *base, int idx, long elems);
 int qwen2_load_blob(QW2 *m, const char *path, float **owned);
 /* v4: geometry (heads, KV heads, head_dim, rope theta, eps) comes from the file's BLOCK TABLE. */
 int qwen2_load_v4(QW2 *m, const char *path, void **map, size_t *maplen);
