@@ -34,6 +34,12 @@ fi
 # First port (models/gpt2-moe). Skipped unless its checkpoint exists, since weights are
 # gitignored. Converts the checkpoint to v4, then runs the port's own gate.
 if [ -f weights/qwen2.5-0.5b-instruct/model.safetensors ]; then
+    printf '  %-22s ' "qwen_v4_values"
+    python3 models/qwen2.5-0.5b/convert.py --out scratch/qwen.v4cp >/dev/null 2>&1 || fail=1
+    out=$(python3 models/qwen2.5-0.5b/verify/v4_values.py scratch/qwen.v4cp 2>&1); rc=$?
+    echo "$out" | grep -E "^V4 VALUES" | tail -1 | sed 's/^/ /'
+    [ $rc -eq 0 ] || fail=1
+
     printf '  %-22s ' "qwen_c_forward"
     out=$(python3 models/qwen2.5-0.5b/verify/c_forward.py 2>&1); rc=$?
     echo "$out" | grep -E "^C FORWARD" | tail -1 | sed 's/^/ /'
