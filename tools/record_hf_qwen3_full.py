@@ -17,6 +17,10 @@ RECORD ONCE. If a gate fails later, fix the code — do not regenerate this file
 The script runs the model twice and refuses to write unless both runs agree bit for bit.
 """
 import argparse, json, os, sys
+# Must precede any CUDA initialisation. The weight-loading path allocates many short-lived
+# tensors while stacking per-expert checkpoint tensors into the runtime's fused layout, which is
+# exactly the pattern that fragments the default allocator.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from pathlib import Path
 import numpy as np
 import torch
@@ -129,7 +133,22 @@ def main():
     print(f"placing: {place}", flush=True)
     extra = {}
     if place in ("spread", "cuda"):
+        # device_map="auto" fills every GPU to the last byte, and then the loader needs somewhere
+        # to put its TRANSIENTS: transformers 5.x stacks the checkpoint's per-expert `gate_proj`
+        # and `up_proj` into the runtime's fused `gate_up_proj`, on-device. With ~180 MiB free that
+        # is an OOM half-way through layer 37 — which reads like "the model doesn't fit" but is
+        # really "the loader had no scratch space". Reserve headroom per device explicitly.
+        max_mem = {}
+        if place == "spread":
+            for d in range(torch.cuda.device_count()):
+                free_b, _ = torch.cuda.mem_get_info(d)
+                gib = free_b / 2**30
+                max_mem[d] = f"{max(1.0, gib - 3.0):.0f}GiB"      # 3 GiB scratch per card
+            max_mem["cpu"] = f"{max(1.0, avail / 2**30 - 8.0):.0f}GiB"
+            print(f"max_memory: {max_mem}", flush=True)
         extra["device_map"] = "auto" if place == "spread" else "cuda:0"
+        if max_mem:
+            extra["max_memory"] = max_mem
     # transformers renamed the argument (torch_dtype -> dtype); accept either so the box does
     # not have to match the T480's version. Silently falling back to fp32 here would need 122 GB
     # and fail with an OOM that looks like a hardware limit rather than a keyword mismatch.
