@@ -58,6 +58,13 @@ if [ -f weights/qwen2.5-0.5b-instruct/model.safetensors ]; then
     [ $rc -eq 0 ] || fail=1
 fi
 
+if [ -f weights/qwen3-30b-a3b/model-00001-of-00016.safetensors ]; then
+    printf '  %-22s ' "qwen3_c_blocks"
+    out=$(python3 tools/verify_qwen3_blocks.py 2>&1); rc=$?
+    echo "$out" | grep -E "^QWEN3 C BLOCKS" | tail -1 | sed 's/^/ /'
+    [ $rc -eq 0 ] || fail=1
+fi
+
 printf '  %-22s ' "qwen_kernels"
 out=$(python3 tools/verify_qwen_kernels.py 2>&1); rc=$?
 echo "$out" | grep -E "^QWEN KERNELS" | tail -1 | sed 's/^/ /'
