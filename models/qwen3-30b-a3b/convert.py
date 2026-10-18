@@ -61,26 +61,50 @@ def main():
     def t(name):
         return shard1.get_tensor(name).float().numpy()
 
+    import importlib.util, sys as _s
+    _spec = importlib.util.spec_from_file_location("format_q8", str(ROOT / "format/q8.py"))
+    _q8 = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_q8)
+
     w = V.V4Writer()
     tid = {}
-    def add(name, arr, role, enc="f32"):
+
+    def nbytes_for(shape, enc):
+        n = 1
+        for x in shape: n *= int(x)
+        if enc == "q8_0":
+            assert n % 32 == 0, (shape, n)
+            return (n // 32) * 34
+        return n * 4
+
+    def add(name, shape, src_name, role, enc="f32"):
+        """Register LAZILY: the payload is read and quantized at write time, one tensor at a time.
+
+        Every tensor goes through this path, not just the experts. Materialising them would need
+        the sum of all payloads (61 GB fp32, 16.2 GB at Q8) against 16 GB of RAM.
+        """
         use = "q8_0" if (enc == "q8_0" and args.quant == "q8_0") else "f32"
-        tid[name] = w.add_tensor(name, np.ascontiguousarray(arr, dtype=np.float32), role=role, enc=use)
+        def source(_n=src_name, _u=use):
+            a = np.ascontiguousarray(t(_n), dtype=np.float32)
+            return _q8.encode_q8_0(a)[0] if _u == "q8_0" else a.tobytes()
+        tid[name] = w.add_tensor_lazy(name, shape, nbytes_for(shape, use),
+                                     role=role, enc=use, source=source)
 
     # embedding table (also the shard-1 input); the model's head is UNTIED
-    add("embed", t("model.embed_tokens.weight"), V.R_EMBED)
+    add("embed", (Voc, D), "model.embed_tokens.weight", V.R_EMBED, enc="q8_0")
     for l in range(L):
         p = f"model.layers.{l}."
-        add(f"ln1.{l}", t(p + "input_layernorm.weight"), V.R_NORM)
-        add(f"ln2.{l}", t(p + "post_attention_layernorm.weight"), V.R_NORM)
-        add(f"q_norm.{l}", t(p + "self_attn.q_norm.weight"), V.R_NORM)
-        add(f"k_norm.{l}", t(p + "self_attn.k_norm.weight"), V.R_NORM)
+        add(f"ln1.{l}", (D,), p + "input_layernorm.weight", V.R_NORM)
+        add(f"ln2.{l}", (D,), p + "post_attention_layernorm.weight", V.R_NORM)
+        add(f"q_norm.{l}", (HD,), p + "self_attn.q_norm.weight", V.R_NORM)
+        add(f"k_norm.{l}", (HD,), p + "self_attn.k_norm.weight", V.R_NORM)
         for nm, key in (("Wq", "q_proj"), ("Wk", "k_proj"), ("Wv", "v_proj"), ("Wo", "o_proj")):
-            add(f"{nm}.{l}", t(p + f"self_attn.{key}.weight"), V.R_ATTN, enc="q8_0")
-        add(f"Wgate.{l}", t(p + "mlp.gate.weight"), V.R_ROUTER)
+            shp = (H * HD, D) if nm == "Wq" else (KV * HD, D) if nm in ("Wk", "Wv") else (D, H * HD)
+            add(f"{nm}.{l}", shp, p + f"self_attn.{key}.weight", V.R_ATTN, enc="q8_0")
+        add(f"Wgate.{l}", (E, D), p + "mlp.gate.weight", V.R_ROUTER)
         for e in range(E):
             for nm, key in (("Wg", "gate_proj"), ("Wu", "up_proj"), ("Wd", "down_proj")):
-                add(f"expert.{l}.{e}.{nm}", t(p + f"mlp.experts.{e}.{key}.weight"),
+                shp = (D, F) if nm == "Wd" else (F, D)
+                add(f"expert.{l}.{e}.{nm}", shp, p + f"mlp.experts.{e}.{key}.weight",
                     V.R_EXPERT, enc="q8_0")
 
     w.add_block(V.KIND_EMBED, 0xFFFFFFFF, refs=[tid["embed"]], params=[Voc, D, 0])

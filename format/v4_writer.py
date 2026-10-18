@@ -110,6 +110,39 @@ class V4Writer:
                                  offset=None, pad=0))
         return len(self.tensors) - 1
 
+    def add_tensor_lazy(self, name, shape, nbytes, role=R_OTHER, enc="f32", source=None):
+        """Register a tensor whose BYTES ARE PRODUCED LATER, at write time.
+
+        The materialising `add_tensor` keeps every payload in memory until `write()`, so peak
+        usage is the sum of all tensors — fine for a 184M-parameter model, impossible for
+        Qwen3-30B-A3B where even the Q8 payload is 16.2 GB against 16 GB of RAM.
+
+        `nbytes` must be known now (offsets are assigned before any payload exists) and is
+        asserted against the actual bytes when they arrive. `source()` is called at most twice
+        — once to digest the region it belongs to, once to write it — and must return exactly
+        `nbytes`.
+        """
+        if source is None:
+            raise ValueError("add_tensor_lazy needs a source")
+        self._use_enc(enc)
+        self.tensors.append(dict(name=name, shape=tuple(int(x) for x in shape), role=role,
+                                 enc=enc, raw=None, source=source, nbytes=int(nbytes),
+                                 offset=None, pad=0))
+        return len(self.tensors) - 1
+
+    def _payload(self, t):
+        """Bytes for one tensor, materialising only if it was registered lazily."""
+        if t["raw"] is not None:
+            return t["raw"]
+        b = t["source"]()
+        if len(b) != t["nbytes"]:
+            raise ValueError(f"{t['name']}: source produced {len(b)} bytes, declared "
+                             f"{t['nbytes']}")
+        return b
+
+    def _nbytes(self, t):
+        return len(t["raw"]) if t["raw"] is not None else t["nbytes"]
+
     def _use_enc(self, enc):
         if enc not in self.ENCODINGS:
             self.ENCODINGS.append(enc)
@@ -156,9 +189,9 @@ class V4Writer:
         for i in ids:
             t = self.tensors[i]
             t["offset"] = off
-            pad = (-len(t["raw"])) % self.align
+            pad = (-self._nbytes(t)) % self.align
             t["pad"] = pad
-            off += len(t["raw"]) + pad
+            off += self._nbytes(t) + pad
         return off
 
     def write(self, path, n_encodings=1, encoding=(0, 0, 0, 0, 4, 1, 0, 4, "f32"),
@@ -187,7 +220,7 @@ class V4Writer:
             tens.string(t["name"]).u32(self.ENCODINGS.index(t["enc"])).u8(len(t["shape"]))
             for d in t["shape"]:
                 tens.u32(d)
-            tens.u64(t["offset"]).u64(len(t["raw"]))
+            tens.u64(t["offset"]).u64(self._nbytes(t))
             tens.u32(NO_BLOCK).u16(t["role"])
 
         blk = _W().u32(len(self.blocks))
@@ -206,9 +239,11 @@ class V4Writer:
                 raise ValueError("region tensor range must be non-empty")
             first, last = self.tensors[r["lo"]], self.tensors[r["hi"] - 1]
             off = first["offset"]
-            length = (last["offset"] + len(last["raw"])) - off
+            length = (last["offset"] + self._nbytes(last)) - off
             # digest over exactly the bytes this region covers
-            blob = b"".join(self.tensors[i]["raw"] + b"\0" * self.tensors[i]["pad"]
+            # One tensor at a time: a region is a single tensor for expert regions, and the
+            # generator form keeps peak memory at one payload even when tensors are lazy.
+            blob = b"".join(self._payload(self.tensors[i]) + b"\0" * self.tensors[i]["pad"]
                             for i in range(r["lo"], r["hi"]))
             digest = zlib.crc32(blob) & 0xFFFFFFFFFFFFFFFF
             reg.u64(off).u64(length).u32(r["lo"]).u32(r["hi"])
@@ -234,7 +269,7 @@ class V4Writer:
         # own premise failing in its own tool, so it is fixed before anything larger is attempted.
         total = off_data
         for t in self.tensors:
-            total = max(total, off_data + t["offset"] + len(t["raw"]) + t["pad"])
+            total = max(total, off_data + t["offset"] + self._nbytes(t) + t["pad"])
 
         with open(path, "wb") as f:
             written = 0
@@ -252,7 +287,11 @@ class V4Writer:
                 if written != off_data + t["offset"]:
                     raise ValueError(f"{t['name']}: at {written}, expected "
                                      f"{off_data + t['offset']}")
-                put(t["raw"]); put(b"\0" * t["pad"])
+                blo = self._payload(t)
+                if len(blo) != self._nbytes(t):
+                    raise ValueError(f"{t['name']}: wrote {len(blo)} bytes, "
+                                     f"declared {self._nbytes(t)}")
+                put(blo); put(b"\0" * t["pad"])
             if written != total:
                 raise ValueError(f"file ends at {written}, expected {total}")
 

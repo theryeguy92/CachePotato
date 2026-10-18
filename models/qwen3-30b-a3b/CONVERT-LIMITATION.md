@@ -57,3 +57,26 @@ streaming: never hold more than one tensor.
 Interaction to remember when it is done: region digests cover payload bytes and the region table
 precedes the payload, so a lazy writer either reads payloads twice or writes placeholder digests and
 patches them by seeking back. The second is one pass and the file is already seekable.
+
+## Update 2 — lazy payloads land, and the blocker becomes TIME (2026-10-17)
+
+`add_tensor_lazy` + a `_payload()` accessor: peak memory is now ONE tensor, and every tensor in this
+converter is registered lazily (not just the experts). Q8 happens inside the source callable, so a
+tensor is quantized as it is written.
+
+    one layer, fp32 : 3737 MB
+    one layer, Q8   :  993 MB   (3.76x, matching the 1.0625/4 bytes-per-param ratio)
+    V4 FORMAT: PASS (structure, regions, digests)
+
+**New blocker: conversion TIME, and it is two separate inefficiencies.**
+
+1. `format/q8.py::encode_q8_0` loops over rows *in Python* (`for row in flat:`). For the embedding
+   (151 936 rows) and for 18 867 expert tensors that is minutes of interpreter overhead, not
+   arithmetic. It vectorises straightforwardly — the group math is already numpy.
+2. Each payload is produced **twice**: once when the region digest is computed (the region table
+   precedes the payload) and once when it is written. Two options, both cheap: cache the payload
+   when the tensors are visited in the same order, or keep it lazy and accept reading twice —
+   but reading twice means paying the encoder twice.
+
+Measured: ~10 minutes for ONE layer. At 48 layers that is ~8 hours, which is not a conversion, it is
+a workday. Both fixes are small and independent; neither changes the format.
