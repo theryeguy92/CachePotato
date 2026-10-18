@@ -193,6 +193,25 @@ static inline void q8_axpy_avx2(float *out, const uint8_t *blk, float xk) {
 }
 
 /* out[i] += (float)q[i] * d * xk, 32 elements */
+static inline __m256 q8_dot_acc_avx2(__m256 s, const uint8_t *blk, const float *x) {
+    const float d = q8_scale(blk);
+    const int8_t *q = (const int8_t *)(blk + 2);
+    const __m256 dv = _mm256_set1_ps(d);
+    for (int h = 0; h < 4; h++) {
+        __m128i b = _mm_loadl_epi64((const __m128i *)(q + h * 8));
+        __m256 v = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b)), dv);
+        s = _mm256_fmadd_ps(v, _mm256_loadu_ps(x + h * 8), s);
+    }
+    return s;
+}
+
+static inline float q8_hsum8(__m256 s) {
+    float lane[8];
+    _mm256_storeu_ps(lane, s);
+    return ((lane[0] + lane[1]) + (lane[2] + lane[3])) +
+           ((lane[4] + lane[5]) + (lane[6] + lane[7]));
+}
+
 static inline void q8_dot_avx2(float *acc, const uint8_t *blk, const float *x) {
     const float d = q8_scale(blk);
     const int8_t *q = (const int8_t *)(blk + 2);
@@ -271,18 +290,26 @@ static void wx_q8_slice(void *v, int ilo, int ihi) {
     WXQ8Ctx *c = v;
     for (int i = ilo; i < ihi; i++) {
         const uint8_t *row = c->w + (size_t)i * c->rowbytes;
+#if defined(__AVX2__)
+        /* Accumulate in a VECTOR across every group, then horizontal-sum ONCE per row.
+           The previous version summed 8 lanes per 32-element GROUP — for a 4864-wide row that
+           is 152 horizontal sums per row, each a 32-byte store plus 7 scalar adds. Profiling
+           put Wd at 0.81 ms/token and 5.7 GB/s (half the ceiling); the summation, not the
+           arithmetic, was the cost. */
+        __m256 s = _mm256_setzero_ps();
+        for (int g = 0; g < c->ng; g++)
+            s = q8_dot_acc_avx2(s, row + (size_t)g * 34, c->x + g * 32);
+        c->out[i] = q8_hsum8(s);
+#else
         float acc = 0.0f;
         for (int g = 0; g < c->ng; g++) {
             const uint8_t *blk = row + (size_t)g * 34;
-#if defined(__AVX2__)
-            q8_dot_avx2(&acc, blk, c->x + g * 32);
-#else
             float d = q8_scale(blk);
             const int8_t *q = (const int8_t *)(blk + 2);
             for (int j = 0; j < 32; j++) acc += ((float)q[j] * d) * c->x[g * 32 + j];
-#endif
         }
         c->out[i] = acc;
+#endif
     }
 }
 
