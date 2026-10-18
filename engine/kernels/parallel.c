@@ -10,8 +10,10 @@
 #include <unistd.h>
 
 #define MAX_THREADS 64
-#define SPIN_LIMIT  1500    /* ~15-20us of spinning; enough for a hot dispatch, short enough that
-                               oversubscribed threads fall asleep instead of thrashing */
+#define SPIN_LIMIT  60000   /* ~0.5 ms of spinning. A token issues ~144 dispatches separated
+                               by up to ~1 ms of serial work; with a 15 us spin the workers
+                               slept between almost every one. Measured: dispatch costs 2.0 us
+                               hot but 63 us after a 1 ms gap = ~9 ms/token of wake-up. */
 
 typedef void (*task_fn)(void *ctx, int lo, int hi);
 
