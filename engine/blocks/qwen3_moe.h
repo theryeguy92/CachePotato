@@ -49,6 +49,7 @@ typedef struct {
        what lets the accounting be checked against the file instead of against itself.
        Every id is -1 when no pager is attached and pager_touch_region(-1) is a no-op,
        so the unpaged path runs the same code with the same arithmetic. */
+    int cur_layer;          /* the layer qwen3_bind_layer() just bound (trace/debug) */
     int pager;              /* 1 when a pager is attached to this mapping */
     int n_regions;          /* regions in the file's table */
     int *tensor_reg;        /* [n_tens]: region covering that tensor, or -1 */

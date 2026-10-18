@@ -46,6 +46,21 @@ static void head_rmsnorm(float *v, int rows, int hd, const float *g, float eps) 
     }
 }
 
+/* Per-layer physical-read trace (CP_TRACE=1). Exists because C2 measured the engine
+   reading ~1.9x the bytes its regions declare, in both the pager and the unpaged control,
+   and nothing in the policy explained it: this says WHICH layer reads more than it touches.
+   Diagnostic only; it reads /proc/self/io, which is one small file, and is off by default. */
+static long qwen3_io_read_kb(void) {
+    FILE *f = fopen("/proc/self/io", "r");
+    long val = 0;
+    char key[64];
+    if (!f) return 0;
+    while (fscanf(f, "%63[^:]: %ld\n", key, &val) == 2)
+        if (strcmp(key, "read_bytes") == 0) break;
+    fclose(f);
+    return val / 1024;
+}
+
 int qwen3_kv_alloc(QW3KV *kv, const QW3Layer *m, int cap) {
     kv->k = malloc(sizeof(float) * (size_t)cap * m->n_kv * m->head_dim);
     kv->v = malloc(sizeof(float) * (size_t)cap * m->n_kv * m->head_dim);
@@ -70,6 +85,9 @@ int qwen3_layer(const QW3Layer *m, const float *x, int T, QW3Out *o) {
 int qwen3_layer_kv(const QW3Layer *m, const float *x, int T, int pos0, QW3KV *cache, QW3Out *o) {
     const int D = m->d_model, H = m->n_heads, KV = m->n_kv, HD = m->head_dim;
     const int E = m->n_experts, K = m->topk, F = m->d_exp, rep = H / KV;
+    static int trace = -1;
+    if (trace < 0) { const char *e = getenv("CP_TRACE"); trace = e && e[0] == '1'; }
+    const long io0 = trace ? qwen3_io_read_kb() : 0;
     if (!cache || pos0 < 0 || T <= 0 || pos0 + T > cache->cap) {
         fprintf(stderr, "qwen3: kv range %d+%d outside cache cap %d\n", pos0, T,
                 cache ? cache->cap : 0);
@@ -185,6 +203,9 @@ int qwen3_layer_kv(const QW3Layer *m, const float *x, int T, int pos0, QW3KV *ca
         }
     }
     free(xn); free(q); free(ao); free(sc); free(hh); free(gu); free(probs); free(idx); free(wt);
+    if (trace)
+        fprintf(stderr, "trace: layer %2d pos0 %3d T %d  read %ld KB  touched ~%d regions\n",
+                m->cur_layer, pos0, T, qwen3_io_read_kb() - io0, (int)(9 + K));
     return 0;
 }
 
@@ -273,6 +294,17 @@ int qwen3_map(QW3Layer *m, const char *path) {
     const unsigned char *base = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (base == MAP_FAILED) { perror("mmap"); close(fd); return -1; }
     m->map = base; m->map_len = (size_t)st.st_size;
+    /* CP_FADV_RANDOM=1: POSIX_FADV_RANDOM on the file, i.e. ra_pages = 0 for readahead,
+       but fault-around still maps 16 pages per fault. (MADV_RANDOM is the blunter version:
+       it disables fault-around too, and measured 2.6x slower.) This is the switch that
+       tests whether the ~1.8x read amplification is readahead overshoot: a 4.78 MB expert
+       region is read in ~4 MiB requests, and the overshoot lands in regions the pager has
+       not fetched. */
+    {
+        const char *fr = getenv("CP_FADV_RANDOM");
+        if (fr && fr[0] == '1' && posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM) != 0)
+            fprintf(stderr, "v4: fadvise(RANDOM) failed (%m)\n");
+    }
     /* CP_NO_READAHEAD=1 turns off the kernel's sequential readahead for this mapping.
        Under a pager that drops regions on eviction, readahead is speculative bytes that
        get thrown away and read again: the C2 8 GB run reads 1.9x what it fetches, and the
@@ -371,6 +403,7 @@ int qwen3_map(QW3Layer *m, const char *path) {
 /* Walk the tensor table once, resolving what this layer needs and the model-wide tensors. */
 int qwen3_bind_layer(QW3Layer *m, int layer) {
     const unsigned char *base = m->map;
+    m->cur_layer = layer;
     const unsigned char *cur = base + m->off_tens;
     uint32_t cnt = rd32(cur); cur += 4;
     if (cnt != m->n_tens) { fprintf(stderr, "v4: tensor count %u != header %u\n", cnt, m->n_tens); return -3; }
