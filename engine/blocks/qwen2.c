@@ -41,6 +41,13 @@ const unsigned char *q_slice_at(const unsigned char *base, int idx, long elems, 
 static inline const unsigned char *qsl(const QW2 *m, const unsigned char *base, int idx, long elems) {
     return q_slice_at(base, idx, elems, m->q_bits == 4 ? 18 : 34);
 }
+/* Decode ONE row. Must follow q_bits: calling q8_dequant_row on Q4 blocks reads 34-byte groups
+   from 18-byte data and yields NaN — which is exactly what happened, because a rewrite pass
+   replaced the tensor pointers but not the decoder, and its pattern silently failed to match. */
+static inline void q_dequant_row(const QW2 *m, const unsigned char *blk, float *out, int n) {
+    if (m->q_bits == 4) q4_dequant_row(blk, out, n);
+    else                q8_dequant_row(blk, out, n);
+}
 static inline void mm_wx(const QW2 *m, float *o, const float *x, const float *w,
                          const unsigned char *q, int nin, int nout) {
     if (!q) matmul_wx(o, x, w, nin, nout);
@@ -66,8 +73,8 @@ int qwen2_forward(const QW2 *m, const int *tokens, int T, float *logits) {
     if (!x || !xn || !q || !k || !vv || !ao || !sc || !hh || !gg) return -2;
 
     for (int t = 0; t < T; t++) {
-        if (m->q_embed) q8_dequant_row(qsl(m, m->q_embed, tokens[t], (long)D),
-                                       x + (size_t)t * D, D);
+        if (m->q_embed) q_dequant_row(m, qsl(m, m->q_embed, tokens[t], (long)D),
+                                      x + (size_t)t * D, D);
         else memcpy(x + (size_t)t * D, m->embed + (size_t)tokens[t] * D, sizeof(float) * D);
     }
 
@@ -467,7 +474,7 @@ int qwen2_step(const QW2 *m, QW2Cache *c, int token, int pos, float *logits) {
     float *g = malloc(sizeof(float) * (F > D ? F : D));
     float *ao = malloc(sizeof(float) * D), *sc = malloc(sizeof(float) * (size_t)c->maxT);
     if (!x || !xn || !q || !h || !g || !ao || !sc) return -2;
-    if (m->q_embed) q8_dequant_row(qsl(m, m->q_embed, token, (long)D), x, D);
+    if (m->q_embed) q_dequant_row(m, qsl(m, m->q_embed, token, (long)D), x, D);
     else memcpy(x, m->embed + (size_t)token * D, sizeof(float) * D);
 
     for (int l = 0; l < L; l++) {

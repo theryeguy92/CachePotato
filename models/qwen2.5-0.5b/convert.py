@@ -53,7 +53,11 @@ def main():
     # The tied head is 151936 x 896 and is 27% of the model: quantizing it is the largest
     # single byte saving left. It is also the embedding table, so the LOOKUP path must
     # dequantize one row per token.
-    add("embed", sd["model.embed_tokens.weight"], V.R_EMBED, enc="q8_0")
+    # Embedding/tied head: f32 at Q4. Embeddings are the most quantisation-sensitive tensor and
+    # the head is 27% of the bytes; at Q8 it was fine, at Q4 it destroyed the model (rel 0.92,
+    # argmax 3/5). Keeping it exact costs bytes but not correctness.
+    add("embed", sd["model.embed_tokens.weight"], V.R_EMBED,
+        enc="q8_0" if args.quant == "q8_0" else "f32")
     add("norm", sd["model.norm.weight"], V.R_NORM)
     add("ln1", stack("input_layernorm.weight"), V.R_NORM)
     add("ln2", stack("post_attention_layernorm.weight"), V.R_NORM)
