@@ -86,6 +86,16 @@ if [ -f weights/qwen3_30b_a3b_q8.v4cp ]; then
     [ $rc -eq 0 ] || fail=1
 fi
 
+# Tier B: expert PLACEMENT can be recompiled without changing the answer. One layer is enough —
+# the claim is about where bytes live, and a second layer would only repeat the sum. Guarded by
+# the checkpoint because it converts (2 x 1-layer files, ~3.5 min).
+if [ -f weights/qwen3-30b-a3b/model-00001-of-00016.safetensors ]; then
+    printf '  %-22s ' "qwen3_tierb_grouping"
+    out=$(python3 tools/verify_tierb_grouping.py 2>&1); rc=$?
+    echo "$out" | grep -E "^TIER B GROUPING" | tail -1 | sed 's/^/ /'
+    [ $rc -eq 0 ] || fail=1
+fi
+
 printf '  %-22s ' "qwen_kernels"
 out=$(python3 tools/verify_qwen_kernels.py 2>&1); rc=$?
 echo "$out" | grep -E "^QWEN KERNELS" | tail -1 | sed 's/^/ /'

@@ -149,7 +149,7 @@ static void write_meta(const char *pre, const char *model_path, const QW3Layer *
 /* Run every layer once over T rows. `kv` non-NULL means incremental: the rows are
    positions pos0..pos0+T-1 in the per-layer caches. route/router are optional. */
 static int run_layers(QW3Layer *m, float *x, int T, int pos0, QW3KV *kv, int L,
-                      int *route, float *router) {
+                      int *route, int route_stride, float *router) {
     const int D = m->d_model, K = m->topk, E = m->n_experts;
     QW3Out o;
     for (int l = 0; l < L; l++) {
@@ -161,7 +161,8 @@ static int run_layers(QW3Layer *m, float *x, int T, int pos0, QW3KV *kv, int L,
         for (int t = 0; t < T; t++)
             for (int j = 0; j < D; j++)
                 x[(size_t)t * D + j] += o.attn[(size_t)t * D + j] + o.mlp[(size_t)t * D + j];
-        if (route)  memcpy(route  + (size_t)l * T * K, o.topk_idx, sizeof(int) * (size_t)T * K);
+        if (route)  memcpy(route  + (size_t)l * route_stride, o.topk_idx,
+                           sizeof(int) * (size_t)T * K);
         if (router) memcpy(router + (size_t)l * T * E, o.router, sizeof(float) * (size_t)T * E);
         qwen3_layer_free(&o);
         /* Between layers, not inside one: the 8 experts a layer selected are still being
@@ -303,17 +304,18 @@ int main(int argc, char **argv) {
         {   /* the prefill is reported separately: it is prompt processing, not decode, and
                its reads are what leave the cache in whatever state the decode loop starts in */
             long io0 = io_read_kb(); double t0 = now_s();
-            if (run_layers(&m, x, T, 0, kv, L, NULL, NULL)) return 1;
+            if (run_layers(&m, x, T, 0, kv, L, NULL, 0, NULL)) return 1;
             fprintf(stderr, "prefill: %.0f ms, %ld KB read\n",
                     (now_s() - t0) * 1e3, io_read_kb() - io0);
         }
 
+        int   *groute = calloc((size_t)L * gen * K, sizeof(int));  /* L x gen x K */
         int   *gtok   = malloc(sizeof(int) * (size_t)gen);
         float *glog   = malloc(sizeof(float) * (size_t)gen * V);
         float *grow   = malloc(sizeof(float) * D);
         double *gms   = malloc(sizeof(double) * (size_t)gen);
         long  *gkb    = malloc(sizeof(long) * (size_t)gen);
-        if (!gtok || !glog || !grow || !gms || !gkb) return 1;
+        if (!groute || !gtok || !glog || !grow || !gms || !gkb) return 1;
 
         const float *last = x + (size_t)(T - 1) * D;
         for (int s = 0; s < gen; s++) {
@@ -324,7 +326,9 @@ int main(int argc, char **argv) {
             apply_head(&m, grow, 1, pos - 1, glog + (size_t)s * V, V);
             gtok[s] = argmax_row(glog + (size_t)s * V, V);
             embed_rows(&m, &gtok[s], 1, pos, grow, D);
-            if (run_layers(&m, grow, 1, pos, kv, L, NULL, NULL)) return 1;
+            /* the layer writes its K selections into this token's row block */
+            if (run_layers(&m, grow, 1, pos, kv, L, groute + (size_t)s * K, (size_t)gen * K,
+                           NULL)) return 1;
             gms[s] = now_s() - t0;
             gkb[s] = io_read_kb() - io0;
             last = grow;
@@ -339,6 +343,8 @@ int main(int argc, char **argv) {
         }
         snprintf(fn, sizeof fn, "%s.logits", pre); FILE *f = out_file(fn);
         fwrite(glog, sizeof(float), (size_t)gen * V, f); fclose(f);
+        snprintf(fn, sizeof fn, "%s.route", pre); f = out_file(fn);
+        fwrite(groute, sizeof(int), (size_t)L * gen * K, f); fclose(f);
         snprintf(fn, sizeof fn, "%s.tokens", pre); f = out_file(fn);
         fwrite(gtok, sizeof(int), (size_t)gen, f); fclose(f);
         snprintf(fn, sizeof fn, "%s.steps", pre); f = out_file(fn);
@@ -356,7 +362,7 @@ int main(int argc, char **argv) {
     /* ---- prefill: all T tokens in one forward (B5 / A5 / the C1 control) ---- */
     int *route = malloc(sizeof(int) * (size_t)L * T * K);
     float *router = malloc(sizeof(float) * (size_t)L * T * E);
-    if (run_layers(&m, x, T, 0, NULL, L, route, router)) return 1;
+    if (run_layers(&m, x, T, 0, NULL, L, route, T * K, router)) return 1;
 
     float *logits = malloc(sizeof(float) * (size_t)T * V);
     apply_head(&m, x, T, 0, logits, V);

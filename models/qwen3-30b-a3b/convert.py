@@ -30,6 +30,14 @@ def main():
     ap.add_argument("--quant", choices=["none", "q8_0"], default="none")
     ap.add_argument("--manifest", default=None,
                     help="write name/offset/size so the payloads can be checked against the source")
+    # TIER B: placement-only expert reordering. The order file names a permutation per layer;
+    # `--group N` puts N consecutive experts of that order into ONE region. Expert ids, tensor
+    # names and the router are untouched, so this changes where the bytes live and nothing about
+    # what the model computes — which makes the gate bit-identity rather than a tolerance.
+    ap.add_argument("--expert-order", default=None,
+                    help="JSON from tools/fit_expert_pairs.py: per-layer expert permutations")
+    ap.add_argument("--group", type=int, default=2,
+                    help="experts per region when --expert-order is given (default 2)")
     args = ap.parse_args()
 
     md = ROOT / args.model
@@ -69,6 +77,19 @@ def main():
           f"model has {total_layers})")
     if args.shard1 and L == 0:
         raise SystemExit("convert: no complete layer in shard 1")
+
+    order = None
+    group = 1
+    if args.expert_order:
+        spec = json.load(open(args.expert_order))
+        order = spec["layers_order"]
+        group = int(spec.get("group", args.group))
+        if len(order) < L:
+            raise SystemExit(f"expert order has {len(order)} layers, converting {L}")
+        for l in range(L):
+            if sorted(order[l]) != list(range(E)):
+                raise SystemExit(f"expert order for layer {l} is not a permutation of 0..{E-1}")
+        print(f"expert order: {args.expert_order} ({group} experts per region)")
 
     def t(name):
         # the tensor, from whichever shard holds it
@@ -117,7 +138,7 @@ def main():
             shp = (H * HD, D) if nm == "Wq" else (KV * HD, D) if nm in ("Wk", "Wv") else (D, H * HD)
             add(f"{nm}.{l}", shp, p + f"self_attn.{key}.weight", V.R_ATTN, enc="q8_0")
         add(f"Wgate.{l}", (E, D), p + "mlp.gate.weight", V.R_ROUTER)
-        for e in range(E):
+        for e in (order[l] if order else range(E)):
             for nm, key in (("Wg", "gate_proj"), ("Wu", "up_proj"), ("Wd", "down_proj")):
                 shp = (D, F) if nm == "Wd" else (F, D)
                 add(f"expert.{l}.{e}.{nm}", shp, p + f"mlp.experts.{e}.{key}.weight",
@@ -142,11 +163,24 @@ def main():
         w.add_block(V.KIND_MOE, l, refs=[tid[f"Wgate.{l}"]],
                     params=[E, K, V.SCORING_SOFTMAX, 1, 0, V.f32_bits(1.0), 0, 0, 0, 1])
 
-    for e in range(L * E):
-        l, ex = divmod(e, E)
-        lo = min(tid[f"expert.{l}.{ex}.{n}"] for n in ("Wg", "Wu", "Wd"))
-        hi = max(tid[f"expert.{l}.{ex}.{n}"] for n in ("Wg", "Wu", "Wd"))
-        w.add_region(lo, hi + 1, kind=V.REGION_EXPERT, slot=l, mlo=ex, mhi=ex + 1)
+    if order is None:
+        for e in range(L * E):
+            l, ex = divmod(e, E)
+            lo = min(tid[f"expert.{l}.{ex}.{n}"] for n in ("Wg", "Wu", "Wd"))
+            hi = max(tid[f"expert.{l}.{ex}.{n}"] for n in ("Wg", "Wu", "Wd"))
+            w.add_region(lo, hi + 1, kind=V.REGION_EXPERT, slot=l, mlo=ex, mhi=ex + 1)
+    else:
+        # One region per GROUP of consecutive experts in the emitted order. The members' tensors
+        # are contiguous because the experts were emitted in that order, which is what lets a
+        # region be one sequential read.
+        for l in range(L):
+            seq = order[l]
+            for g0 in range(0, E, group):
+                members = seq[g0:g0 + group]
+                lo = min(tid[f"expert.{l}.{e}.Wg"] for e in members)
+                hi = max(tid[f"expert.{l}.{e}.Wd"] for e in members)
+                w.add_region(lo, hi + 1, kind=V.REGION_EXPERT, slot=l,
+                             mlo=g0, mhi=g0 + len(members))
     for name, i in tid.items():
         if not name.startswith("expert."):
             w.add_region(i, i + 1, kind=V.REGION_TENSOR)
@@ -168,7 +202,8 @@ def main():
     out = Path(args.out)
     print(f"convert: {out} ({out.stat().st_size/1e6:.0f} MB) | tensors {info['tensors']} "
           f"blocks {info['blocks']} regions {info['regions']}")
-    print(f"  D={D} H={H}/{KV} HD={HD} experts={E} top{K} d_exp={F} vocab={Voc} layers={L}")
+    print(f"  D={D} H={H}/{KV} HD={HD} experts={E} top{K} d_exp={F} vocab={Voc} layers={L}"
+          + ("" if order is None else f" | {group} experts/region"))
     return 0
 
 if __name__ == "__main__":
