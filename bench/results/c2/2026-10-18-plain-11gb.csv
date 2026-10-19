@@ -1,0 +1,2 @@
+config,rep,regions_per_token,mb_per_token,hits_per_token,evictions_per_token,expert_hit_pct,core_hit_pct,physical_mb_per_token,ms_per_token,tok_per_s,prefill_ms,prefill_mb,mhz,mem_available_mb
+b11264sys,0,39.62,198.66,779.31,15.69,82.24,97.30,382.57,5132.9,0.1948,45708,13884,2872,12924
