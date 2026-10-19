@@ -24,6 +24,7 @@ typedef struct {
     int pinned;             /* never chosen as an LRU victim (CP_PIN_CORE). Still
                                counts against the budget: pinning is a policy about
                                WHO gets evicted, not a way to get memory for free. */
+    void *abuf;             /* CP_ARENA: this region's copy in the arena, or NULL */
 } Region;
 
 /* Which front-end opened the pager. 0 = none, 1 = pager_init (v2/v3 layout),
@@ -48,6 +49,9 @@ static long n_hits, n_misses, bytes_missed, n_prefetch, n_pf_resident;
 static long n_ehits, n_emisses, bytes_emissed;   /* routed experts only */
 static int sys_evict;           /* CP_PAGER_SYS: also evict the system cache */
 static int pin_core;            /* CP_PIN_CORE: core (non-expert) regions are never victims */
+static int use_arena;           /* CP_ARENA: the pager owns the bytes (pread per region) */
+static long n_arena_fallback;   /* regions too big for the budget, read from the mapping */
+static long arena_bytes;        /* bytes currently held in arena buffers */
 static int warned_pinned_over;  /* one message, not one per enforce call */
 static int model_fd;
 static const float *model_data;
@@ -88,7 +92,7 @@ static void add_region_raw(const char *name, int layer, float *ptr, size_t bytes
         cap_regions = nc;
     }
     regions[n_regions++] = (Region){name, layer, ptr, bytes, 0, 0, is_expert,
-                                    pin_core && !is_expert};
+                                    pin_core && !is_expert, NULL};
 }
 
 static void add_region(const char *name, int layer, float *ptr, size_t bytes) {
@@ -105,6 +109,8 @@ void pager_init(Model *m, long budget_bytes) {
     sys_evict = s && s[0] == '1';
     const char *pc = getenv("CP_PIN_CORE");
     pin_core = pc && pc[0] == '1';
+    const char *ar = getenv("CP_ARENA");
+    use_arena = ar && ar[0] == '1';
     const char *pw = getenv("CP_PREFETCH_W");
     if (pw) pf_w = atoi(pw);
     if (pf_w < 0) pf_w = 0;
@@ -197,6 +203,8 @@ int pager_open_v4(int fd, const void *map_base, size_t data_off, long budget_byt
     sys_evict = s && s[0] == '1';
     const char *pc = getenv("CP_PIN_CORE");
     pin_core = pc && pc[0] == '1';
+    const char *ar = getenv("CP_ARENA");
+    use_arena = ar && ar[0] == '1';
     /* Expert prefetch (CP_PREFETCH_W) is v3 policy: it predicts token t+1's experts
        from the history pager_moe_access() keeps. C1 pages on demand only, so the
        knob is not read here — a silent W=4 would make a warm run look like a win. */
@@ -211,10 +219,84 @@ int pager_add_region(size_t off, size_t len, int is_expert) {
     return n_regions - 1;
 }
 
-void pager_touch_region(int id) {
+/* Evict down to `need` free bytes (arena mode) by freeing the LRU buffer. Same policy as
+   the madvise path, different mechanics: the pager allocated the memory, so it frees it. */
+static void arena_make_room(size_t need) {
+    while (arena_bytes + (long)need > budget) {
+        int victim = -1;
+        for (int i = 0; i < n_regions; i++)
+            if (regions[i].abuf && !regions[i].pinned &&
+                (victim < 0 || regions[i].last_used < regions[victim].last_used))
+                victim = i;
+        if (victim < 0) {
+            if (!warned_pinned_over) {
+                fprintf(stderr, "pager: arena cannot make room for %zu bytes (%.1f MB held, "
+                                "%ld MB budget) — pinned or oversized region\n",
+                        need, arena_bytes / 1048576.0, budget / (1024 * 1024));
+                warned_pinned_over = 1;
+            }
+            break;
+        }
+        Region *v = &regions[victim];
+        free(v->abuf);
+        v->abuf = NULL;
+        v->resident = 0;
+        arena_bytes -= (long)v->bytes;
+        n_evictions++;
+        bytes_evicted += v->bytes;
+        if (cur_step >= 0) steps[cur_step].evictions++;
+    }
+}
+
+const void *pager_region_get(int id) {
     if (pager_mode != 2 || id < 0 || id >= n_regions)
-        return;
+        return NULL;
     Region *r = &regions[id];
+    /* A region larger than the whole budget can never be cached. Reading it through the
+       mapping keeps the budget honest and is the only sane answer for a 330 MB embedding
+       against an 8 GB budget — it is touched once per token, not per expert. */
+    const int oversized = use_arena && (long)r->bytes > budget;
+
+    if (use_arena && !oversized) {
+        if (!r->abuf) {
+            arena_make_room(r->bytes);
+            void *buf = malloc(r->bytes);
+            if (!buf) { fprintf(stderr, "pager: arena malloc failed\n"); exit(1); }
+            if (pread(model_fd, buf, r->bytes, (off_t)((const unsigned char *)r->ptr
+                                                       - (const unsigned char *)model_data)) !=
+                (ssize_t)r->bytes) {
+                fprintf(stderr, "pager: pread failed for region %d\n", id);
+                exit(1);
+            }
+            /* The bytes now live in OUR buffer, so drop them from the page cache. Without
+               this the page cache becomes a shadow cache the budget does not count, and a
+               "miss" would be a memcpy rather than a disk read — which would flatter the
+               arena by exactly the thing it is supposed to remove. Only under CP_PAGER_SYS,
+               like every other honest-disk measurement here. */
+            if (sys_evict)
+                posix_fadvise(model_fd,
+                              (off_t)((const unsigned char *)r->ptr - (const unsigned char *)model_data),
+                              (off_t)r->bytes, POSIX_FADV_DONTNEED);
+            r->abuf = buf;
+            r->resident = 1;
+            arena_bytes += (long)r->bytes;
+            n_misses++;
+            bytes_missed += r->bytes;
+            if (r->is_expert) { n_emisses++; bytes_emissed += r->bytes; }
+            if (cur_step >= 0) {
+                steps[cur_step].regions++;
+                steps[cur_step].bytes += (long)r->bytes;
+            }
+        } else {
+            n_hits++;
+            if (r->is_expert) n_ehits++;
+            if (cur_step >= 0) steps[cur_step].hits++;
+        }
+        r->last_used = ++tick;
+        return r->abuf;
+    }
+
+    /* no arena (or oversized): track residency, read through the mapping */
     if (r->resident) {
         n_hits++;
         if (r->is_expert) n_ehits++;
@@ -229,7 +311,9 @@ void pager_touch_region(int id) {
             steps[cur_step].bytes += (long)r->bytes;
         }
     }
+    if (oversized) n_arena_fallback++;
     r->last_used = ++tick;
+    return r->ptr;
 }
 
 void pager_step(int step) {
@@ -322,6 +406,9 @@ void pager_moe_access(int slot, const int *idx, int k, int pos) {
 void pager_enforce(void) {
     if (budget < 0)
         return;
+    if (use_arena) {  /* fetches already made room; nothing to do between layers */
+        return;
+    }
     long resident_bytes = 0;
     for (int i = 0; i < n_regions; i++)
         if (regions[i].resident)
@@ -391,6 +478,10 @@ static void pager_report_resident(void) {
         fprintf(stderr, "  pinned    : %.1f MB never evicted (CP_PIN_CORE) — evictable "
                         "capacity %.1f MB for experts\n",
                 pin_b / 1048576.0, ((long)budget - pin_b) / 1048576.0);
+    if (use_arena)
+        fprintf(stderr, "  arena     : %.1f MB held in pager buffers (%ld oversized regions "
+                        "read through the mapping)\n",
+                arena_bytes / 1048576.0, n_arena_fallback);
 }
 
 void pager_report(void) {

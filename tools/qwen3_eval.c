@@ -179,25 +179,28 @@ static int run_layers(QW3Layer *m, float *x, int T, int pos0, QW3KV *kv, int L,
 static void apply_head(QW3Layer *m, float *x, int T, int pos0, float *logits, int V) {
     const int D = m->d_model;
     for (int t = 0; t < T; t++) {
-        if (m->pager) { pager_step(pos0 + t); pager_touch_region(m->reg_final_norm); }
-        rmsnorm(x + (size_t)t * D, x + (size_t)t * D, m->final_norm, D, m->rms_eps);
+        const float *fn = m->final_norm;
+        if (m->pager) { pager_step(pos0 + t); fn = pager_region_get(m->reg_final_norm); }
+        rmsnorm(x + (size_t)t * D, x + (size_t)t * D, fn, D, m->rms_eps);
     }
     for (int t = 0; t < T; t++) {
-        if (m->pager) { pager_step(pos0 + t); pager_touch_region(m->reg_lm_head); }
-        if (m->lm_head.enc == QW3_ENC_Q8)
-            matmul_wx_q8(logits + (size_t)t * V, x + (size_t)t * D, (const uint8_t *)m->lm_head.p, D, V);
+        QW3T head = m->lm_head;
+        if (m->pager) { pager_step(pos0 + t); head.p = pager_region_get(m->reg_lm_head); }
+        if (head.enc == QW3_ENC_Q8)
+            matmul_wx_q8(logits + (size_t)t * V, x + (size_t)t * D, (const uint8_t *)head.p, D, V);
         else
-            matmul_wx(logits + (size_t)t * V, x + (size_t)t * D, (const float *)m->lm_head.p, D, V);
+            matmul_wx(logits + (size_t)t * V, x + (size_t)t * D, (const float *)head.p, D, V);
     }
 }
 
 static void embed_rows(QW3Layer *m, const int *ids, int T, int pos0, float *x, int D) {
     for (int t = 0; t < T; t++) {
-        if (m->pager) { pager_step(pos0 + t); pager_touch_region(m->reg_embed); }
-        const unsigned char *row = (const unsigned char *)m->embed.p
+        const void *base = m->embed.p;
+        if (m->pager) { pager_step(pos0 + t); base = pager_region_get(m->reg_embed); }
+        const unsigned char *row = (const unsigned char *)base
                                  + (size_t)ids[t] * (size_t)((D / 32) * 34);
         if (m->embed.enc == QW3_ENC_Q8) q8_dequant_row(row, x + (size_t)t * D, D);
-        else memcpy(x + (size_t)t * D, (const float *)m->embed.p + (size_t)ids[t] * D,
+        else memcpy(x + (size_t)t * D, (const float *)base + (size_t)ids[t] * D,
                     sizeof(float) * D);
     }
 }

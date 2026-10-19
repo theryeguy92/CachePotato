@@ -113,21 +113,27 @@ int qwen3_layer_kv(const QW3Layer *m, const float *x, int T, int pos0, QW3KV *ca
            Nine core regions per layer (six here, Wo, ln2, the router) plus one per
            selected expert is 17 per layer, 816 per token across 48 layers — the
            working set the budget is measured against. */
+        /* The pointers are resolved AFTER the demand access, not at bind time: with
+           CP_ARENA the bytes live in a pager buffer that moves between fetches, so a
+           pointer cached earlier would read freed memory. Without the arena the same
+           call returns the mapping address, so this is one code path either way. */
+        const float *ln1 = m->ln1, *qnorm = m->q_norm, *knorm = m->k_norm;
+        QW3T wq = m->Wq, wk = m->Wk, wv = m->Wv;
         if (m->pager) {
             pager_step(pos0 + t);
-            pager_touch_region(m->reg_ln1);
-            pager_touch_region(m->reg_Wq);
-            pager_touch_region(m->reg_Wk);
-            pager_touch_region(m->reg_Wv);
-            pager_touch_region(m->reg_qnorm);
-            pager_touch_region(m->reg_knorm);
+            ln1   = pager_region_get(m->reg_ln1);
+            wq.p  = pager_region_get(m->reg_Wq);
+            wk.p  = pager_region_get(m->reg_Wk);
+            wv.p  = pager_region_get(m->reg_Wv);
+            qnorm = pager_region_get(m->reg_qnorm);
+            knorm = pager_region_get(m->reg_knorm);
         }
-        rmsnorm(xn + (size_t)t * D, x + (size_t)t * D, m->ln1, D, m->rms_eps);
-        mm(&m->Wq, q + (size_t)t * H * HD,  xn + (size_t)t * D, D, H * HD);
-        mm(&m->Wk, cache->k + (size_t)(pos0 + t) * KV * HD, xn + (size_t)t * D, D, KV * HD);
-        mm(&m->Wv, cache->v + (size_t)(pos0 + t) * KV * HD, xn + (size_t)t * D, D, KV * HD);
-        head_rmsnorm(q + (size_t)t * H * HD,  H,  HD, m->q_norm, m->rms_eps);
-        head_rmsnorm(cache->k + (size_t)(pos0 + t) * KV * HD, KV, HD, m->k_norm, m->rms_eps);
+        rmsnorm(xn + (size_t)t * D, x + (size_t)t * D, ln1, D, m->rms_eps);
+        mm(&wq, q + (size_t)t * H * HD,  xn + (size_t)t * D, D, H * HD);
+        mm(&wk, cache->k + (size_t)(pos0 + t) * KV * HD, xn + (size_t)t * D, D, KV * HD);
+        mm(&wv, cache->v + (size_t)(pos0 + t) * KV * HD, xn + (size_t)t * D, D, KV * HD);
+        head_rmsnorm(q + (size_t)t * H * HD,  H,  HD, qnorm, m->rms_eps);
+        head_rmsnorm(cache->k + (size_t)(pos0 + t) * KV * HD, KV, HD, knorm, m->rms_eps);
     }
     /* the new rows start at pos0, so token n is rotated at position n */
     rope_apply_from(q, cache->k + (size_t)pos0 * KV * HD, T, pos0, H, KV, HD, m->rope_theta);
@@ -153,20 +159,23 @@ int qwen3_layer_kv(const QW3Layer *m, const float *x, int T, int pos0, QW3KV *ca
         }
     }
     for (int t = 0; t < T; t++) {
-        if (m->pager) { pager_step(pos0 + t); pager_touch_region(m->reg_Wo); }
-        mm(&m->Wo, o->attn + (size_t)t * D, ao + (size_t)t * H * HD, H * HD, D);
+        QW3T wo = m->Wo;
+        if (m->pager) { pager_step(pos0 + t); wo.p = pager_region_get(m->reg_Wo); }
+        mm(&wo, o->attn + (size_t)t * D, ao + (size_t)t * H * HD, H * HD, D);
     }
 
     /* ---- MoE: router -> softmax -> top-k -> renormalise -> gated experts ---- */
     for (int t = 0; t < T; t++) {
+        const float *ln2 = m->ln2;
+        QW3T wgate = m->Wgate;
         if (m->pager) {
             pager_step(pos0 + t);
-            pager_touch_region(m->reg_ln2);
-            pager_touch_region(m->reg_Wgate);
+            ln2 = pager_region_get(m->reg_ln2);
+            wgate.p = pager_region_get(m->reg_Wgate);
         }
         for (int j = 0; j < D; j++) hh[j] = x[(size_t)t * D + j] + o->attn[(size_t)t * D + j];
-        rmsnorm(xn + (size_t)t * D, hh, m->ln2, D, m->rms_eps);
-        mm(&m->Wgate, o->router + (size_t)t * E, xn + (size_t)t * D, D, E);
+        rmsnorm(xn + (size_t)t * D, hh, ln2, D, m->rms_eps);
+        mm(&wgate, o->router + (size_t)t * E, xn + (size_t)t * D, D, E);
         memcpy(probs, o->router + (size_t)t * E, sizeof(float) * E);
         softmax(probs, E);
 
@@ -190,15 +199,23 @@ int qwen3_layer_kv(const QW3Layer *m, const float *x, int T, int pos0, QW3KV *ca
             /* One region per (layer, expert), declared by the file. This is the touch
                that makes the experiment: 8 of 128 per layer, chosen by the router, and
                nothing else in the layer depends on which ones. */
-            if (m->pager) pager_touch_region(m->reg_exp[e]);
             o->topk_idx[(size_t)t * K + j] = e;
-            const QW3T *wg = &m->exp[(size_t)e * 3 + 0];
-            const QW3T *wu = &m->exp[(size_t)e * 3 + 1];
-            const QW3T *wd = &m->exp[(size_t)e * 3 + 2];
-            mm(wg, gu, xn + (size_t)t * D, D, F);              /* gate */
-            mm(wu, hh, xn + (size_t)t * D, D, F);              /* up   */
+            QW3T wg = m->exp[(size_t)e * 3 + 0];
+            QW3T wu = m->exp[(size_t)e * 3 + 1];
+            QW3T wd = m->exp[(size_t)e * 3 + 2];
+            if (m->pager) {
+                /* one region covers this expert's three matrices: fetch once, then take
+                   their offsets from the mapping pointers captured at bind time */
+                const unsigned char *base = pager_region_get(m->reg_exp[e]);
+                const unsigned char *b0 = (const unsigned char *)wg.p;
+                wg.p = base;
+                wu.p = base + ((const unsigned char *)wu.p - b0);
+                wd.p = base + ((const unsigned char *)wd.p - b0);
+            }
+            mm(&wg, gu, xn + (size_t)t * D, D, F);             /* gate */
+            mm(&wu, hh, xn + (size_t)t * D, D, F);             /* up   */
             for (int i = 0; i < F; i++) gu[i] = silu(gu[i]) * hh[i];
-            mm(wd, hh, gu, F, D);                              /* down */
+            mm(&wd, hh, gu, F, D);                             /* down */
             for (int i = 0; i < D; i++) o->mlp[(size_t)t * D + i] += wt[(size_t)t * K + j] * hh[i];
         }
     }

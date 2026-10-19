@@ -251,6 +251,20 @@ def main():
         print(f"  CP_BUDGET={bm} MB + pinned core: "
               + ", ".join(f"tok {r[0]} {r[1]} regions/{r[4]} evict" for r in num))
 
+    # The arena makes the pager own the bytes: a miss is one pread into a buffer, eviction
+    # frees it, and the caller reads from RAM. Values must not change, so the same bar.
+    if args.budget_mb:
+        bm = args.budget_mb
+        run(args.engine, args.model, ids, str(pre) + "_arena",
+            {"CP_PAGER": "1", "CP_BUDGET": str(bm), "CP_ARENA": "1"})
+        for suf in (".logits", ".route", ".router"):
+            a = (Path(str(pre) + "_unpaged" + suf)).read_bytes()
+            b = (Path(str(pre) + "_arena" + suf)).read_bytes()
+            same = a == b
+            ok &= same
+            print(f"  {suf:9s} at CP_BUDGET={bm} MB + CP_ARENA: "
+                  f"{'BIT-IDENTICAL' if same else 'DIFFERS'}")
+
     print()
     print("C1 PAGING: " + ("PASS — bit-identical at unlimited budget, accounting matches the file"
                            if ok else "FAIL — see above"))

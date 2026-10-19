@@ -50,7 +50,20 @@ void pager_report(void);                         /* totals to stderr */
    budget; unlimited is where the attachment point itself is on trial.) */
 int  pager_open_v4(int fd, const void *map_base, size_t data_off, long budget_bytes);
 int  pager_add_region(size_t off, size_t len, int is_expert); /* -> region id, -1 */
-void pager_touch_region(int id);                             /* demand access */
+
+/* Demand access, returning the address the caller must read the region from.
+
+   Without CP_ARENA this is the old pager_touch_region plus the mapping address: the bytes
+   come from the mmap and the kernel's fault-around reads ~1.9x the region (measured; see
+   docs/2026-10-18-c2-read-amplification). With CP_ARENA the pager OWNS the bytes: a miss
+   is one pread of exactly the region into a buffer inside the budget, an eviction recycles
+   that buffer, and the caller reads from RAM. Measured on this disk, one pread is both
+   fewer bytes (1.00x) and faster (6-13 ms) than the same region faulted in (3-6x, 12-18 ms).
+
+   Always call this BEFORE reading; it is also the accounting point (hit/miss/eviction), so
+   replacing it with a direct pointer read would silently stop the counters. Returns NULL
+   when no pager is attached. */
+const void *pager_region_get(int id);
 
 /* Per-STEP (per-token) accounting, not cumulative-only. A cumulative counter
    divided by the wrong token count has already cost this project a debugging
