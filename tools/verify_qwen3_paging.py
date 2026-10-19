@@ -141,6 +141,8 @@ def main():
     ap.add_argument("--budget-mb", type=int, default=0,
                     help="also check this finite budget (C2's knob); 0 = unlimited only")
     ap.add_argument("--keep", default="scratch/c1")
+    ap.add_argument("--check-pinning", action="store_true", default=True,
+                    help="also check CP_PIN_CORE at the finite budget (default on)")
     args = ap.parse_args()
     ids = args.tokens
     T = len(ids.split(","))
@@ -227,6 +229,26 @@ def main():
                 if ln.strip() and not ln.startswith("#")]
         num = [[int(x) for x in r] for r in rows]
         print(f"  CP_BUDGET={bm} MB: "
+              + ", ".join(f"tok {r[0]} {r[1]} regions/{r[4]} evict" for r in num))
+
+    # Pinning changes WHICH region is evicted. It must not change a value, so the same
+    # bit-identity bar applies at the same tight budget — and the pinned floor must be
+    # honoured (the report says how much of the budget it took).
+    if args.budget_mb and args.check_pinning:
+        bm = args.budget_mb
+        run(args.engine, args.model, ids, str(pre) + "_pin",
+            {"CP_PAGER": "1", "CP_BUDGET": str(bm), "CP_PIN_CORE": "1"})
+        for suf in (".logits", ".route", ".router"):
+            a = (Path(str(pre) + "_unpaged" + suf)).read_bytes()
+            b = (Path(str(pre) + "_pin" + suf)).read_bytes()
+            same = a == b
+            ok &= same
+            print(f"  {suf:9s} at CP_BUDGET={bm} MB + CP_PIN_CORE: "
+                  f"{'BIT-IDENTICAL' if same else 'DIFFERS'}")
+        rows = [ln.split() for ln in Path(str(pre) + "_pin.pager").read_text().splitlines()
+                if ln.strip() and not ln.startswith("#")]
+        num = [[int(x) for x in r] for r in rows]
+        print(f"  CP_BUDGET={bm} MB + pinned core: "
               + ", ".join(f"tok {r[0]} {r[1]} regions/{r[4]} evict" for r in num))
 
     print()

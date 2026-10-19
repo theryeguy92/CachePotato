@@ -21,6 +21,9 @@ typedef struct {
     int is_expert;          /* for the report's core/expert split. Not derivable
                                from an index: the v4 front-end gets regions in the
                                file's order, where they are interleaved. */
+    int pinned;             /* never chosen as an LRU victim (CP_PIN_CORE). Still
+                               counts against the budget: pinning is a policy about
+                               WHO gets evicted, not a way to get memory for free. */
 } Region;
 
 /* Which front-end opened the pager. 0 = none, 1 = pager_init (v2/v3 layout),
@@ -44,6 +47,8 @@ static long n_evictions, bytes_evicted;
 static long n_hits, n_misses, bytes_missed, n_prefetch, n_pf_resident;
 static long n_ehits, n_emisses, bytes_emissed;   /* routed experts only */
 static int sys_evict;           /* CP_PAGER_SYS: also evict the system cache */
+static int pin_core;            /* CP_PIN_CORE: core (non-expert) regions are never victims */
+static int warned_pinned_over;  /* one message, not one per enforce call */
 static int model_fd;
 static const float *model_data;
 
@@ -82,7 +87,8 @@ static void add_region_raw(const char *name, int layer, float *ptr, size_t bytes
         regions = nr;
         cap_regions = nc;
     }
-    regions[n_regions++] = (Region){name, layer, ptr, bytes, 0, 0, is_expert};
+    regions[n_regions++] = (Region){name, layer, ptr, bytes, 0, 0, is_expert,
+                                    pin_core && !is_expert};
 }
 
 static void add_region(const char *name, int layer, float *ptr, size_t bytes) {
@@ -97,6 +103,8 @@ void pager_init(Model *m, long budget_bytes) {
     model_data = m->data;
     const char *s = getenv("CP_PAGER_SYS");
     sys_evict = s && s[0] == '1';
+    const char *pc = getenv("CP_PIN_CORE");
+    pin_core = pc && pc[0] == '1';
     const char *pw = getenv("CP_PREFETCH_W");
     if (pw) pf_w = atoi(pw);
     if (pf_w < 0) pf_w = 0;
@@ -187,6 +195,8 @@ int pager_open_v4(int fd, const void *map_base, size_t data_off, long budget_byt
     if (model_fd < 0) { perror("pager: dup"); pager_mode = 0; return -1; }
     const char *s = getenv("CP_PAGER_SYS");
     sys_evict = s && s[0] == '1';
+    const char *pc = getenv("CP_PIN_CORE");
+    pin_core = pc && pc[0] == '1';
     /* Expert prefetch (CP_PREFETCH_W) is v3 policy: it predicts token t+1's experts
        from the history pager_moe_access() keeps. C1 pages on demand only, so the
        knob is not read here — a silent W=4 would make a warm run look like a win. */
@@ -320,11 +330,21 @@ void pager_enforce(void) {
     while (resident_bytes > budget) {
         int victim = -1;
         for (int i = 0; i < n_regions; i++)
-            if (regions[i].resident &&
+            if (regions[i].resident && !regions[i].pinned &&
                 (victim < 0 || regions[i].last_used < regions[victim].last_used))
                 victim = i;
-        if (victim < 0)
+        if (victim < 0) {
+            /* Everything left is pinned: the budget is below the pinned floor, so the
+               policy cannot honour it. Say so once — silently running over budget would
+               make every number after this one a fiction. */
+            if (!warned_pinned_over) {
+                fprintf(stderr, "pager: budget too small for the pinned core (%ld MB "
+                                "resident, %ld MB budget) — running over budget\n",
+                        resident_bytes / (1024 * 1024), budget / (1024 * 1024));
+                warned_pinned_over = 1;
+            }
             break;
+        }
         Region *r = &regions[victim];
         unsigned long start = (unsigned long)r->ptr & ~(PAGE - 1);
         size_t len = r->bytes + ((unsigned long)r->ptr - start);
@@ -354,10 +374,11 @@ static void budget_str(char *buf, size_t n) {
 }
 
 static void pager_report_resident(void) {
-    long core_b = 0, exp_b = 0, core_n = 0, exp_n = 0, exp_total = 0;
+    long core_b = 0, exp_b = 0, core_n = 0, exp_n = 0, exp_total = 0, pin_b = 0;
     for (int i = 0; i < n_regions; i++) {
         if (regions[i].is_expert) exp_total++;
         if (!regions[i].resident) continue;
+        if (regions[i].pinned) pin_b += (long)regions[i].bytes;
         if (regions[i].is_expert) { exp_b += (long)regions[i].bytes; exp_n++; }
         else { core_b += (long)regions[i].bytes; core_n++; }
     }
@@ -366,6 +387,10 @@ static void pager_report_resident(void) {
                     " | total %.1f MB of budget %s\n",
             core_n, core_b / 1048576.0, exp_n, exp_total,
             exp_b / 1048576.0, (core_b + exp_b) / 1048576.0, bs);
+    if (pin_core)
+        fprintf(stderr, "  pinned    : %.1f MB never evicted (CP_PIN_CORE) — evictable "
+                        "capacity %.1f MB for experts\n",
+                pin_b / 1048576.0, ((long)budget - pin_b) / 1048576.0);
 }
 
 void pager_report(void) {
