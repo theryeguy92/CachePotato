@@ -449,6 +449,28 @@ int qwen3_bind_layer(QW3Layer *m, int layer) {
 
         if (name_is(nm, nlen, "embed"))     { m->embed.p = ptr; m->embed.enc = enc;
                                               m->reg_embed = reg; continue; }
+        if (nlen > 6 && memcmp(nm, "embed.", 6) == 0) {
+            int c = atoi((const char *)nm + 6);
+            if (c >= 0 && c < 65536) {
+                if (c >= m->embed_chunks) {
+                    int nc = c + 1;
+                    int *nr = realloc(m->reg_embed_chunk, (size_t)nc * sizeof(int));
+                    const void **np = realloc(m->embed_chunk_ptr, (size_t)nc * sizeof(void *));
+                    if (!nr || !np) return -2;
+                    m->reg_embed_chunk = nr;
+                    m->embed_chunk_ptr = np;
+                    for (int i = m->embed_chunks; i < nc; i++) {
+                        m->reg_embed_chunk[i] = -1;
+                        m->embed_chunk_ptr[i] = NULL;
+                    }
+                    m->embed_chunks = nc;
+                }
+                m->reg_embed_chunk[c] = reg;
+                m->embed_chunk_ptr[c] = ptr;
+                if (c == 0) { m->embed_rows = (int)dims[0]; m->embed.enc = enc; }
+            }
+            continue;
+        }
         if (name_is(nm, nlen, "lm_head"))   { m->lm_head.p = ptr; m->lm_head.enc = enc;
                                               m->reg_lm_head = reg; continue; }
         if (name_is(nm, nlen, "final_norm")){ m->final_norm = (const float *)ptr;

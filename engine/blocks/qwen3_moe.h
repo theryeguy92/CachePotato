@@ -57,6 +57,13 @@ typedef struct {
     int reg_ln1, reg_ln2, reg_qnorm, reg_knorm;
     int reg_Wq, reg_Wk, reg_Wv, reg_Wo, reg_Wgate;
     int reg_embed, reg_lm_head, reg_final_norm;
+    /* embed as row-chunks (embed.0 .. embed.N). A token reads ONE row of the embedding table,
+       so a file that declares the whole 330 MB table as one region costs a pager that owns its
+       bytes the entire table per token — measured as the reason the arena lost. 0 chunks means
+       the file has a single `embed` tensor (the older shape) and m->embed is the whole table. */
+    int embed_chunks, embed_rows;
+    int *reg_embed_chunk;
+    const void **embed_chunk_ptr;
 } QW3Layer;
 
 typedef struct {

@@ -38,6 +38,13 @@ def main():
                     help="JSON from tools/fit_expert_pairs.py: per-layer expert permutations")
     ap.add_argument("--group", type=int, default=2,
                     help="experts per region when --expert-order is given (default 2)")
+    # REGION GRANULARITY vs ACCESS GRANULARITY. `embed` is a lookup table: a token reads ONE
+    # row (2 KB at Q8) and never the other 151,935. Declared as one 330 MB region it costs a
+    # pager that owns its bytes a whole region per token for one row — measured as the reason
+    # the arena lost. This splits it into row-chunks so a region is at most a few MB.
+    ap.add_argument("--embed-rows", type=int, default=1024,
+                    help="rows per embed region (0 = one region for the whole table); "
+                         "the block ref count is u8, so Voc/embed-rows must be <= 254")
     args = ap.parse_args()
 
     md = ROOT / args.model
@@ -112,22 +119,43 @@ def main():
             return (n // 32) * 34
         return n * 4
 
-    def add(name, shape, src_name, role, enc="f32"):
+    def add(name, shape, src_name, role, enc="f32", rows=None):
         """Register LAZILY: the payload is read and quantized at write time, one tensor at a time.
 
         Every tensor goes through this path, not just the experts. Materialising them would need
         the sum of all payloads (61 GB fp32, 16.2 GB at Q8) against 16 GB of RAM.
         """
         use = "q8_0" if (enc == "q8_0" and args.quant == "q8_0") else "f32"
-        def source(_n=src_name, _u=use):
-            a = np.ascontiguousarray(t(_n), dtype=np.float32)
+        def source(_n=src_name, _u=use, _r=rows):
+            if _r is None:
+                a = np.ascontiguousarray(t(_n), dtype=np.float32)
+            else:
+                # read only the rows this chunk needs: the full table is 330 MB at Q8 and
+                # materialising it once per chunk would dominate the conversion
+                r0, r1 = _r
+                a = np.ascontiguousarray(_h(_n).get_slice(_n)[r0:r1].float().numpy(),
+                                         dtype=np.float32)
             return _q8.encode_q8_0(a)[0] if _u == "q8_0" else a.tobytes()
         tid[name] = w.add_tensor_lazy(name, shape, nbytes_for(shape, use),
                                      role=role, enc=use, source=source)
         _src[name] = (src_name, tuple(int(x) for x in shape), use)
 
     # embedding table (also the shard-1 input); the model's head is UNTIED
-    add("embed", (Voc, D), "model.embed_tokens.weight", V.R_EMBED, enc="q8_0")
+    embed_tids = []
+    EMB = args.embed_rows
+    if EMB and 0 < EMB < Voc:
+        if (Voc + EMB - 1) // EMB > 254:
+            raise SystemExit(f"--embed-rows {EMB} needs {(Voc+EMB-1)//EMB} regions but a block "
+                             f"holds at most 255 refs; use >= {(Voc + 253)//254} rows")
+        for c, r0 in enumerate(range(0, Voc, EMB)):
+            r1 = min(r0 + EMB, Voc)
+            add(f"embed.{c}", (r1 - r0, D), "model.embed_tokens.weight", V.R_EMBED,
+                enc="q8_0", rows=(r0, r1))
+            embed_tids.append(tid[f"embed.{c}"])
+        print(f"  embed: {len(embed_tids)} regions of {EMB} rows")
+    else:
+        add("embed", (Voc, D), "model.embed_tokens.weight", V.R_EMBED, enc="q8_0")
+        embed_tids = [tid["embed"]]
     for l in range(L):
         p = f"model.layers.{l}."
         add(f"ln1.{l}", (D,), p + "input_layernorm.weight", V.R_NORM)
@@ -150,7 +178,7 @@ def main():
     # so there is no embedding to fall back on. A silent hole, not a crash.
     add("final_norm", (D,), "model.norm.weight", V.R_NORM)
     add("lm_head", (Voc, D), "lm_head.weight", V.R_HEAD, enc="q8_0")
-    w.add_block(V.KIND_EMBED, 0xFFFFFFFF, refs=[tid["embed"]], params=[Voc, D, 0])
+    w.add_block(V.KIND_EMBED, 0xFFFFFFFF, refs=embed_tids, params=[Voc, D, 0])
     for l in range(L):
         # attention: params are (n_heads, n_kv_heads, head_dim, rope_theta, qk_norm, sliding_window).
         # qk_norm = 1 means the block reads q_norm and k_norm AFTER Wo -> see SPEC §7.

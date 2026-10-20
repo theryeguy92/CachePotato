@@ -197,14 +197,28 @@ static void apply_head(QW3Layer *m, float *x, int T, int pos0, float *logits, in
     }
 }
 
+/* One row per token. With chunked embed regions this fetches the chunk that holds the row
+   (~2 MB) instead of the whole table (330 MB) — the difference between a region being a read
+   unit and an access being a read unit. */
 static void embed_rows(QW3Layer *m, const int *ids, int T, int pos0, float *x, int D) {
+    const size_t q8_row = (size_t)((D / 32) * 34);
     for (int t = 0; t < T; t++) {
-        const void *base = m->embed.p;
-        if (m->pager) { pager_step(pos0 + t); base = pager_region_get(m->reg_embed); }
-        const unsigned char *row = (const unsigned char *)base
-                                 + (size_t)ids[t] * (size_t)((D / 32) * 34);
-        if (m->embed.enc == QW3_ENC_Q8) q8_dequant_row(row, x + (size_t)t * D, D);
-        else memcpy(x + (size_t)t * D, (const float *)base + (size_t)ids[t] * D,
+        int row = ids[t];
+        const void *base;
+        if (m->embed_chunks > 0 && m->embed_rows > 0) {
+            int c = row / m->embed_rows, r = row - c * m->embed_rows;
+            if (c >= m->embed_chunks) { c = m->embed_chunks - 1; r = row - c * m->embed_rows; }
+            if (m->pager) { pager_step(pos0 + t); base = pager_region_get(m->reg_embed_chunk[c]); }
+            else base = m->embed_chunk_ptr[c];
+            row = r;
+        } else {
+            if (m->pager) { pager_step(pos0 + t); base = pager_region_get(m->reg_embed); }
+            else base = m->embed.p;
+        }
+        if (m->embed.enc == QW3_ENC_Q8)
+            q8_dequant_row((const unsigned char *)base + (size_t)row * q8_row,
+                           x + (size_t)t * D, D);
+        else memcpy(x + (size_t)t * D, (const float *)base + (size_t)row * D,
                     sizeof(float) * D);
     }
 }
@@ -293,8 +307,10 @@ int main(int argc, char **argv) {
     const int D = m.d_model, V = m.vocab, K = m.topk, E = m.n_experts;
     fprintf(stderr, "model: D=%d heads=%d/%d hd=%d d_exp=%d experts=%d top%d vocab=%d layers=%d\n",
             D, m.n_heads, m.n_kv, m.head_dim, m.d_exp, E, K, V, L);
-    if (!m.embed.p || !m.lm_head.p || !m.final_norm) {
-        fprintf(stderr, "missing embed/lm_head/final_norm\n"); return 1;
+    /* a chunked file has no single `embed` tensor — the chunks are the table */
+    if ((!m.embed.p && m.embed_chunks == 0) || !m.lm_head.p || !m.final_norm) {
+        fprintf(stderr, "missing embed/lm_head/final_norm (chunks %d)\n", m.embed_chunks);
+        return 1;
     }
 
     /* Bind every layer once. Each layer needs its own expert binding arrays, because
