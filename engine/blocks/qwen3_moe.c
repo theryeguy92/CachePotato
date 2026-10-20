@@ -230,6 +230,12 @@ int qwen3_layer_kv(const QW3Layer *m, const float *x, int T, int pos0, QW3KV *ca
    tools/verify_qwen3_blocks.py. The real port reads CPW1 v4; this exists so a mismatch here is
    unambiguously arithmetic. */
 int qwen3_load_blob(QW3Layer *m, const char *path, float **owned) {
+    /* A loader must not depend on the caller's stack being zero: `pager`, the region ids and
+       the embed-chunk arrays are all "absent" as zero/NULL, and a caller that forgets to
+       memset would otherwise read garbage as "a pager is attached" and dereference it. The
+       block gate's runner does exactly that, and caught this by segfaulting once the struct
+       grew a pager field. */
+    memset(m, 0, sizeof *m);
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return -1; }
     int h[8];
@@ -304,6 +310,7 @@ static int name_is(const char *s, unsigned len, const char *want) {
 }
 
 int qwen3_map(QW3Layer *m, const char *path) {
+    memset(m, 0, sizeof *m);   /* same contract as qwen3_load_blob */
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror(path); return -1; }
     struct stat st;
