@@ -156,3 +156,48 @@ previous token did *not* select, and no prefetch can know them before the router
 I/O is demand-driven on unpredictable experts; there is nothing to overlap it with. The only real
 way to cut it is fewer bytes (step 2), a bigger budget (4→11 GB halves the fetches), or a layout
 that raises reuse (Tier B, measured and negative).
+
+## Step 2 measured: chunked embed helps, the arena still does not — and now we know why
+
+Full re-conversion with 149 embed regions (6,727 regions, 19,015 tensors, `V4 FORMAT: PASS`), and
+the 48-layer output is **bit-identical** to the one-region file. Measured at 8 GB / 4 threads /
+32 tokens / cold start:
+
+| file | read path | regions/tok | fetched MB/tok | physical MB/tok | ms/tok | tok/s |
+|---|---|---:|---:|---:|---:|---:|
+| one `embed` region | mmap | 108.3 | 542.9 | 986 | 2861 | 0.350 |
+| **149 embed regions** | **mmap** | 102.2 | 511.4 | **866** | **2668** | **0.375** |
+| 149 embed regions | arena | 102.3 | 512.0 | 1059 | 3233 | 0.310 |
+
+**Chunked embed is the best configuration so far: 0.375 tok/s** (+7% on bind-once, +155% on the
+0.147 this branch started at). The arena is *still* worse, and instrumenting the pread volume
+explains both facts at once.
+
+### Why the arena cannot win on this filesystem
+
+The pager requested **11,424 MB via `pread` over 13 steps** — exactly the region bytes it fetched —
+and the process read 1.3–2× that from the block device. The excess is not the pager and not
+fault-around: **btrfs/kernel issue I/O in up-to-4 MiB blocks** (`max_sectors_kb=4096`), and an expert
+region is 4.78 MB, so it always spans two of them. A fetch of 4.78 MB therefore reads 8–12 MB.
+
+Under **mmap that is not waste**: the extra block bytes land in the page cache and the *neighbouring*
+region — the next expert of the same layer, or the same expert next token — is served from them.
+Under the **arena** the over-read is thrown away by the `POSIX_FADV_DONTNEED` that makes the
+measurement honest, so the arena pays for the same blocks and then discards what the page cache
+would have reused. That is why 866 MB under mmap becomes 1059 MB under the arena.
+
+Which corrects the earlier framing: the "1.9× amplification" is **block rounding plus readahead that
+the cache reuses**, not pure waste. It only becomes waste when the pager owns the bytes and drops
+them. The read path the measurements favour is therefore **mmap for the data + chunked regions for
+the accounting**, which is exactly the 0.375 tok/s row.
+
+### What is left, honestly
+
+- **Total for this round: 0.147 → 0.375 tok/s (2.55×)** at 8 GB, with page counts, file format and
+  numerics unchanged (bit-identity gated at every step).
+- The remaining I/O is demand-driven: **86.8% of touches are already hits**, so there is nothing to
+  prefetch (step 3), and the bytes are block-rounded (step 2). Both levers are now closed by
+  measurement, not by opinion.
+- What remains is **compute** (the token is ~1.4 s compute at 4 threads, ~0.7 s I/O now) and **budget**:
+  the 11 GB arm halves the fetches through reuse alone (~0.45–0.5 tok/s expected) without touching a
+  line of code. That is the next measurement, not the next implementation.

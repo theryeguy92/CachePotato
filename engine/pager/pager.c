@@ -52,6 +52,7 @@ static int pin_core;            /* CP_PIN_CORE: core (non-expert) regions are ne
 static int use_arena;           /* CP_ARENA: the pager owns the bytes (pread per region) */
 static long n_arena_fallback;   /* regions too big for the budget, read from the mapping */
 static long arena_bytes;        /* bytes currently held in arena buffers */
+static long arena_pread_bytes;  /* bytes actually requested from the kernel */
 static int warned_pinned_over;  /* one message, not one per enforce call */
 static int model_fd;
 static const float *model_data;
@@ -262,6 +263,7 @@ const void *pager_region_get(int id) {
             arena_make_room(r->bytes);
             void *buf = malloc(r->bytes);
             if (!buf) { fprintf(stderr, "pager: arena malloc failed\n"); exit(1); }
+            arena_pread_bytes += (long)r->bytes;
             if (pread(model_fd, buf, r->bytes, (off_t)((const unsigned char *)r->ptr
                                                        - (const unsigned char *)model_data)) !=
                 (ssize_t)r->bytes) {
@@ -480,8 +482,8 @@ static void pager_report_resident(void) {
                 pin_b / 1048576.0, ((long)budget - pin_b) / 1048576.0);
     if (use_arena)
         fprintf(stderr, "  arena     : %.1f MB held in pager buffers (%ld oversized regions "
-                        "read through the mapping)\n",
-                arena_bytes / 1048576.0, n_arena_fallback);
+                        "read through the mapping); %.1f MB requested via pread\n",
+                arena_bytes / 1048576.0, n_arena_fallback, arena_pread_bytes / 1048576.0);
 }
 
 void pager_report(void) {
