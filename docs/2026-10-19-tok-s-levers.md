@@ -201,3 +201,41 @@ the accounting**, which is exactly the 0.375 tok/s row.
 - What remains is **compute** (the token is ~1.4 s compute at 4 threads, ~0.7 s I/O now) and **budget**:
   the 11 GB arm halves the fetches through reuse alone (~0.45–0.5 tok/s expected) without touching a
   line of code. That is the next measurement, not the next implementation.
+
+## Round 3: the consolidated table, the cost model, and why the compute levers are capped
+
+Final measurement (chunked file, 4 threads, cold start, 32 tokens):
+
+| arm | regions/token | physical MB/tok | ms/token | tok/s |
+|---|---:|---:|---:|---:|
+| unpaged control | 38.3 | 401.3 | 1417 | 0.709 |
+| 8 GB, cache on | 102.2 | 374.1 | 1357 | 0.737 |
+| 8 GB, honest disk | 102.2 | 926.2 | 2753 | 0.363 |
+| 11 GB, honest disk | 39.2 | 362.0 | 1304 | 0.767 |
+| **13 GB, honest disk** | 38.3 | 348.5 | **1252** | **0.799** |
+| 14 GB, honest disk | 38.3 | 347.3 | 1266 | 0.790 |
+
+**A two-parameter model fits all of it:** `t = 374 ms + physical_MB / 0.389 GB/s` (control predicted
+1405 against 1417 measured; the 8 GB arms are exact by construction). Two consequences:
+
+1. **Compute is 374 ms — 30% of the token at 13 GB, 14% at 8 GB.** The int8-activation dot would
+   attack that 374 ms and nothing else: its ceiling is `1252 → 895 ms`, i.e. **1.4×**, and it costs
+   the q8 gate's tolerance and a quality question that Tier C would have to re-answer. Same for f16
+   weights (a format change) and for any further kernel work. **Not worth it** — the compute levers
+   are now capped by arithmetic, not by implementation effort.
+2. **Disk is 895 ms of 1252 ms at 13 GB**, and the curve saturates because 38.3 regions/token is the
+   *compulsory* demand. So the wall is **0.8 tok/s**, set by the new experts a token selects.
+
+### What that leaves
+
+- **Fewer bytes per compulsory region**: Q4 halves each expert to ~2.4 MB, but block rounding
+  (4 MiB) then dominates, so expect ~160 MB/token → ~1.0 tok/s rather than 2×. Tier C quality, and
+  the Q4 kernel measured slower in the vault's earlier work.
+- **Fewer compulsory regions**: a top-4 model (half the active experts) would halve the bytes;
+  that is a model choice, not an engine one.
+- **More reuse**: Tier B measured negative at 11.2% co-selection.
+- **A faster disk**: the 0.389 GB/s is the SATA SSD's measured sequential rate.
+
+Time on this machine: **~0.8 tok/s ceiling for this model**, and the engine is within 30% of it being
+pure compute. The next useful thing is not a kernel — it is a *smaller-active* model (the Qwen3-Coder
+port at the same geometry, or a 3B for speed), measured with this same harness.

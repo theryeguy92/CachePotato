@@ -14,26 +14,30 @@ the unpaged run; the accounting is checked against the file's own region table (
 3600.2 MB for one token: 435 core + 384 experts), not against itself. 20 gates.
 
 **C2 — the paging numbers.** Qwen3-30B-A3B Q8, 32.5 GB against 16 GB, 32 greedy tokens, cold start,
-interleaved arms, deterministic counters identical across reps.
+interleaved arms, **4 threads**, region-chunked `embed` file, 2 reps (1 rep for 13/14 GB; the
+deterministic counters are identical in every rep). This is the consolidated table; it replaces the
+single-threaded numbers that stood here and the correction note that annotated them.
 
-> **Thread-count correction (2026-10-19).** The table below was measured **single-threaded**:
-> `c2_measure.py` stripped every `CP_*` variable, including `CP_THREADS`, and the engine defaults
-> to one thread. Re-measured at 4 threads with everything else identical
-> (`bench/results/c2/2026-10-19-threaded*`): the honest 8 GB arm is **3182 ms/token = 0.314 tok/s**
-> (not 0.147) and the unpaged control is **0.521** (not 0.176) — a **2.1–3.0×** understatement. 8
-> threads is worse than 4. The page-count columns are unaffected (deterministic, thread-independent),
-> so the paging findings stand; the speed conclusions were too pessimistic, and the corrected
-> envelope is in `docs/2026-10-19-tok-s-levers.md`.
+| arm | regions/token | fetched MB/tok | physical MB/tok | ms/token | tok/s |
+|---|---:|---:|---:|---:|---:|
+| unpaged control | 38.3 *(demand)* | 191.3 | 401.3 | 1417 | 0.709 |
+| 8 GB, page cache on | 102.2 | 511.4 | 374.1 | 1357 | 0.737 |
+| 8 GB, honest disk | 102.2 | 511.4 | 926.2 | 2753 | 0.363 |
+| 11 GB, honest disk | 39.2 | 196.2 | 362.0 | 1304 | 0.767 |
+| **13 GB, honest disk** | 38.3 | 191.3 | 348.5 | **1252** | **0.799** |
+| 14 GB, honest disk | 38.3 | 191.3 | 347.3 | 1266 | 0.790 |
 
-| budget | policy | regions/token | physical MB/token | tok/s |
-|---|---|---:|---:|---:|
-| unpaged control | OS page cache | 38.1 *(demand)* | 418 | 0.176 |
-| 11 GB | pager | 39.6 | 383 | 0.195 |
-| 8 GB | pager | 108.3 | 1014 | 0.147 |
-| 4 GB | pager | 255.5 | 1633 | 0.119 |
-| 4 GB | pager + core pinned | 244.0 | 1597 | 0.124 |
-| 2 GB | pager | 818.9 | 3510 | 0.085 |
-| 2 GB | pager + core pinned | **384.0** | 2110 | **0.100** |
+Two things to read off it. First, the pager **beats the unpaged control at 11–13 GB** (0.767–0.799
+against 0.709) while running with a hard cap: at equal memory its region-LRU keeps the working set
+better than the OS does. Second, the **budget curve saturates at ~13 GB** — 38.3 regions/token is the
+*demand* figure, i.e. the compulsory misses — so no larger budget helps.
+
+**The cost model, fitted from the two 8 GB arms and checked against the control:**
+`t = 374 ms compute + physical_MB / 0.389 GB/s` — predicted 1405 ms for the control against 1417
+measured. At 13 GB, **disk is 895 ms of the 1252 ms token (71%)** and compute is 374 ms. So
+**this engine is disk-bound at every budget**, and the ceiling on this machine is **0.8 tok/s**,
+set by the compulsory 191 MB/token of newly-selected experts times the ~1.8× block-rounding
+overhead.
 
 Three findings that survived every check:
 

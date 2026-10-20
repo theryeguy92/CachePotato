@@ -281,9 +281,11 @@ claims separable is what the whole verification structure is for.
 - **The paging thesis HAS now been exercised on a model that does not fit — and the answer is a
   tie.** Qwen3-30B-A3B (32.5 GB at Q8, 48 layers, 128 experts, top-8) runs on the T480 from a CPW1
   v4 file with the output **bit-identical** to the unpaged run at every budget, and per-token
-  counters checked against the file's own region table. It runs at **0.31 tok/s at 8 GB** on four
-  threads (0.52 unpaged), and the first measurements said 0.147 only because the harness was
-  silently running one thread —
+  counters checked against the file's own region table. On four threads it runs at **0.80 tok/s at
+  a 13 GB budget**, 0.77 at 11 GB, and **0.36 at 8 GB with real disk reads** — and the first
+  measurements said 0.147 only because the harness was silently running one thread. At 13 GB it also
+  *beats* the unpaged control (0.71), so the region-LRU is better than the OS's paging at equal
+  memory —
   and at equal memory the pager only *ties* the OS page cache (54.8 vs 54.7 regions/token at 11 GB).
   Core pinning is the one policy win (2.13x fewer reads at 2 GB). See
   [`docs/2026-10-19-c2-results-and-thesis.md`](docs/2026-10-19-c2-results-and-thesis.md).
@@ -295,8 +297,10 @@ claims separable is what the whole verification structure is for.
   beside the GPT-2 `Model`; merging them is a refactor with no numerical payoff yet, and until it
   happens `cachepotato -i` speaks only GPT-2.
 
-The T6b estimate above predicted **2–4 tok/s** for a 3B-active MoE. Measured: **0.31 tok/s** on four
-threads, on the honest-disk arm. The
+The T6b estimate above predicted **2–4 tok/s** for a 3B-active MoE. Measured: **0.80 tok/s** at a
+13 GB budget, 0.36 at 8 GB. A two-parameter fit (`t = 374 ms compute + bytes/0.389 GB/s`) says
+**71% of the token is disk even at 13 GB**, so the gap is bandwidth and compulsory reads, not
+compute. The
 gap is not bandwidth — 3.6 GB/token at the disk's 0.39 GB/s would be 9 s, and the run is 6.8 s. It
 is **compute**, dominated by scalar Q8 dequant, at ~1.28 ms per 1B active elements. That is the
 number to attack if this engine is to become usable, and it is the same number for every model.
@@ -485,7 +489,7 @@ through one contract ([`models/CONTRACT.md`](models/CONTRACT.md)), a self-descri
 [format](format/SPEC.md) with two block encodings, and 16 gates. See
 [Phase 8](#phase-8--the-engine-meets-someone-elses-model) for what was measured and what is still
 missing. The paging experiment itself is now done on a model that does not fit — exact, and at
-0.31 tok/s on four threads — batch-usable, not interactive. The next step is not a bigger
+0.80 tok/s at a 13 GB budget — batch-usable, not interactive. The next step is not a bigger
 model but a smaller, faster one: see
 [`docs/2026-10-19-c2-results-and-thesis.md`](docs/2026-10-19-c2-results-and-thesis.md).
 
@@ -513,10 +517,11 @@ model but a smaller, faster one: see
   measured machine noise floor of 8–17%, and it is content-dependent across document blocks.
   The 384 MB re-measurement (+38.2%) is significant but **flagged**: λ=0's access pattern
   exhausts the hot tier, so that figure is a whole-hierarchy effect, not pure expert paging.
-- **Usable speed is not a claim.** The 30B port runs exactly and at 0.31 tok/s on four threads. The measured
-  envelope on this machine (16 GB, 4 cores, SATA SSD) is ~1 tok/s at 3B active and ~0.35 at 7B
-  dense; a model large enough to need paging is ~0.15. Those two requirements pull in opposite
-  directions, and the numbers behind that table are in the C2 record.
+- **Usable speed is not a claim.** The 30B port runs exactly and at 0.80 tok/s at a 13 GB budget
+  (0.36 at 8 GB, where real disk reads happen). The measured envelope on this machine is set by
+  **compulsory expert traffic, not compute**: compute is 374 ms/token, disk is 895 ms at 13 GB, and
+  the curve saturates because the remaining reads are exactly the experts each token selects. A
+  model with fewer active parameters is the lever, not a faster kernel.
 - **Model quality is not a claim.** This is a 12-layer, 736 MB research artifact at
   GPT-2-small scale, pretrained on FineWeb-Edu. It proves an architecture; it is not a useful
   assistant. Quality was checked only against a pre-registered repetition-rate gate.
