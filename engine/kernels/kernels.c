@@ -286,9 +286,61 @@ void matmul_wx_auto(float *out, const float *x, const float *w, const uint8_t *q
 
 typedef struct { float *out; const float *x; const uint8_t *w; int ng; size_t rowbytes; } WXQ8Ctx;
 
+#if defined(__AVX2__)
+/* Four rows per pass: x is loaded once per 32-element block and used four times, and the
+   four accumulator chains are independent so the FMA latency hides. Per-row summation order
+   is unchanged (blocks ascending, lanes summed once at the end), so this is bit-identical. */
+/* NOTE: hoisting the per-block scale out of the inner product (sum(q*d*x) == d*sum(q*x)) was
+   implemented and measured — it is a numerics change, and it is NOT kept: on this CPU the
+   small expert shapes are already at the DRAM ceiling (768x2048 measured 13.1 GB/s, against a
+   ~13 GB/s machine ceiling), so removing FP work buys nothing and the extra dependency costs
+   up to 46% on that shape (+12% on 2048x768, +9% on 4096x2048 — a wash overall). Keeping the
+   scale inside the block also keeps the kernel bit-identical, which is worth more. */
+static inline __m256 q8_dot_acc_avx2_x4(__m256 s, const uint8_t *blk,
+                                        __m256 x0, __m256 x1, __m256 x2, __m256 x3) {
+    const float d = q8_scale(blk);
+    const int8_t *q = (const int8_t *)(blk + 2);
+    const __m256 dv = _mm256_set1_ps(d);
+    __m256 v0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(q + 0)))), dv);
+    __m256 v1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(q + 8)))), dv);
+    __m256 v2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(q + 16)))), dv);
+    __m256 v3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(q + 24)))), dv);
+    s = _mm256_fmadd_ps(v0, x0, s);
+    s = _mm256_fmadd_ps(v1, x1, s);
+    s = _mm256_fmadd_ps(v2, x2, s);
+    s = _mm256_fmadd_ps(v3, x3, s);
+    return s;
+}
+#endif
+
 static void wx_q8_slice(void *v, int ilo, int ihi) {
     WXQ8Ctx *c = v;
-    for (int i = ilo; i < ihi; i++) {
+    int i = ilo;
+#if defined(__AVX2__)
+    for (; i + 4 <= ihi; i += 4) {
+        const uint8_t *r0 = c->w + (size_t)i * c->rowbytes;
+        const uint8_t *r1 = r0 + c->rowbytes;
+        const uint8_t *r2 = r1 + c->rowbytes;
+        const uint8_t *r3 = r2 + c->rowbytes;
+        __m256 s0 = _mm256_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
+        for (int g = 0; g < c->ng; g++) {
+            const size_t o = (size_t)g * 34;
+            const __m256 x0 = _mm256_loadu_ps(c->x + (size_t)g * 32 + 0);
+            const __m256 x1 = _mm256_loadu_ps(c->x + (size_t)g * 32 + 8);
+            const __m256 x2 = _mm256_loadu_ps(c->x + (size_t)g * 32 + 16);
+            const __m256 x3 = _mm256_loadu_ps(c->x + (size_t)g * 32 + 24);
+            s0 = q8_dot_acc_avx2_x4(s0, r0 + o, x0, x1, x2, x3);
+            s1 = q8_dot_acc_avx2_x4(s1, r1 + o, x0, x1, x2, x3);
+            s2 = q8_dot_acc_avx2_x4(s2, r2 + o, x0, x1, x2, x3);
+            s3 = q8_dot_acc_avx2_x4(s3, r3 + o, x0, x1, x2, x3);
+        }
+        c->out[i + 0] = q8_hsum8(s0);
+        c->out[i + 1] = q8_hsum8(s1);
+        c->out[i + 2] = q8_hsum8(s2);
+        c->out[i + 3] = q8_hsum8(s3);
+    }
+#endif
+    for (; i < ihi; i++) {
         const uint8_t *row = c->w + (size_t)i * c->rowbytes;
 #if defined(__AVX2__)
         /* Accumulate in a VECTOR across every group, then horizontal-sum ONCE per row.
@@ -321,6 +373,16 @@ void matmul_wx_q8(float *out, const float *x, const uint8_t *w, int n_in, int n_
         cp_parallel_for(n_out, wx_q8_slice, &c);
         return;
     }
+#if defined(__AVX2__)
+    /* The vector kernel used to live only inside the parallel dispatch, so a single-threaded
+       run fell through to the scalar loop — measured at 0.68 GFLOP/s against 6.5 for the same
+       code at 4 threads. Vectorisation and threading are independent; this makes them so. */
+    {
+        WXQ8Ctx c = { out, x, w, ng, rowbytes };
+        wx_q8_slice(&c, 0, n_out);
+        return;
+    }
+#endif
     for (int i = 0; i < n_out; i++) {
         const uint8_t *row = w + (size_t)i * rowbytes;
         float acc = 0.0f;

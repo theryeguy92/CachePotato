@@ -122,3 +122,37 @@ the paging levers (2 and 3) are what the 30B needs.**
 
 Steps 1–2 are hours. Steps 3–4 are the paging story and worth a day. Step 5 is the one that makes a
 ported 3B feel usable, and it is also the only one with a numerics decision in it.
+
+## Measured outcomes (2026-10-19, in the agreed order)
+
+**Step 4 — bind once: DONE, +11%.** 3182 → **2861 ms/token (0.350 tok/s)** at 8 GB, 4 threads,
+honest disk. Bit-identical (all five paging arms re-gated).
+
+**Step 2 — embed by row: code done and gated, full conversion pending.** `--embed-rows 1024`
+gives 149 embed regions instead of one 330 MB region; the engine resolves the chunk for a token's
+row and the pager fetches ~2 MB instead of the whole table. Verified **bit-identical** on a 1-layer
+file against the one-region version (unpaged and with the arena). The 32.5 GB re-conversion was
+started twice and abandoned both times because it competes with every measurement for CPU/disk —
+it needs a clean window, and its result is the next number to get.
+
+**Step 5 — kernel: DONE (bit-identical part), and the numerics part was measured and rejected.**
+
+| change | 1 thread | 4 threads | verdict |
+|---|---|---|---|
+| vector path reachable without the thread pool | 768×2048: 4.63 → **0.94 ms** (4.9×) | n/a (already parallel) | **keep** — `CP_THREADS=1` was silently running the *scalar* loop, because the AVX2 kernel lived only inside the parallel dispatch |
+| 4 rows per pass, shared x loads | — | 0.49 → 0.37 ms (contended run); clean: 13.1 GB/s | **keep** — bit-identical, at the DRAM ceiling |
+| hoist the block scale out of the dot | 0.94 → 0.47 ms (2×) | 768×2048 **0.13 → 0.19 ms (worse)**, 2048×768 +12%, 4096×2048 +9% | **rejected** — a wash, and it costs bit-identity |
+
+**But at 8 GB none of it shows:** 2861 → 2915 ms (within noise), because 2.5 s of the 2.9 s token
+is disk. The kernel lever is real and will show once the bytes come down (step 2) or at a budget
+where the token is compute-bound. That is the ordering lesson: **I/O first, compute second.**
+
+**Step 3 — prefetch: rejected before building it, from the data already on disk.** The plan was to
+prefetch the previous token's expert set on the assumption that 71–83% of a token's experts recur.
+The pager's own hit rate says the opposite of what the plan needs: **86.8% of touches are already
+hits** (710 of 819 regions), so the previous token's 384 regions are *resident* when the next token
+starts — queuing them reads nothing. The 108 regions that miss are, by definition, the experts the
+previous token did *not* select, and no prefetch can know them before the router runs. At 8 GB the
+I/O is demand-driven on unpredictable experts; there is nothing to overlap it with. The only real
+way to cut it is fewer bytes (step 2), a bigger budget (4→11 GB halves the fetches), or a layout
+that raises reuse (Tier B, measured and negative).
