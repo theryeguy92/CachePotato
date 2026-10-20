@@ -148,12 +148,16 @@ static void write_meta(const char *pre, const char *model_path, const QW3Layer *
 
 /* Run every layer once over T rows. `kv` non-NULL means incremental: the rows are
    positions pos0..pos0+T-1 in the per-layer caches. route/router are optional. */
-static int run_layers(QW3Layer *m, float *x, int T, int pos0, QW3KV *kv, int L,
+/* `layers` is bound ONCE at startup. Binding per token was the old shape and it walked all
+   18,867 tensor records — with an sscanf for each of the 18,432 expert names — 48 times per
+   token. None of that changes between tokens: the per-layer pointers and region ids are fixed
+   by the file, and with the arena the data pointers are resolved per touch anyway. */
+static int run_layers(QW3Layer *layers, float *x, int T, int pos0, QW3KV *kv, int L,
                       int *route, int route_stride, float *router) {
-    const int D = m->d_model, K = m->topk, E = m->n_experts;
     QW3Out o;
     for (int l = 0; l < L; l++) {
-        if (qwen3_bind_layer(m, l)) { fprintf(stderr, "bind layer %d failed\n", l); return -1; }
+        QW3Layer *m = &layers[l];
+        const int D = m->d_model, K = m->topk, E = m->n_experts;
         if (qwen3_layer_alloc(&o, m, T)) return -1;
         int rc = kv ? qwen3_layer_kv(m, x, T, pos0, &kv[l], &o)
                     : qwen3_layer(m, x, T, &o);
@@ -293,8 +297,23 @@ int main(int argc, char **argv) {
         fprintf(stderr, "missing embed/lm_head/final_norm\n"); return 1;
     }
 
+    /* Bind every layer once. Each layer needs its own expert binding arrays, because
+       qwen3_bind_layer fills m->exp[] and m->reg_exp[] for the layer it was given. */
+    QW3Layer *layers = calloc((size_t)L, sizeof(QW3Layer));
+    if (!layers) return 1;
+    for (int l = 0; l < L; l++) {
+        layers[l] = m;                                  /* map, table geometry, encodings */
+        layers[l].exp = calloc((size_t)E * 3, sizeof(QW3T));
+        layers[l].reg_exp = calloc((size_t)E, sizeof(int));
+        if (!layers[l].exp || !layers[l].reg_exp) return 1;
+        if (qwen3_bind_layer(&layers[l], l)) {
+            fprintf(stderr, "bind layer %d failed\n", l);
+            return 1;
+        }
+    }
+
     float *x = malloc(sizeof(float) * (size_t)T * D);
-    embed_rows(&m, ids, T, 0, x, D);
+    embed_rows(&layers[0], ids, T, 0, x, D);
 
     char fn[512], fn0[512];
     if (gen > 0) {
@@ -307,7 +326,7 @@ int main(int argc, char **argv) {
         {   /* the prefill is reported separately: it is prompt processing, not decode, and
                its reads are what leave the cache in whatever state the decode loop starts in */
             long io0 = io_read_kb(); double t0 = now_s();
-            if (run_layers(&m, x, T, 0, kv, L, NULL, 0, NULL)) return 1;
+            if (run_layers(layers, x, T, 0, kv, L, NULL, 0, NULL)) return 1;
             fprintf(stderr, "prefill: %.0f ms, %ld KB read\n",
                     (now_s() - t0) * 1e3, io_read_kb() - io0);
         }
@@ -326,11 +345,11 @@ int main(int argc, char **argv) {
             long io0 = io_read_kb();
             double t0 = now_s();
             memcpy(grow, last, sizeof(float) * D);   /* apply_head normalises in place */
-            apply_head(&m, grow, 1, pos - 1, glog + (size_t)s * V, V);
+            apply_head(&layers[0], grow, 1, pos - 1, glog + (size_t)s * V, V);
             gtok[s] = argmax_row(glog + (size_t)s * V, V);
-            embed_rows(&m, &gtok[s], 1, pos, grow, D);
+            embed_rows(&layers[0], &gtok[s], 1, pos, grow, D);
             /* the layer writes its K selections into this token's row block */
-            if (run_layers(&m, grow, 1, pos, kv, L, groute + (size_t)s * K, (size_t)gen * K,
+            if (run_layers(layers, grow, 1, pos, kv, L, groute + (size_t)s * K, (size_t)gen * K,
                            NULL)) return 1;
             gms[s] = now_s() - t0;
             gkb[s] = io_read_kb() - io0;
@@ -365,10 +384,10 @@ int main(int argc, char **argv) {
     /* ---- prefill: all T tokens in one forward (B5 / A5 / the C1 control) ---- */
     int *route = malloc(sizeof(int) * (size_t)L * T * K);
     float *router = malloc(sizeof(float) * (size_t)L * T * E);
-    if (run_layers(&m, x, T, 0, NULL, L, route, T * K, router)) return 1;
+    if (run_layers(layers, x, T, 0, NULL, L, route, T * K, router)) return 1;
 
     float *logits = malloc(sizeof(float) * (size_t)T * V);
-    apply_head(&m, x, T, 0, logits, V);
+    apply_head(&layers[0], x, T, 0, logits, V);
 
     if (m.pager) {
         snprintf(fn0, sizeof fn0, "%s.pager", pre);
