@@ -27,7 +27,14 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--shard1", action="store_true", help="only layers present in shard 1")
     ap.add_argument("--layers", type=int, default=None, help="override the layer count")
-    ap.add_argument("--quant", choices=["none", "q8_0"], default="none")
+    ap.add_argument("--quant", choices=["none", "q8_0", "q4_0"], default="none")
+    # The experts are 30.0 GB of the 32.5 GB file and 100% of the per-token disk traffic, so
+    # they are where bytes are worth the most. The attention weights, embed and lm_head are
+    # where a lossy encoding is felt most directly (lm_head produces the logits themselves).
+    # Whole-model Q4_0 halves the bytes but failed the quality gate (70.8% teacher-forced
+    # agreement on a factual probe); this lets the experts take Q4 while the rest stays Q8.
+    ap.add_argument("--quant-experts", choices=["none", "q8_0", "q4_0"], default=None,
+                    help="encoding for expert tensors only (default: same as --quant)")
     ap.add_argument("--manifest", default=None,
                     help="write name/offset/size so the payloads can be checked against the source")
     # TIER B: placement-only expert reordering. The order file names a permutation per layer;
@@ -105,6 +112,8 @@ def main():
     import importlib.util, sys as _s
     _spec = importlib.util.spec_from_file_location("format_q8", str(ROOT / "format/q8.py"))
     _q8 = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_q8)
+    _spec4 = importlib.util.spec_from_file_location("format_q4", str(ROOT / "format/q4.py"))
+    _q4 = importlib.util.module_from_spec(_spec4); _spec4.loader.exec_module(_q4)
 
     w = V.V4Writer()
     tid = {}
@@ -117,6 +126,9 @@ def main():
         if enc == "q8_0":
             assert n % 32 == 0, (shape, n)
             return (n // 32) * 34
+        if enc == "q4_0":
+            assert n % 32 == 0, (shape, n)
+            return (n // 32) * 18          # fp16 scale + 32 nibbles
         return n * 4
 
     def add(name, shape, src_name, role, enc="f32", rows=None):
@@ -125,7 +137,9 @@ def main():
         Every tensor goes through this path, not just the experts. Materialising them would need
         the sum of all payloads (61 GB fp32, 16.2 GB at Q8) against 16 GB of RAM.
         """
-        use = "q8_0" if (enc == "q8_0" and args.quant == "q8_0") else "f32"
+        # `enc` marks a tensor as quantisable; the flags pick which encoding each role gets.
+        want = args.quant_experts if (role == V.R_EXPERT and args.quant_experts) else args.quant
+        use = want if (enc in ("q8_0", "q4_0") and want != "none") else "f32"
         def source(_n=src_name, _u=use, _r=rows):
             if _r is None:
                 a = np.ascontiguousarray(t(_n), dtype=np.float32)
@@ -135,7 +149,9 @@ def main():
                 r0, r1 = _r
                 a = np.ascontiguousarray(_h(_n).get_slice(_n)[r0:r1].float().numpy(),
                                          dtype=np.float32)
-            return _q8.encode_q8_0(a)[0] if _u == "q8_0" else a.tobytes()
+            if _u == "q8_0": return _q8.encode_q8_0(a)[0]
+            if _u == "q4_0": return _q4.encode_q4_0(a)[0]
+            return a.tobytes()
         tid[name] = w.add_tensor_lazy(name, shape, nbytes_for(shape, use),
                                      role=role, enc=use, source=source)
         _src[name] = (src_name, tuple(int(x) for x in shape), use)

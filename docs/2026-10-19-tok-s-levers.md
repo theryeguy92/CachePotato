@@ -276,3 +276,42 @@ under memory latency. Nobody has measured Q4 in *this* regime, and that is the n
 
 A cheaper variant if a full Q4 is too lossy: **Q4 only the core** (1,597 MB of the 3,523 MB) or only
 `lm_head` (330 MB). Core-only Q4 saves ~85 ms/token (~7%) at much lower quality risk than the experts.
+
+## Round 5: Q4_0 measured — 1.40 tok/s, and the quality gate fails
+
+Whole-model Q4_0 (17,220 MB, 6,727 regions) at 13 GB / 4 threads / 32 tokens, 2 reps:
+
+| encoding | regions/tok | physical MB/tok | ms/token | tok/s |
+|---|---:|---:|---:|---:|
+| Q8_0 | 38.3 | 348.5 | 1252 | 0.799 |
+| **Q4_0** | 32.9 | **120.4** | **710** | **1.40** |
+
+**The bytes model is confirmed**: halving the encoding took 1.75x off the token (predicted 1.58,
+measured 1.41; the gap is the nibble-unpack cost, ~215 ms). Disk traffic fell further than half
+(348 → 120 MB) because smaller regions mean more of the working set is resident at the same budget.
+
+**But it does not pass the quality gate**, which was pre-registered before measuring:
+
+| probe | teacher-forced agreement | free-running | top-5 overlap |
+|---|---:|---:|---:|
+| code continuation | **91.7%** | 29.2% | 30.8% |
+| factual continuation | **70.8%** | 4.2% | 9.2% |
+
+The free-running numbers (29%, 4%) are *snowball*: one flipped token changes every later context,
+so they collapse for any lossy encoding and are diagnostic only. The teacher-forced number — the
+Q4 model scoring Q8's own trajectory on identical contexts — is the sound one, and 70.8% on the
+factual probe is a material loss. **Whole-model Q4_0 is rejected** at 4.5 bpw for a 30B on this
+evidence.
+
+### Where the bytes actually are, and the variant that follows
+
+| part | size at Q8 | share of per-token disk | share of per-token RAM |
+|---|---:|---:|---:|
+| experts (6,144 regions) | 30.0 GB | **100%** | 55% |
+| attention + norms + embed + lm_head | 2.5 GB | ~0% (97% resident) | 45% |
+
+The disk traffic is *entirely* experts, and the experts are also the safest thing to quantise
+less aggressively than the logits path: `lm_head` produces the logits themselves, and attention
+is where a 4-bit weight error propagates most directly. So the variant to measure is **Q4 experts,
+Q8 everywhere else** (`--quant-experts q4_0`): same disk saving, no unpack cost on the core, and
+the quality risk confined to the expert path. Predicted ~1.6-1.7 tok/s.

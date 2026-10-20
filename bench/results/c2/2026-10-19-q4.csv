@@ -1,0 +1,3 @@
+config,rep,regions_per_token,mb_per_token,hits_per_token,evictions_per_token,expert_hit_pct,core_hit_pct,physical_mb_per_token,ms_per_token,tok_per_s,prefill_ms,prefill_mb,mhz,mem_available_mb
+b13312sys,0,32.94,87.10,786.00,0.00,83.95,97.24,120.44,710.4,1.4076,24220,8977,2550,13217
+b13312sys,1,32.94,87.10,786.00,0.00,83.95,97.24,120.81,726.8,1.3760,23898,8838,2450,13225

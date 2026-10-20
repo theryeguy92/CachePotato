@@ -190,10 +190,7 @@ static void apply_head(QW3Layer *m, float *x, int T, int pos0, float *logits, in
     for (int t = 0; t < T; t++) {
         QW3T head = m->lm_head;
         if (m->pager) { pager_step(pos0 + t); head.p = pager_region_get(m->reg_lm_head); }
-        if (head.enc == QW3_ENC_Q8)
-            matmul_wx_q8(logits + (size_t)t * V, x + (size_t)t * D, (const uint8_t *)head.p, D, V);
-        else
-            matmul_wx(logits + (size_t)t * V, x + (size_t)t * D, (const float *)head.p, D, V);
+        qwen3_mm(&head, logits + (size_t)t * V, x + (size_t)t * D, D, V);
     }
 }
 
@@ -202,6 +199,7 @@ static void apply_head(QW3Layer *m, float *x, int T, int pos0, float *logits, in
    unit and an access being a read unit. */
 static void embed_rows(QW3Layer *m, const int *ids, int T, int pos0, float *x, int D) {
     const size_t q8_row = (size_t)((D / 32) * 34);
+    const size_t q4_row = (size_t)((D / 32) * 18);
     for (int t = 0; t < T; t++) {
         int row = ids[t];
         const void *base;
@@ -217,6 +215,9 @@ static void embed_rows(QW3Layer *m, const int *ids, int T, int pos0, float *x, i
         }
         if (m->embed.enc == QW3_ENC_Q8)
             q8_dequant_row((const unsigned char *)base + (size_t)row * q8_row,
+                           x + (size_t)t * D, D);
+        else if (m->embed.enc == QW3_ENC_Q4)
+            q4_dequant_row((const unsigned char *)base + (size_t)row * q4_row,
                            x + (size_t)t * D, D);
         else memcpy(x + (size_t)t * D, (const float *)base + (size_t)row * D,
                     sizeof(float) * D);

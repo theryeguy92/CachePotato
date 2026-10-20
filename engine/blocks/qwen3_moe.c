@@ -31,9 +31,11 @@ void qwen3_layer_free(QW3Out *o) {
 }
 
 /* One matmul, encoding-agnostic. Same idea as qwen2.c's mm_wx: the block size and the kernel must
-   be chosen together, because a Q8 payload read as f32 is not an error you can see. */
-static void mm(const QW3T *t, float *out, const float *x, int n_in, int n_out) {
-    if (t->enc == QW3_ENC_Q8) matmul_wx_q8(out, x, (const uint8_t *)t->p, n_in, n_out);
+   be chosen together, because a Q8 payload read as f32 is not an error you can see — and a Q4
+   payload read as f32 is a segfault. */
+void qwen3_mm(const QW3T *t, float *out, const float *x, int n_in, int n_out) {
+    if (t->enc == QW3_ENC_Q4) matmul_wx_q4(out, x, (const uint8_t *)t->p, n_in, n_out);
+    else if (t->enc == QW3_ENC_Q8) matmul_wx_q8(out, x, (const uint8_t *)t->p, n_in, n_out);
     else                      matmul_wx(out, x, (const float *)t->p, n_in, n_out);
 }
 
@@ -129,9 +131,9 @@ int qwen3_layer_kv(const QW3Layer *m, const float *x, int T, int pos0, QW3KV *ca
             knorm = pager_region_get(m->reg_knorm);
         }
         rmsnorm(xn + (size_t)t * D, x + (size_t)t * D, ln1, D, m->rms_eps);
-        mm(&wq, q + (size_t)t * H * HD,  xn + (size_t)t * D, D, H * HD);
-        mm(&wk, cache->k + (size_t)(pos0 + t) * KV * HD, xn + (size_t)t * D, D, KV * HD);
-        mm(&wv, cache->v + (size_t)(pos0 + t) * KV * HD, xn + (size_t)t * D, D, KV * HD);
+        qwen3_mm(&wq, q + (size_t)t * H * HD,  xn + (size_t)t * D, D, H * HD);
+        qwen3_mm(&wk, cache->k + (size_t)(pos0 + t) * KV * HD, xn + (size_t)t * D, D, KV * HD);
+        qwen3_mm(&wv, cache->v + (size_t)(pos0 + t) * KV * HD, xn + (size_t)t * D, D, KV * HD);
         head_rmsnorm(q + (size_t)t * H * HD,  H,  HD, qnorm, m->rms_eps);
         head_rmsnorm(cache->k + (size_t)(pos0 + t) * KV * HD, KV, HD, knorm, m->rms_eps);
     }
@@ -161,7 +163,7 @@ int qwen3_layer_kv(const QW3Layer *m, const float *x, int T, int pos0, QW3KV *ca
     for (int t = 0; t < T; t++) {
         QW3T wo = m->Wo;
         if (m->pager) { pager_step(pos0 + t); wo.p = pager_region_get(m->reg_Wo); }
-        mm(&wo, o->attn + (size_t)t * D, ao + (size_t)t * H * HD, H * HD, D);
+        qwen3_mm(&wo, o->attn + (size_t)t * D, ao + (size_t)t * H * HD, H * HD, D);
     }
 
     /* ---- MoE: router -> softmax -> top-k -> renormalise -> gated experts ---- */
@@ -175,7 +177,7 @@ int qwen3_layer_kv(const QW3Layer *m, const float *x, int T, int pos0, QW3KV *ca
         }
         for (int j = 0; j < D; j++) hh[j] = x[(size_t)t * D + j] + o->attn[(size_t)t * D + j];
         rmsnorm(xn + (size_t)t * D, hh, ln2, D, m->rms_eps);
-        mm(&wgate, o->router + (size_t)t * E, xn + (size_t)t * D, D, E);
+        qwen3_mm(&wgate, o->router + (size_t)t * E, xn + (size_t)t * D, D, E);
         memcpy(probs, o->router + (size_t)t * E, sizeof(float) * E);
         softmax(probs, E);
 
@@ -212,10 +214,10 @@ int qwen3_layer_kv(const QW3Layer *m, const float *x, int T, int pos0, QW3KV *ca
                 wu.p = base + ((const unsigned char *)wu.p - b0);
                 wd.p = base + ((const unsigned char *)wd.p - b0);
             }
-            mm(&wg, gu, xn + (size_t)t * D, D, F);             /* gate */
-            mm(&wu, hh, xn + (size_t)t * D, D, F);             /* up   */
+            qwen3_mm(&wg, gu, xn + (size_t)t * D, D, F);             /* gate */
+            qwen3_mm(&wu, hh, xn + (size_t)t * D, D, F);             /* up   */
             for (int i = 0; i < F; i++) gu[i] = silu(gu[i]) * hh[i];
-            mm(&wd, hh, gu, F, D);                             /* down */
+            qwen3_mm(&wd, hh, gu, F, D);                             /* down */
             for (int i = 0; i < D; i++) o->mlp[(size_t)t * D + i] += wt[(size_t)t * K + j] * hh[i];
         }
     }
@@ -360,7 +362,7 @@ int qwen3_map(QW3Layer *m, const char *path) {
         uint16_t len; memcpy(&len, cur, 2); cur += 2 + len;
         m->enc_code[i] = (kind == 0) ? QW3_ENC_F32
                        : (scalar == 3) ? QW3_ENC_Q8
-                       : (scalar == 4) ? 4 : -1;
+                       : (scalar == 4) ? QW3_ENC_Q4 : -1;
     }
     m->exp = calloc((size_t)128 * 3, sizeof(QW3T));
     m->reg_exp = calloc((size_t)128, sizeof(int));

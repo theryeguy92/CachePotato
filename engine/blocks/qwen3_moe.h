@@ -14,6 +14,7 @@
  */
 #define QW3_ENC_F32 0
 #define QW3_ENC_Q8  8
+#define QW3_ENC_Q4  4
 
 typedef struct { const void *p; int enc; } QW3T;
 
@@ -91,6 +92,11 @@ int qwen3_layer(const QW3Layer *m, const float *x, int T, QW3Out *o);
 int qwen3_layer_kv(const QW3Layer *m, const float *x, int T, int pos0, QW3KV *cache, QW3Out *o);
 int qwen3_kv_alloc(QW3KV *kv, const QW3Layer *m, int cap);
 void qwen3_kv_free(QW3KV *kv);
+
+/* Encoding-agnostic W·x (f32 / Q8_0 / Q4_0). Callers must use this rather than re-implementing
+   the dispatch: a second copy is how the Q4 lm_head came to be read as fp32, 1.24 GB out of a
+   0.62 GB region. */
+void qwen3_mm(const QW3T *t, float *out, const float *x, int n_in, int n_out);
 
 /* Flat-blob loader: the arithmetic gate. Host-endian, no tables. */
 int qwen3_load_blob(QW3Layer *m, const char *path, float **owned);
