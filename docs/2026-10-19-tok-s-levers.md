@@ -239,3 +239,40 @@ Final measurement (chunked file, 4 threads, cold start, 32 tokens):
 Time on this machine: **~0.8 tok/s ceiling for this model**, and the engine is within 30% of it being
 pure compute. The next useful thing is not a kernel — it is a *smaller-active* model (the Qwen3-Coder
 port at the same geometry, or a 3B for speed), measured with this same harness.
+
+## Round 4: the engine is a bandwidth machine — both halves of the token are bytes
+
+Adding up what a token must stream, from the file's own region accounting (13 GB arm):
+
+| term | bytes/token | rate | time | measured |
+|---|---:|---:|---:|---:|
+| **RAM**: core regions (incl. `lm_head`) 1,597 MB + 384 expert regions 1,925 MB | **3,523 MB** | 9.4 GB/s (4-thread effective) | 366 ms | 374 ms |
+| **disk**: physical reads after reuse | **348 MB** | 0.389 GB/s (SSD) | 896 ms | 895 ms |
+| | | | **1,262 ms** | **1,252 ms** |
+
+Two percent on both terms. **There is no arithmetic ceiling here — the engine is limited by
+bytes/bandwidth on both sides**, so no kernel technique can move it. This closes the whole
+technique list:
+
+| technique | verdict | why |
+|---|---|---|
+| more CPU threads | **no** | measured 4 / 6 / 8 threads = 1921 / 1964 / 4467 ms on the 13 GB arm; the part has 4 physical cores |
+| CPU affinity (`CP_PIN_CORES=1`) | **+7%, committed as opt-in** | 1478 → 1374 ms/token over alternating runs; migration between HT siblings was costing the L1/L2 hot set |
+| deeper I/O queue (pre-issue all 8 experts) | **no** | O_DIRECT probe: the SSD does 288 MB/s at depth 1 and saturates at **370–400 MB/s from depth 2 up**; the engine already measures 389, so page-fault readahead is already pipelining |
+| int8-activation dot (`vpmaddubsw`) | **no** | it reduces ALU work, and ALU is not the limit |
+| speculative decoding | **≤1.4×, and only without Q4** | exact under greedy, but a batch of k positions multiplies the *RAM* term by k while saving only part of the disk term — and Q4 shrinks the disk term, making speculation less valuable, not more |
+| prefetch / arena / Tier B grouping | **already closed** | measured in rounds 2–3 |
+| AVX-512 / VNNI | **absent** | this CPU is `avx2 fma sse4.2` |
+
+### The one lever left, and what it is worth
+
+**Halve the bytes.** Both terms scale with bytes, so Q4 halves the token: `3,523/2 GB ÷ 9.4 GB/s`
+(187 ms) + `348/2 MB ÷ 0.389 GB/s` (447 ms) = **634 ms → 1.58 tok/s**, from 0.80.
+
+The caveat that makes this a measurement rather than a promise: the vault's earlier "Q4 is slower"
+result came from an **in-cache, ALU-bound** regime (the 0.5B model, matrix resident in L2). At 13 GB
+on the 30B the regime is the opposite — DRAM-bandwidth-bound — so nibble-unpacking may hide entirely
+under memory latency. Nobody has measured Q4 in *this* regime, and that is the next thing to do.
+
+A cheaper variant if a full Q4 is too lossy: **Q4 only the core** (1,597 MB of the 3,523 MB) or only
+`lm_head` (330 MB). Core-only Q4 saves ~85 ms/token (~7%) at much lower quality risk than the experts.
