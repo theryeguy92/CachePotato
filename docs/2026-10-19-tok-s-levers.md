@@ -315,3 +315,38 @@ less aggressively than the logits path: `lm_head` produces the logits themselves
 is where a 4-bit weight error propagates most directly. So the variant to measure is **Q4 experts,
 Q8 everywhere else** (`--quant-experts q4_0`): same disk saving, no unpack cost on the core, and
 the quality risk confined to the expert path. Predicted ~1.6-1.7 tok/s.
+
+## Round 6: the variant that works — Q4 experts, Q8 everywhere else
+
+`--quant-experts q4_0` (17,984 MB, 6,727 regions, `V4 FORMAT: PASS`), same 13 GB / 4 threads /
+32 tokens / 2 reps:
+
+| encoding | regions/tok | physical MB/tok | ms/token | tok/s | quality (teacher-forced) |
+|---|---:|---:|---:|---:|---|
+| Q8_0 | 38.3 | 348.5 | 1252 | 0.799 | exact |
+| Q4_0 experts, **Q8 rest** | 53.1 | 184.4 | **874** | **1.14** | **91.7% / 91.7% PASS** |
+| Q4_0 whole model | 32.9 | 120.4 | 710 | 1.40 | 91.7% / 70.8% FAIL |
+
+**1.14 tok/s with the pre-registered quality gate passing on both probes** — 43% faster than Q8,
+on the model we already run, with no new architecture. That is the configuration to ship.
+
+Two things worth understanding about the numbers:
+
+- **Expert-only Q4 is slower than whole-model Q4 (1.14 vs 1.40) despite the same expert encoding.**
+  The core stays at 1.6 GB, so at the same 13 GB budget fewer expert regions stay resident: expert
+  hit rate 79.3% vs 84.0%, so it fetches 53 regions/token instead of 33. The disk cost of keeping
+  attention and `lm_head` exact is the budget they occupy.
+- **Physical bytes per token rose to 184 MB because the regions got small.** An expert at Q4 is
+  2.65 MB, which is smaller than the filesystem's 4 MiB I/O unit, so block rounding costs ~1.58x
+  per fetch. This is the same rounding documented in step 2, now biting at a smaller region size:
+  quantisation shrinks the payload but not the minimum read. If a Q4 file were laid out with two
+  experts per region (5.3 MB), the rounding would amortise — but that is Tier B grouping, which
+  costs cache efficiency, and it measured negative at 11 GB.
+
+**The trade is now explicit:** 0.80 (exact) → 1.14 (Q4 experts, ~91.7% next-token agreement on a
+matched context) → 1.40 (whole-model Q4, which drops to 70.8% on the factual probe).
+
+The remaining candidate, if the last 20% matters: Q4 on the attention matrices *and* the experts,
+with `lm_head` and `embed` left at Q8 — the failure of whole-model Q4 looks like it comes through
+the logits path, and `lm_head` is 330 MB of the 1.6 GB core. Predicted ~1.3 tok/s at similar
+quality; worth measuring before accepting 1.14 as final.

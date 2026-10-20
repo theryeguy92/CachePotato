@@ -28,6 +28,8 @@ ROOT = Path(__file__).resolve().parents[1]
 EXE = ROOT / "build/qwen3_eval"
 Q8 = ROOT / "scratch/qwen3_q8_chunked.v4cp"
 Q4 = ROOT / "scratch/qwen3_q4_chunked.v4cp"
+if "--q4" in sys.argv:
+    Q4 = Path(sys.argv[sys.argv.index("--q4") + 1])
 GEN = 24
 # two probes: a continuation of natural text, and one that needs a fact
 PROBES = [
