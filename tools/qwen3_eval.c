@@ -285,12 +285,14 @@ int main(int argc, char **argv) {
     }
     const char *path = argv[1];
     const int L = atoi(argv[2]);
-    int ids[64]; int T = 0;
+    int ids[512]; int T = 0;   /* the reference runs used 5; the quality gate needs long
+                                  teacher-forced contexts (a 64-token cap made one token
+                                  worth 4.2 points of agreement) */
     /* strtok() rewrites argv[3] in place, so the literal is copied for the metadata
        BEFORE it is parsed — otherwise the .meta records only the first token id. */
     char ids_arg[512];
     snprintf(ids_arg, sizeof ids_arg, "%s", argv[3]);
-    for (char *s = strtok(argv[3], ","); s && T < 64; s = strtok(NULL, ",")) ids[T++] = atoi(s);
+    for (char *s = strtok(argv[3], ","); s && T < 512; s = strtok(NULL, ",")) ids[T++] = atoi(s);
     const char *pre = argv[4];
     /* Greedy and measurement-only on purpose: C2 measures the paging cost of producing a
        token, so the token itself must be the deterministic argmax. Sampling would change

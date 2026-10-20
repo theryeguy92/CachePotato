@@ -281,8 +281,7 @@ claims separable is what the whole verification structure is for.
 - **The paging thesis HAS now been exercised on a model that does not fit — and the answer is a
   tie.** Qwen3-30B-A3B (32.5 GB at Q8, 48 layers, 128 experts, top-8) runs on the T480 from a CPW1
   v4 file with the output **bit-identical** to the unpaged run at every budget, and per-token
-  counters checked against the file's own region table. On four threads it runs at **1.14 tok/s
-  with 4-bit experts at a 13 GB budget** (0.80 at Q8), 0.77 at 11 GB Q8, and **0.36 at 8 GB with
+  counters checked against the file's own region table. On four threads it runs at **1.22 tok/s with 4-bit experts and attention at a 13 GB budget** (0.80 at Q8), 0.77 at 11 GB Q8, and **0.36 at 8 GB with
   real disk reads** — and the first
   measurements said 0.147 only because the harness was silently running one thread. At 13 GB it also
   *beats* the unpaged control (0.71), so the region-LRU is better than the OS's paging at equal
@@ -519,9 +518,11 @@ model but a smaller, faster one: see
   The 384 MB re-measurement (+38.2%) is significant but **flagged**: λ=0's access pattern
   exhausts the hot tier, so that figure is a whole-hierarchy effect, not pure expert paging.
 - **Usable speed is not a claim.** The 30B port runs exactly and at 1.14 tok/s with 4-bit experts
-  at a 13 GB budget (0.80 at Q8, 0.36 at 8 GB with real disk reads). 4-bit is a Tier-C choice and
-  costs ~8% next-token agreement with Q8 on a matched context (gated; whole-model 4-bit failed
-  that gate at 70.8%). The measured envelope on this machine is set by
+  at a 13 GB budget (0.80 at Q8, 0.36 at 8 GB with real disk reads). 4-bit experts + attention is a
+  Tier-C choice and costs ~5% next-token agreement with Q8 on a matched context (gated at 120
+  generated tokens; 93.3% / 97.5%). 4-bit on `lm_head`/`embed` as well reads 1.40 tok/s but is
+  unvalidated — its rejection rested on a 24-token measurement, which later work showed to be
+  too noisy to trust. The measured envelope on this machine is set by
   **compulsory expert traffic, not compute**: compute is 374 ms/token, disk is 895 ms at 13 GB, and
   the curve saturates because the remaining reads are exactly the experts each token selects. A
   model with fewer active parameters is the lever, not a faster kernel.

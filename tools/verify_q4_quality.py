@@ -27,11 +27,16 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 EXE = ROOT / "build/qwen3_eval"
 Q8 = ROOT / "scratch/qwen3_q8_chunked.v4cp"
-Q4 = ROOT / "scratch/qwen3_q4_chunked.v4cp"
+GEN = 24        # default; --gen overrides. At 24 one token = 4.2 points, too coarse to
+                # separate two Q4 variants that differ by a single token.
+Q8 = ROOT / "scratch/qwen3_q8_chunked.v4cp"
+Q4 = ROOT / "scratch/qwen3_q4exp.v4cp"
 if "--q4" in sys.argv:
     Q4 = Path(sys.argv[sys.argv.index("--q4") + 1])
-GEN = 24
-# two probes: a continuation of natural text, and one that needs a fact
+if "--gen" in sys.argv:
+    GEN = int(sys.argv[sys.argv.index("--gen") + 1])
+# two probes: a code continuation and a factual one. Both start from fixed token ids so the
+# comparison is reproducible without a tokenizer in the loop.
 PROBES = [
     ("code", [785, 6722, 315, 9625, 374]),
     ("fact", [3838, 374, 220, 12817, 13]),
@@ -52,7 +57,8 @@ def prefill(model: Path, ids, out: Path):
     return np.fromfile(str(out) + ".logits", dtype=np.float32).reshape(len(ids), V)
 
 
-def run(model: Path, ids, out: Path, gen=GEN):
+def run(model: Path, ids, out: Path, gen=None):
+    gen = GEN if gen is None else gen          # read at call time: --gen is parsed after import
     env = {k: v for k, v in __import__("os").environ.items() if not k.startswith("CP_")}
     env.update({"CP_THREADS": str(THREADS), "CP_PAGER": "1", "CP_BUDGET": str(BUDGET_MB),
                 "CP_PAGER_SYS": "1", "CP_COLD_START": "1"})

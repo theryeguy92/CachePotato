@@ -35,6 +35,11 @@ def main():
     # agreement on a factual probe); this lets the experts take Q4 while the rest stays Q8.
     ap.add_argument("--quant-experts", choices=["none", "q8_0", "q4_0"], default=None,
                     help="encoding for expert tensors only (default: same as --quant)")
+    # Attention is 0.9 GB of the core and is read every token; lm_head and embed are left to
+    # --quant because lm_head produces the logits themselves and whole-model Q4 showed the loss
+    # coming through that path (70.8% teacher-forced agreement on the factual probe).
+    ap.add_argument("--quant-attn", choices=["none", "q8_0", "q4_0"], default=None,
+                    help="encoding for attention matrices only (default: same as --quant)")
     ap.add_argument("--manifest", default=None,
                     help="write name/offset/size so the payloads can be checked against the source")
     # TIER B: placement-only expert reordering. The order file names a permutation per layer;
@@ -138,7 +143,9 @@ def main():
         the sum of all payloads (61 GB fp32, 16.2 GB at Q8) against 16 GB of RAM.
         """
         # `enc` marks a tensor as quantisable; the flags pick which encoding each role gets.
-        want = args.quant_experts if (role == V.R_EXPERT and args.quant_experts) else args.quant
+        want = args.quant
+        if role == V.R_EXPERT and args.quant_experts: want = args.quant_experts
+        elif role == V.R_ATTN and args.quant_attn: want = args.quant_attn
         use = want if (enc in ("q8_0", "q4_0") and want != "none") else "f32"
         def source(_n=src_name, _u=use, _r=rows):
             if _r is None:

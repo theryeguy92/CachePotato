@@ -350,3 +350,42 @@ The remaining candidate, if the last 20% matters: Q4 on the attention matrices *
 with `lm_head` and `embed` left at Q8 — the failure of whole-model Q4 looks like it comes through
 the logits path, and `lm_head` is 330 MB of the 1.6 GB core. Predicted ~1.3 tok/s at similar
 quality; worth measuring before accepting 1.14 as final.
+
+## Round 7: the gate was underpowered — Q4 attention + experts wins at 1.22 tok/s
+
+The 24-token gate put expert-only Q4 at 91.7/91.7 and Q4-attention at 95.8/**87.5** — a *one
+token* difference, and at n=24 one token is 4.2 points. That is not a measurement, it is noise.
+Re-run at **120 generated tokens** (one token = 0.8%), with the same 90% threshold:
+
+| encoding | teacher-forced, code | teacher-forced, fact | verdict |
+|---|---:|---:|---|
+| Q4 experts | 90.8% | 98.3% | PASS |
+| **Q4 experts + attention** | **93.3%** | **97.5%** | **PASS** |
+
+The n=24 numbers were not just imprecise, they were *wrong in direction*: expert-only's factual
+probe moved from 91.7% to 98.3% when measured properly, and the configuration that "failed" at
+87.5% is the one that scores 93.3% on the code probe. Both survivors pass; they are
+statistically equivalent, and the faster one wins.
+
+| configuration | regions/tok | physical MB/tok | ms/token | tok/s | quality (120 tok) |
+|---|---:|---:|---:|---:|---|
+| Q8_0 | 38.3 | 348.5 | 1252 | 0.799 | exact |
+| Q4 experts | 53.1 | 184.4 | 874 | 1.14 | 90.8 / 98.3 PASS |
+| **Q4 experts + attention, Q8 embed + lm_head** | **32.4** | **125.7** | **822** | **1.22** | **93.3 / 97.5 PASS** |
+| Q4 whole model | 32.9 | 120.4 | 710 | 1.40 | 91.7 / **70.8** (n=24 only) |
+
+**The last 20% delivered 7%**, not the 14% the bytes model suggested: quantising attention
+(Wq/Wk/Wv/Wo, 0.9 GB) saves 449 MB of file but only 52 ms/token, because attention is the part of
+the working set that was already 97% resident — it halves RAM bytes, not disk bytes.
+
+### The open question this leaves
+
+**Whole-model Q4 (1.40 tok/s) was rejected on a 24-token measurement, and 24-token measurements
+have now been shown unreliable.** Its factual probe read 70.8% against the survivors' 97.5%+ — a
+gap far larger than the ±4 points of noise, so the rejection is probably right — but "probably" is
+not the standard the rest of this file holds. Re-testing it needs the file again (17.2 GB, ~30 min)
+and an `--gen 120` gate run. Until then, 1.22 tok/s is the fastest configuration that has passed a
+gate with enough power to mean something.
+
+The same suspicion applies to the *speed* side: with `lm_head` and `embed` at Q4 the token was
+710 ms; the 100 ms between that and 1.22 is what keeping the logits path exact costs.
