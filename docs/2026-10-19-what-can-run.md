@@ -95,3 +95,37 @@ quick win.
 - **More threads, better kernels, int8 activations**: compute is 374 ms of 1252 ms at 13 GB, so the
   whole compute programme is a 1.4× ceiling, and at Q4 the disk term shrinks further.
 - **A bigger budget**: the curve saturates at 13 GB (38.3 regions/token = the compulsory demand).
+
+## How to actually use it
+
+```
+make build/qwen3_chat
+CP_PAGER=1 CP_BUDGET=13312 CP_THREADS=4 CP_PIN_CORES=1 \
+  ./build/qwen3_chat scratch/qwen3_q4attn.v4cp 48 200
+```
+
+- `48` is the layer count (the v4 header has it; the driver is told), `200` is the per-answer
+  token cap. Type a message, "exit" or ctrl-D to leave.
+- **Budget:** 13312 MB is the fast setting and leaves ~2.7 GB for the OS on this 15.7 GB machine —
+  close heavy applications, and drop to 8192 if it starts swapping (0.36 tok/s: swapping looks
+  exactly like a bad model).
+- **Files:** `scratch/qwen3_q4attn.v4cp` is the fast one (4-bit experts + attention, 1.2 tok/s,
+  93.3% / 97.5% next-token agreement with Q8). `scratch/qwen3_q8_chunked.v4cp` is the exact one
+  (0.8 tok/s).
+- Greedy only — there is no sampler, by design (see the header comment in `tools/qwen3_chat.c`).
+
+**What it feels like, measured:** first prefill ~20 s cold (the pager has to read the layers it
+needs), then ~0.8-0.9 s per token. A 60-token answer is about 50 s. Follow-up questions are
+cheaper *and* faster (24-token prefill, 12.8 s) because the conversation stays in the KV cache and
+the expert set is already resident — a two-turn test measured **2.22 tok/s** on the second answer
+against 1.15 on the first.
+
+**The bug worth remembering** (it is in the commit message): the first version of this driver
+produced fluent-looking nonsense because it added only the expert output to the residual stream and
+not the attention output. Nothing fails when you drop a residual — token 1 is just wrong, and every
+token after it is confidently wrong. The eval driver, which was already gated, had the right line.
+
+**Not a conversation partner at 0.8-1.2 tok/s.** It writes a correct in-place `strrev` in ~50
+seconds, and that is the realistic unit of work: one self-contained question, one file, walk away.
+Agentic loops (write → run → fix → repeat) need 10-30x this speed and are out of reach on this
+machine with this model.
