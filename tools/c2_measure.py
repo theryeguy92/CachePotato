@@ -119,8 +119,13 @@ def mem_available_mb():
         return 0
 
 
-def run_one(engine, model, ids, pre, gen, env_cfg, cold, layers=48):
+def run_one(engine, model, ids, pre, gen, env_cfg, cold, layers=48, threads=4):
+    # CP_THREADS must NOT be stripped with the other CP_* vars: the engine defaults to ONE
+    # thread, so a harness that clears the environment silently measures single-threaded
+    # numbers. That is exactly what happened to the first C2 matrix (0.147 tok/s was 1 thread;
+    # 4 threads is 1.68x). Threads are now explicit and recorded.
     env = {k: v for k, v in os.environ.items() if not k.startswith("CP_")}
+    env["CP_THREADS"] = str(threads)
     env.update(env_cfg)
     if cold:
         env["CP_COLD_START"] = "1"
@@ -207,6 +212,8 @@ def main():
     ap.add_argument("--runs", default="control,b8192,b8192sys")
     ap.add_argument("--keep", default="scratch/c2")
     ap.add_argument("--out", default="")
+    ap.add_argument("--threads", type=int, default=4,
+                    help="CP_THREADS for every run; the engine defaults to 1")
     ap.add_argument("--no-cold", action="store_true",
                     help="skip the page-cache drop (only to show why it is needed)")
     args = ap.parse_args()
@@ -242,7 +249,7 @@ def main():
             pre = keep / f"{name}_r{rep}"
             print(f"  [rep {rep}] {name:<10} {label}")
             r = run_one(args.engine, args.model, args.tokens, pre, args.gen, env_cfg, cold,
-                        args.layers)
+                        args.layers, args.threads)
             r["name"] = name
             r["rep"] = rep
             results[(name, rep)] = r
@@ -325,7 +332,8 @@ def main():
             f.write(f"C2 measurement {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
             f.write(f"model {args.model}\nprompt {args.tokens}\ngen {args.gen}\n"
                     f"layers {args.layers}\n"
-                    f"reps {args.reps}\ncold_start {cold}\narms {','.join(names)}\n\n")
+                    f"reps {args.reps}\ncold_start {cold}\nthreads {args.threads}\n"
+                    f"arms {','.join(names)}\n\n")
             f.write(Path(str(keep / f"{names[0]}_r0.meta")).read_text())
             f.write("\n# generated tokens (identical in every arm and rep — asserted)\n")
             f.write("tokens " + " ".join(str(t) for t in tokens_ref) + "\n")

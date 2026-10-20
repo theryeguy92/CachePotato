@@ -14,7 +14,16 @@ the unpaged run; the accounting is checked against the file's own region table (
 3600.2 MB for one token: 435 core + 384 experts), not against itself. 20 gates.
 
 **C2 — the paging numbers.** Qwen3-30B-A3B Q8, 32.5 GB against 16 GB, 32 greedy tokens, cold start,
-interleaved arms, deterministic counters identical across reps:
+interleaved arms, deterministic counters identical across reps.
+
+> **Thread-count correction (2026-10-19).** The table below was measured **single-threaded**:
+> `c2_measure.py` stripped every `CP_*` variable, including `CP_THREADS`, and the engine defaults
+> to one thread. Re-measured at 4 threads with everything else identical
+> (`bench/results/c2/2026-10-19-threaded*`): the honest 8 GB arm is **3182 ms/token = 0.314 tok/s**
+> (not 0.147) and the unpaged control is **0.521** (not 0.176) — a **2.1–3.0×** understatement. 8
+> threads is worse than 4. The page-count columns are unaffected (deterministic, thread-independent),
+> so the paging findings stand; the speed conclusions were too pessimistic, and the corrected
+> envelope is in `docs/2026-10-19-tok-s-levers.md`.
 
 | budget | policy | regions/token | physical MB/token | tok/s |
 |---|---|---:|---:|---:|
