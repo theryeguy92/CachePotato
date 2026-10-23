@@ -9,6 +9,7 @@ mod ffi;
 mod models;
 mod pull;
 mod run;
+mod serve;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -42,6 +43,34 @@ enum Cmd {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Serve a model: browser UI and an OpenAI-compatible API (http://localhost:8080)
+    Serve {
+        /// Model name (`qwen3-30b-a3b`, `qwen3-30b-a3b:q8`) or a path to a .v4cp file
+        model: String,
+        /// Address to listen on. Anything but loopback requires --api-key
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Require `Authorization: Bearer <key>` on the API
+        #[arg(long, env = "CACHEPOTATO_API_KEY")]
+        api_key: Option<String>,
+        /// Answer length when a request does not set max_tokens
+        #[arg(long, default_value_t = 512)]
+        max_tokens: usize,
+        /// Pager budget in MB (default: from available memory)
+        #[arg(long)]
+        budget: Option<u64>,
+        /// Threads (default: one per physical core)
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Do not pin each thread to its own physical core
+        #[arg(long)]
+        no_pin_cores: bool,
+        /// Download without asking
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Download a model
     Pull {
         /// Model name, e.g. `qwen3-30b-a3b` or `qwen3-30b-a3b:q8`
@@ -67,6 +96,19 @@ fn real_main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Run { model, max_tokens, budget, threads, no_pin_cores, yes } => {
             run::run(run::RunArgs { model, max_tokens, budget_mb: budget, threads, pin_cores: !no_pin_cores, yes })
+        }
+        Cmd::Serve { model, host, port, api_key, max_tokens, budget, threads, no_pin_cores, yes } => {
+            serve::serve(serve::ServeArgs {
+                model,
+                host,
+                port,
+                api_key,
+                max_tokens,
+                budget_mb: budget,
+                threads,
+                pin_cores: !no_pin_cores,
+                yes,
+            })
         }
         Cmd::Pull { model, yes } => {
             let r = models::resolve(&model)?;

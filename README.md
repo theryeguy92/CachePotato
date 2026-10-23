@@ -79,7 +79,7 @@ file format in which the unit of paging (a region) is also the unit of measureme
 - **Not a sampler.** Greedy only, deliberately — the gate structure rests on the output being a
   deterministic function of the weights. A temperature knob is the first thing that would erode
   that, so it is absent rather than half-supported.
-- **Not production.** One user, one model, one machine. No GPU/NUMA story, no concurrency, no API server.
+- **Not production.** One user, one model, one machine. No GPU/NUMA story, and the server answers one request at a time.
 - **Not a speed champion against mature runtimes.** The token is bytes divided by bandwidth on both
   the disk and the RAM side, measured to 2%. A runtime with more mature kernels may well be faster
   on the same model; the claim here is *repeatable measurement and exactness*, not throughput.
@@ -117,6 +117,29 @@ default is conservative. Each thread is pinned to its own physical core, read fr
 topology (+7% measured; `--no-pin-cores` turns it off, and the output is the same). Models live
 in `~/.local/share/cachepotato` (`CACHEPOTATO_HOME` moves them). Details:
 [Build & run](#build--run).
+
+### In the browser, or from other tools
+
+```bash
+cachepotato serve qwen3-30b-a3b   # then open http://localhost:8080
+```
+
+`serve` loads the model once and serves a chat page beside a live **Monitor**: which layer the
+prompt has reached and how many MB it has read from disk, tok/s, context used, weights in RAM
+against the budget, and the cache hit rate. That turns the 20-second first prompt from a frozen
+page into something you can watch. The same server speaks the OpenAI API at
+`http://localhost:8080/v1` (`/v1/chat/completions`, streaming or not, and `/v1/models`), so Open
+WebUI, Continue, `curl` or the `openai` client libraries can use it.
+
+- **One request at a time.** Requests queue in arrival order; a client that disconnects stops its
+  own answer after the current token.
+- **Follow-ups are cheap.** When a request's earlier messages are the conversation already in
+  the model's cache, only the new message is processed; otherwise the cache is rebuilt from the
+  messages sent.
+- **Greedy only.** `temperature`, `top_p` and other sampling fields are accepted and ignored,
+  because most clients send them by default. The same conversation gives the same answer.
+- **Localhost by default.** `--host 0.0.0.0` refuses to start without `--api-key <secret>`
+  (or `CACHEPOTATO_API_KEY`), which every API call must then send as `Authorization: Bearer`.
 
 ### Why it is different
 
@@ -272,7 +295,7 @@ python3 tools/verify_cpw1_v3.py                         # export + routing gate
 | `models/` | One port per model: [`CONTRACT.md`](models/CONTRACT.md) (what a port must ship) and `gpt2-moe/` — the project's own model ported through it, with an independent numpy reference, a converter and the port gate |
 | `format/` | [`SPEC.md`](format/SPEC.md) — the self-describing weight format (CPW1 v4). **Implemented and gated**: a v3→v4 round-trip reproduces the recorded PyTorch routing 100% and survives a shuffled physical payload, i.e. tensors are addressed by offset |
 | `engine/api/` | `cachepotato.h` — the public C API (open, chat with a token callback, stats). The chat drivers and the Rust CLI are clients of it |
-| `cli/` | The `cachepotato` command (Rust): `run`, `pull`, `list`, `doctor`. Compiles `engine/` in via `build.rs` |
+| `cli/` | The `cachepotato` command (Rust): `run`, `serve`, `pull`, `list`, `doctor`. Compiles `engine/` in via `build.rs`; `cli/ui/index.html` is the page `serve` shows |
 | `src/` | `main.c` (CLI/REPL/bench/gates) and `train.c` (the C trainer) — the two entry points, now that the runtime lives in `engine/` |
 | `experiments/` | Phase 0 scratch programs — mmap/`madvise` probes, SSD latency. Learning artifacts, not engine code |
 | `docs/` | Dated direction notes — currently the universal-ports pivot and its evidence |
@@ -357,8 +380,9 @@ python3 tools/verify_cpw1_v3.py                         # export + routing gate
   the four kernel and decoder gates can pass: the Qwen and v4 gates skip themselves when their
   gitignored weight files are absent, and the GPT-2/gpt2-moe gates fail, because they expect the
   generated `weights/toy.bin`, the trained gpt2-moe checkpoint and the corpus to be present.
-- **Not a production serving system.** One user, one model, one process: no batching, no paged KV
-  cache, no HTTP or OpenAI-compatible server. The REPL and the chat drivers are the interface.
+- **Not a production serving system.** One model per process and one request at a time: no
+  batching, no paged KV cache, and a 2,048-token context. `cachepotato serve` speaks the OpenAI
+  chat API for a single user; it is not built for many concurrent clients.
 
 ## Documentation
 

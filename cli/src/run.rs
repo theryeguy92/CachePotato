@@ -41,7 +41,7 @@ pub fn confirm(question: &str, yes: bool) -> bool {
 }
 
 /// A model name is fetched if missing; a path to a .v4cp file is used as it is.
-fn locate(model: &str, yes: bool) -> Result<PathBuf> {
+pub fn locate(model: &str, yes: bool) -> Result<PathBuf> {
     let as_path = Path::new(model);
     if as_path.is_file() {
         return Ok(as_path.to_path_buf());

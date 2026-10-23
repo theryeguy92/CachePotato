@@ -72,6 +72,23 @@ int cp_chat(cp_model *m, const char *user_msg, int max_new,
 /* Forget the conversation (the KV cache is reused, not reallocated). */
 void cp_reset(cp_model *m);
 
+/* Append raw text to the conversation without generating: tokenized as is (ChatML special
+   tokens included), run through every layer into the KV cache. For a front-end replaying an
+   earlier conversation (system prompt, past turns) before the next cp_chat. Returns the
+   number of tokens added, -2 if it cannot be tokenized, -3 on a forward failure, -4 if it
+   would not leave room in the context for an answer (nothing is added). */
+int cp_prefill_text(cp_model *m, const char *text);
+
+/* Tokens currently in the KV cache. */
+int cp_context_tokens(const cp_model *m);
+
+/* Called after every layer of every forward pass, on the thread running cp_chat /
+   cp_prefill_text: layer = layers done so far (1..n_layers), T = tokens in this pass
+   (T > 1 is a prompt being prefilled, T == 1 a generated token). The one place a front-end
+   can show progress during a long prefill; it may call cp_get_stats. NULL turns it off. */
+typedef void (*cp_progress_fn)(int layer, int n_layers, int T, void *user);
+void cp_set_progress(cp_model *m, cp_progress_fn fn, void *user);
+
 typedef struct {
     /* model */
     int n_layers, d_model, n_experts, topk, vocab, max_ctx;
