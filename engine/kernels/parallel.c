@@ -39,18 +39,63 @@ static struct {
 
 /* Optional: bind each thread to its own core. On a 4C/8T part the OS otherwise migrates
    threads between HT siblings, and a migrated thread loses its L1/L2 contents — the x vector
-   and the four accumulators are exactly what a decode matmul keeps hot. Off by default so no
-   recorded benchmark moves; CP_PIN_CORES=1 turns it on. */
+   and the four accumulators are exactly what a decode matmul keeps hot (+7% measured, 1478 →
+   1374 ms/token). Off by default so no recorded benchmark moves; CP_PIN_CORES=1 turns it on.
+
+   Thread i goes to the i-th DISTINCT PHYSICAL CORE, read from sysfs topology, not to logical
+   CPU i. On Intel numbering (siblings are n apart) the two agree; on AMD-style numbering
+   (siblings adjacent) "CPU i" would put threads 0 and 1 on the same core. Only CPUs in the
+   process's affinity mask are used, so taskset / cgroups are respected, and if the topology
+   cannot be read nothing is pinned rather than guessed. Pinning never changes a value. */
 static int pin_override = -1;   /* cp_threads_init(): -1 = use CP_PIN_CORES */
 static int pin_cores(void) {
     if (pin_override >= 0) return pin_override;
     const char *pc = getenv("CP_PIN_CORES");
     return pc && *pc && atoi(pc) != 0;
 }
-static void pin_self(int core) {
+static int pin_cpu[MAX_THREADS];   /* logical CPU for pool thread i: one per physical core */
+static int n_pin_cpu;
+
+static int read_int(const char *fmt, int cpu, int *out) {
+    char path[128];
+    snprintf(path, sizeof path, fmt, cpu);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int ok = fscanf(f, "%d", out) == 1;
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+static void build_pin_list(void) {
+    cpu_set_t allowed;
+    n_pin_cpu = 0;
+    if (sched_getaffinity(0, sizeof allowed, &allowed) != 0) return;
+    int key[MAX_THREADS][3];
+    for (int c = 0; c < CPU_SETSIZE && n_pin_cpu < MAX_THREADS; c++) {
+        if (!CPU_ISSET(c, &allowed)) continue;
+        int pkg, core, die = 0;
+        if (read_int("/sys/devices/system/cpu/cpu%d/topology/physical_package_id", c, &pkg) ||
+            read_int("/sys/devices/system/cpu/cpu%d/topology/core_id", c, &core)) {
+            n_pin_cpu = 0;          /* unknown topology: do not guess */
+            return;
+        }
+        read_int("/sys/devices/system/cpu/cpu%d/topology/die_id", c, &die);   /* optional */
+        int dup = 0;
+        for (int i = 0; i < n_pin_cpu; i++)
+            if (key[i][0] == pkg && key[i][1] == die && key[i][2] == core) { dup = 1; break; }
+        if (dup) continue;
+        key[n_pin_cpu][0] = pkg; key[n_pin_cpu][1] = die; key[n_pin_cpu][2] = core;
+        pin_cpu[n_pin_cpu++] = c;
+    }
+}
+
+/* Threads beyond the number of physical cores stay unpinned: two pinned threads sharing a
+   core is the case pinning exists to prevent. */
+static void pin_self(int idx) {
+    if (idx >= n_pin_cpu) return;
     cpu_set_t set;
     CPU_ZERO(&set);
-    CPU_SET(core, &set);
+    CPU_SET(pin_cpu[idx], &set);
     sched_setaffinity(0, sizeof set, &set);
 }
 
@@ -95,7 +140,10 @@ static void start(int nthreads) {
     J.started = 1;
     J.nthreads = nthreads;
     J.nworkers = nthreads - 1;
-    if (pin_cores()) pin_self(0);   /* the caller also runs chunk 0 */
+    if (pin_cores()) {
+        build_pin_list();           /* before the caller narrows its own mask */
+        pin_self(0);                /* the caller also runs chunk 0 */
+    }
     for (long i = 0; i < J.nworkers; i++)
         if (pthread_create(&J.tid[i], NULL, worker, (void *)i) != 0) {
             fprintf(stderr, "parallel: pthread_create failed at %ld; using %ld thread(s)\n",
@@ -129,6 +177,13 @@ int cp_threads_init(int n, int pin) {
     if (n <= 0) return cp_threads();
     start(clamp_threads(n));
     return J.nthreads;
+}
+
+int cp_pinned_cpus(int *out, int max) {
+    if (!J.started || !pin_cores()) return 0;
+    int n = J.nthreads < n_pin_cpu ? J.nthreads : n_pin_cpu;
+    for (int i = 0; i < n && i < max; i++) out[i] = pin_cpu[i];
+    return n;
 }
 
 int cp_would_parallelise(long work, long threshold) {

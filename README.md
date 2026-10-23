@@ -113,7 +113,8 @@ and are checked against the repo's SHA-256 sums; an interrupted download resumes
 The pager budget is set from available memory (leaving 2 GB for everything else) and the
 threads from the physical cores; `--budget <MB>` and `--threads <n>` override them. A budget
 that makes the machine swap looks exactly like a broken model (0.36 tok/s), which is why the
-default is conservative. `--pin-cores` is the measured setting on this Intel part. Models live
+default is conservative. Each thread is pinned to its own physical core, read from the CPU
+topology (+7% measured; `--no-pin-cores` turns it off, and the output is the same). Models live
 in `~/.local/share/cachepotato` (`CACHEPOTATO_HOME` moves them). Details:
 [Build & run](#build--run).
 

@@ -75,15 +75,27 @@ pub fn run(a: RunArgs) -> Result<()> {
         &Options {
             budget_mb: a.budget_mb,
             threads: a.threads,
-            pin_cores: a.pin_cores.then_some(true),
+            pin_cores: Some(a.pin_cores),
             tokenizer_dir: None,
         },
     )?;
     let s = model.stats();
     let budget = if s.budget_mb < 0 { "no pager".to_string() } else { format!("{:.1} GB pager budget", s.budget_mb as f64 / 1024.0) };
+    let pinned = match s.pinned() {
+        [] if a.pin_cores => " (not pinned: CPU topology unreadable)".to_string(),
+        [] => String::new(),
+        cpus => {
+            let list = cpus.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
+            if cpus.len() < s.threads as usize {
+                format!(" ({} pinned to CPUs {list}, one per physical core)", cpus.len())
+            } else {
+                format!(" pinned to CPUs {list}")
+            }
+        }
+    };
     eprintln!(
-        "{} layers, {} experts (top-{}), {}, {} threads, {}-token context.",
-        s.n_layers, s.n_experts, s.topk, budget, s.threads, s.max_ctx
+        "{} layers, {} experts (top-{}), {}, {} threads{}, {}-token context.",
+        s.n_layers, s.n_experts, s.topk, budget, s.threads, pinned, s.max_ctx
     );
     eprintln!("Greedy decoding. /reset starts over, /stats shows the pager, exit or ctrl-D leaves.");
     eprintln!("The first answer is slow while the pager reads weights from disk.");
