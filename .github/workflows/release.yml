@@ -19,7 +19,7 @@ jobs:
       # speed was within run-to-run noise (2.40-3.08 vs 2.41-3.27 tok/s, warm cache).
       CACHEPOTATO_MARCH: x86-64-v3
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
 
       - name: tag matches the crate version
