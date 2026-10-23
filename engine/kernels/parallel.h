@@ -27,6 +27,11 @@ int  cp_threads(void);
  * counts; later calls return the running thread count. */
 int  cp_threads_init(int n, int pin);
 
+/* The logical CPUs the pool's threads are pinned to, thread 0 first (at most max written).
+ * Returns how many threads are pinned: 0 when pinning is off, the pool has not started, or
+ * the CPU topology could not be read. */
+int  cp_pinned_cpus(int *out, int max);
+
 /* Run fn(ctx, lo, hi) over contiguous slices of [0, n). Blocks until all slices finish.
  * Runs serially when the pool has one thread. */
 void cp_parallel_for(int n, void (*fn)(void *ctx, int lo, int hi), void *ctx);

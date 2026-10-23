@@ -386,6 +386,7 @@ void cp_get_stats(const cp_model *m, cp_stats *s) {
     s->topk = b->topk; s->vocab = b->vocab; s->max_ctx = m->max_ctx;
     s->threads = m->threads; s->budget_mb = b->pager ? m->budget_mb : -1;
     s->file_bytes = m->file_bytes;
+    s->n_pinned = cp_pinned_cpus(s->pinned_cpus, 64);
     if (b->pager) {
         PagerTotals p;
         pager_totals(&p);

@@ -42,7 +42,7 @@ pub struct Turn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct Stats {
     pub n_layers: c_int,
     pub d_model: c_int,
@@ -58,6 +58,15 @@ pub struct Stats {
     pub evictions: c_long,
     pub bytes_fetched: c_longlong,
     pub resident_bytes: c_longlong,
+    pub n_pinned: c_int,
+    pub pinned_cpus: [c_int; 64],
+}
+
+impl Stats {
+    /// The logical CPUs the engine's threads are pinned to, thread 0 first; empty if unpinned.
+    pub fn pinned(&self) -> &[c_int] {
+        &self.pinned_cpus[..(self.n_pinned.clamp(0, 64) as usize)]
+    }
 }
 
 #[repr(C)]
@@ -108,7 +117,8 @@ pub struct Options {
     pub budget_mb: Option<u64>,
     /// None = one per physical core.
     pub threads: Option<usize>,
-    /// None = CP_PIN_CORES from the environment.
+    /// None = CP_PIN_CORES from the environment. Pinning is per physical core and never
+    /// changes the output.
     pub pin_cores: Option<bool>,
     pub tokenizer_dir: Option<std::path::PathBuf>,
 }
@@ -192,9 +202,11 @@ impl Model {
     }
 
     pub fn stats(&self) -> Stats {
-        let mut s = Stats::default();
-        unsafe { cp_get_stats(self.ptr.as_ptr(), &mut s) };
-        s
+        let mut s = std::mem::MaybeUninit::<Stats>::zeroed();
+        unsafe {
+            cp_get_stats(self.ptr.as_ptr(), s.as_mut_ptr());
+            s.assume_init()
+        }
     }
 }
 

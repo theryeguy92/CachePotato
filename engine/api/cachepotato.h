@@ -33,7 +33,8 @@ typedef struct cp_model cp_model;
 typedef struct {
     long budget_mb;             /* see above */
     int threads;                /* 0 = physical cores (cp_physical_cores) */
-    int pin_cores;              /* 1/0 = pin worker threads to cores or not; -1 = CP_PIN_CORES */
+    int pin_cores;              /* 1/0 = pin each thread to its own physical core or not;
+                                   -1 = CP_PIN_CORES. Never changes a value (parallel.h) */
     int max_ctx;                /* 0 = 2048 tokens */
     const char *tokenizer_dir;  /* NULL = search: <model dir>/tokenizer, <model dir>, weights */
 } cp_options;
@@ -80,6 +81,10 @@ typedef struct {
     /* pager, cumulative since cp_open (all zero without a pager) */
     long hits, misses, evictions;
     long long bytes_fetched, resident_bytes;
+    /* thread placement: pool thread i runs on logical CPU pinned_cpus[i] (one per physical
+       core); n_pinned is 0 when pinning is off or the topology could not be read */
+    int n_pinned;
+    int pinned_cpus[64];
 } cp_stats;
 
 void cp_get_stats(const cp_model *m, cp_stats *out);
