@@ -152,5 +152,14 @@ if [ "${CP_SKIP_PORT:-0}" != "1" ] && [ -f weights/moe-scale-run/l05/model_only.
     [ $rc -eq 0 ] || fail=1
 fi
 
+# FFI gate: the Rust CLI (cli/) must emit exactly the C chat driver's bytes. Skips itself
+# without the Q4 file or cargo; ~2 minutes when it runs. CP_SKIP_CLI=1 skips it.
+if [ "${CP_SKIP_CLI:-0}" != "1" ]; then
+    printf '  %-22s ' "cli_chat_ffi"
+    out=$(tools/verify_cli_chat.sh 2>&1); rc=$?
+    echo "$out" | grep -E "^CLI CHAT GATE" | tail -1 | sed 's/^/ /'
+    [ $rc -eq 0 ] || fail=1
+fi
+
 echo "== done (fail=$fail) =="
 exit $fail

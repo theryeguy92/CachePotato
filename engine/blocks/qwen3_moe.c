@@ -312,6 +312,10 @@ static int name_is(const char *s, unsigned len, const char *want) {
 }
 
 int qwen3_map(QW3Layer *m, const char *path) {
+    return qwen3_map_ex(m, path, QW3_BUDGET_ENV);
+}
+
+int qwen3_map_ex(QW3Layer *m, const char *path, long budget_bytes) {
     memset(m, 0, sizeof *m);   /* same contract as qwen3_load_blob */
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror(path); return -1; }
@@ -352,6 +356,29 @@ int qwen3_map(QW3Layer *m, const char *path) {
     const uint64_t off_reg = rd64(base + 56);
     m->off_data = rd64(base + 64);
 
+    /* layer count = attention blocks in the block table (SPEC: u8 kind, u32 layer, u8 n_refs,
+       u32 refs[], u8 n_params, u32 params[]). Every Qwen3 layer has exactly one, and reading it
+       here is what lets a driver stop being told "48" on the command line. */
+    {
+        const uint32_t nblk_hdr = rd32(base + 20);
+        const unsigned char *b = base + rd64(base + 48), *end = base + st.st_size;
+        uint32_t nblk = (b + 4 <= end) ? rd32(b) : 0; b += 4;
+        if (nblk != nblk_hdr) {
+            fprintf(stderr, "v4: block table count %u != header %u\n", nblk, nblk_hdr);
+            close(fd);
+            return -3;
+        }
+        for (uint32_t i = 0; i < nblk; i++) {
+            if (b + 6 > end) { close(fd); return -3; }
+            const uint8_t kind = b[0];
+            const uint32_t layer = rd32(b + 1);
+            b += 6 + 4u * b[5];
+            if (b + 1 > end) { close(fd); return -3; }
+            b += 1 + 4u * b[0];
+            if (kind == 0x10 && (int)layer + 1 > m->n_layers) m->n_layers = (int)layer + 1;
+        }
+    }
+
     /* encoding index -> engine encoding code */
     const unsigned char *cur = base + off_enc;
     for (uint32_t i = 0; i < m->n_enc && i < 64; i++) {
@@ -387,9 +414,14 @@ int qwen3_map(QW3Layer *m, const char *path) {
         const char *pg = getenv("CP_PAGER"), *pb = getenv("CP_BUDGET");
         /* Off unless asked for: the unpaged run IS the control (B5), and a pager that
            attached itself would change the memory behaviour of every existing gate. */
-        if ((pg && pg[0] == '1') || pb) {
-            long budget = LONG_MAX;                 /* active, counts, never evicts */
-            if (pb) budget = atol(pb) * 1024L * 1024L;
+        long budget = budget_bytes;
+        if (budget == QW3_BUDGET_ENV) {
+            budget = QW3_BUDGET_NONE;
+            if ((pg && pg[0] == '1') || pb)
+                budget = pb ? atol(pb) * 1024L * 1024L
+                            : LONG_MAX;             /* active, counts, never evicts */
+        }
+        if (budget != QW3_BUDGET_NONE) {
             if (pager_open_v4(fd, base, (size_t)m->off_data, budget)) {
                 fprintf(stderr, "v4: pager open failed\n");
                 close(fd);

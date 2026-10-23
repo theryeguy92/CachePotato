@@ -41,7 +41,9 @@ static struct {
    threads between HT siblings, and a migrated thread loses its L1/L2 contents — the x vector
    and the four accumulators are exactly what a decode matmul keeps hot. Off by default so no
    recorded benchmark moves; CP_PIN_CORES=1 turns it on. */
+static int pin_override = -1;   /* cp_threads_init(): -1 = use CP_PIN_CORES */
 static int pin_cores(void) {
+    if (pin_override >= 0) return pin_override;
     const char *pc = getenv("CP_PIN_CORES");
     return pc && *pc && atoi(pc) != 0;
 }
@@ -104,16 +106,28 @@ static void start(int nthreads) {
         }
 }
 
+static int clamp_threads(int n) {
+    if (n <= 0) n = 1;
+    if (n > MAX_THREADS) n = MAX_THREADS;
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpus > 0 && n > (int)cpus) n = (int)cpus;
+    return n;
+}
+
 int cp_threads(void) {
     if (J.started) return J.nthreads;
     int n = 1;
     const char *s = getenv("CP_THREADS");
     if (s && *s) n = atoi(s);
-    if (n <= 0) n = 1;
-    if (n > MAX_THREADS) n = MAX_THREADS;
-    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    if (cpus > 0 && n > (int)cpus) n = (int)cpus;
-    start(n);
+    start(clamp_threads(n));
+    return J.nthreads;
+}
+
+int cp_threads_init(int n, int pin) {
+    if (J.started) return J.nthreads;
+    if (pin >= 0) pin_override = pin != 0;
+    if (n <= 0) return cp_threads();
+    start(clamp_threads(n));
     return J.nthreads;
 }
 
