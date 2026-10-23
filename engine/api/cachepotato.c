@@ -39,6 +39,8 @@ struct cp_model {
     int *ids, *turn;
     int L, max_ctx, hist, threads;
     long budget_mb;
+    cp_progress_fn progress;
+    void *progress_user;
     long long file_bytes;
 };
 
@@ -146,7 +148,7 @@ static void apply_head(QW3Layer *m, const float *x, int T, int pos0, float *logi
     }
 }
 
-static int run_layers(QW3Layer *layers, float *x, int T, int pos0, QW3KV *kv, int L) {
+static int run_layers(cp_model *cm, QW3Layer *layers, float *x, int T, int pos0, QW3KV *kv, int L) {
     QW3Out o;
     for (int l = 0; l < L; l++) {
         QW3Layer *m = &layers[l];
@@ -161,6 +163,7 @@ static int run_layers(QW3Layer *layers, float *x, int T, int pos0, QW3KV *kv, in
         /* Between layers, not inside one: a layer's 8 experts are still in use for the next
            token, and evicting between two of their own reads is what the policy avoids. */
         pager_enforce();
+        if (cm->progress) cm->progress(l + 1, L, T, cm->progress_user);
     }
     return 0;
 }
@@ -343,7 +346,7 @@ int cp_chat(cp_model *m, const char *user_msg, int max_new,
 
     double t0 = now();
     embed_rows(&layers[0], ids + pos0, Tn, pos0, x, D);
-    if (run_layers(layers, x, Tn, pos0, m->kv, L)) return -3;
+    if (run_layers(m, layers, x, Tn, pos0, m->kv, L)) return -3;
     double t1 = now();
 
     /* the last prefill position gives the first token */
@@ -363,7 +366,7 @@ int cp_chat(cp_model *m, const char *user_msg, int max_new,
         /* the emitted token always goes through the forward pass, even when the caller
            stops here, so the KV cache holds every token hist counts */
         embed_rows(&layers[0], &best, 1, pos, x, D);
-        if (run_layers(layers, x, 1, pos, m->kv, L)) { rc = -3; break; }
+        if (run_layers(m, layers, x, 1, pos, m->kv, L)) { rc = -3; break; }
         apply_head(&layers[0], x, 1, pos, logits, V);
         pos++; produced++;
         if (stop_req) { t.stop = CP_STOP_CALLER; break; }
@@ -376,6 +379,28 @@ int cp_chat(cp_model *m, const char *user_msg, int max_new,
     if (out) *out = t;
     return rc;
 }
+
+void cp_set_progress(cp_model *m, cp_progress_fn fn, void *user) {
+    m->progress = fn;
+    m->progress_user = user;
+}
+
+int cp_prefill_text(cp_model *m, const char *text) {
+    QW3Layer *layers = m->layers;
+    const int D = layers[0].d_model;
+    int Tn = tokenizer_qwen_encode(&m->tk, text, m->turn, m->max_ctx - m->hist);
+    if (Tn <= 0) return -2;
+    /* the same margin cp_chat keeps, so a following turn still has room to answer */
+    if (m->hist + Tn > m->max_ctx - 64) return -4;
+    memcpy(m->ids + m->hist, m->turn, sizeof(int) * (size_t)Tn);
+    const int pos0 = m->hist;
+    m->hist += Tn;
+    embed_rows(&layers[0], m->ids + pos0, Tn, pos0, m->x, D);
+    if (run_layers(m, layers, m->x, Tn, pos0, m->kv, m->L)) return -3;
+    return Tn;
+}
+
+int cp_context_tokens(const cp_model *m) { return m->hist; }
 
 /* ---- counters ---------------------------------------------------------------------- */
 

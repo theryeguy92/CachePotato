@@ -75,6 +75,7 @@ struct CpModel {
 }
 
 type TokenFn = unsafe extern "C" fn(*const c_char, usize, *mut c_void) -> c_int;
+type ProgressFn = unsafe extern "C" fn(c_int, c_int, c_int, *mut c_void);
 
 extern "C" {
     fn cp_options_default(opt: *mut CpOptions);
@@ -89,6 +90,9 @@ extern "C" {
         turn: *mut Turn,
     ) -> c_int;
     fn cp_reset(m: *mut CpModel);
+    fn cp_prefill_text(m: *mut CpModel, text: *const c_char) -> c_int;
+    fn cp_context_tokens(m: *const CpModel) -> c_int;
+    fn cp_set_progress(m: *mut CpModel, f: Option<ProgressFn>, user: *mut c_void);
     fn cp_get_stats(m: *const CpModel, out: *mut Stats);
     fn cp_physical_cores() -> c_int;
     fn cp_mem_available_mb() -> c_long;
@@ -123,9 +127,26 @@ pub struct Options {
     pub tokenizer_dir: Option<std::path::PathBuf>,
 }
 
-/// An open model. One per process: the engine's pager is process-global.
+/// Where a forward pass is: `layer` of `n_layers` done, over `tokens` tokens (> 1 = a prompt
+/// being prefilled). `stats` is filled during a prefill and on the last layer of a generated
+/// token, and is None otherwise (reading it walks every region, so not on every layer).
+pub struct Progress {
+    pub layer: usize,
+    pub n_layers: usize,
+    pub tokens: usize,
+    pub stats: Option<Stats>,
+}
+
+struct ProgressHook {
+    model: *const CpModel,
+    f: Box<dyn FnMut(Progress)>,
+}
+
+/// An open model. One per process: the engine's pager is process-global. Not Send: the
+/// engine pins the thread that opened it, so it is used where it was opened.
 pub struct Model {
     ptr: NonNull<CpModel>,
+    progress: Option<Box<ProgressHook>>,
 }
 
 impl Model {
@@ -154,7 +175,7 @@ impl Model {
         let mut err = [0 as c_char; 512];
         let p = unsafe { cp_open(cpath.as_ptr(), &opt, err.as_mut_ptr(), err.len()) };
         match NonNull::new(p) {
-            Some(ptr) => Ok(Model { ptr }),
+            Some(ptr) => Ok(Model { ptr, progress: None }),
             None => {
                 let msg = unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy().into_owned();
                 Err(anyhow!(msg))
@@ -201,6 +222,40 @@ impl Model {
         unsafe { cp_reset(self.ptr.as_ptr()) }
     }
 
+    /// Append raw text (ChatML included) to the conversation without generating.
+    /// Returns the tokens added.
+    pub fn prefill_text(&mut self, text: &str) -> Result<usize> {
+        let c = CString::new(text).map_err(|_| anyhow!("text contains a NUL byte"))?;
+        match unsafe { cp_prefill_text(self.ptr.as_ptr(), c.as_ptr()) } {
+            n if n >= 0 => Ok(n as usize),
+            -2 => bail!("the text could not be tokenized"),
+            -4 => bail!("the conversation does not fit in the context"),
+            rc => bail!("the forward pass failed (engine error {rc})"),
+        }
+    }
+
+    pub fn context_tokens(&self) -> usize {
+        unsafe { cp_context_tokens(self.ptr.as_ptr()) }.max(0) as usize
+    }
+
+    /// Called after every layer of every forward pass, on this thread.
+    pub fn set_progress<F: FnMut(Progress) + 'static>(&mut self, f: F) {
+        unsafe extern "C" fn trampoline(layer: c_int, n: c_int, t: c_int, user: *mut c_void) {
+            let hook = &mut *(user as *mut ProgressHook);
+            let stats = (t > 1 || layer == n).then(|| {
+                let mut s = std::mem::MaybeUninit::<Stats>::zeroed();
+                cp_get_stats(hook.model, s.as_mut_ptr());
+                s.assume_init()
+            });
+            let p = Progress { layer: layer as usize, n_layers: n as usize, tokens: t as usize, stats };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (hook.f)(p)));
+        }
+        let mut hook = Box::new(ProgressHook { model: self.ptr.as_ptr(), f: Box::new(f) });
+        let user = &mut *hook as *mut ProgressHook as *mut c_void;
+        unsafe { cp_set_progress(self.ptr.as_ptr(), Some(trampoline), user) };
+        self.progress = Some(hook);
+    }
+
     pub fn stats(&self) -> Stats {
         let mut s = std::mem::MaybeUninit::<Stats>::zeroed();
         unsafe {
@@ -212,6 +267,9 @@ impl Model {
 
 impl Drop for Model {
     fn drop(&mut self) {
-        unsafe { cp_close(self.ptr.as_ptr()) }
+        unsafe {
+            cp_set_progress(self.ptr.as_ptr(), None, std::ptr::null_mut());
+            cp_close(self.ptr.as_ptr())
+        }
     }
 }

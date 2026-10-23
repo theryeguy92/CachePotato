@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CachePotato</title>
+<style>
+:root {
+  --bg: #f7f6f3; --panel: #ffffff; --ink: #1d1c1a; --muted: #6b6862; --line: #e4e1da;
+  --accent: #b5651d; --accent-soft: #f3e6d8; --good: #2f7d4f; --warn: #a15c00; --bad: #b3261e;
+  --user: #efece6; --code: #f1efea; --bar: #e9e5dd;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161514; --panel: #1f1e1c; --ink: #ece9e3; --muted: #a29e96; --line: #33312d;
+    --accent: #e0954f; --accent-soft: #3a2b1d; --good: #6cc08f; --warn: #e3a64f; --bad: #f08a80;
+    --user: #2a2825; --code: #282623; --bar: #33312d;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.app { display: grid; grid-template-columns: minmax(0, 1fr) 320px; height: 100vh; }
+header { display: flex; align-items: center; gap: 10px; padding: 12px 20px; border-bottom: 1px solid var(--line); }
+header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+header .model { color: var(--muted); font-size: 13px; }
+header .spacer { flex: 1; }
+button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+  border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: .5; cursor: default; }
+main { display: flex; flex-direction: column; min-height: 0; }
+#log { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+.msg { max-width: 760px; width: 100%; margin: 0 auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.user { background: var(--user); border-radius: 12px; padding: 10px 14px; }
+.msg.assistant .body { padding: 2px 2px; }
+.msg.error { color: var(--bad); }
+.msg pre { background: var(--code); border-radius: 8px; padding: 10px 12px; overflow-x: auto; white-space: pre; margin: 6px 0; }
+.msg code { background: var(--code); border-radius: 4px; padding: 0 4px; font: 13px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+.msg pre code { background: none; padding: 0; }
+.msg .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.empty { margin: auto; text-align: center; color: var(--muted); max-width: 420px; }
+.empty b { color: var(--ink); }
+form { border-top: 1px solid var(--line); padding: 12px 20px 16px; }
+.composer { max-width: 760px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+textarea { flex: 1; resize: none; font: inherit; color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-height: 44px; max-height: 200px; }
+textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.hint { max-width: 760px; margin: 6px auto 0; color: var(--muted); font-size: 12px; }
+aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 16px 18px; }
+aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 18px 0 8px; font-weight: 600; }
+aside h2:first-child { margin-top: 0; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+.dot.idle { background: var(--good); } .dot.prefill { background: var(--warn); } .dot.decode { background: var(--accent); }
+.dot.loading, .dot.down { background: var(--bad); }
+.status-line { color: var(--muted); font-size: 13px; margin-top: 4px; min-height: 20px; }
+.bar { height: 6px; background: var(--bar); border-radius: 3px; overflow: hidden; margin: 6px 0 2px; }
+.bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+dl { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; margin: 0; font-size: 13.5px; }
+dt { color: var(--muted); } dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.note { color: var(--muted); font-size: 12px; margin-top: 18px; line-height: 1.45; }
+@media (max-width: 860px) {
+  .app { grid-template-columns: 1fr; height: auto; min-height: 100vh; }
+  main { height: 100vh; }
+  aside { border-left: 0; border-top: 1px solid var(--line); }
+  #log, form, header { padding-left: 16px; padding-right: 16px; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <main>
+    <header>
+      <h1>CachePotato</h1>
+      <span class="model" id="model-name"></span>
+      <span class="spacer"></span>
+      <button id="new-chat" type="button">New chat</button>
+    </header>
+    <div id="log"></div>
+    <form id="form">
+      <div class="composer">
+        <textarea id="input" rows="1" placeholder="Message the model…" autofocus></textarea>
+        <button class="primary" id="send" type="submit">Send</button>
+      </div>
+      <div class="hint">Enter sends, Shift+Enter for a new line. Runs entirely on this machine; answers are greedy, so the same question gives the same answer.</div>
+    </form>
+  </main>
+  <aside>
+    <h2>Status</h2>
+    <div class="pill"><span class="dot" id="dot"></span><span id="phase">Connecting…</span></div>
+    <div class="bar" id="phase-bar-wrap" hidden><i id="phase-bar"></i></div>
+    <div class="status-line" id="phase-detail"></div>
+
+    <h2>This answer</h2>
+    <dl>
+      <dt>Tokens written</dt><dd id="s-gen">–</dd>
+      <dt>Speed</dt><dd id="s-tps">–</dd>
+      <dt>Read from disk</dt><dd id="s-turn-read">–</dd>
+    </dl>
+
+    <h2>Conversation</h2>
+    <div class="bar"><i id="ctx-bar"></i></div>
+    <dl><dt>Context used</dt><dd id="s-ctx">–</dd></dl>
+
+    <h2>Memory</h2>
+    <div class="bar"><i id="mem-bar"></i></div>
+    <dl>
+      <dt>Weights in RAM</dt><dd id="s-res">–</dd>
+      <dt>Cache hit rate</dt><dd id="s-hit">–</dd>
+      <dt>Read from disk (total)</dt><dd id="s-read">–</dd>
+      <dt>Evictions</dt><dd id="s-ev">–</dd>
+    </dl>
+
+    <h2>Last answer</h2>
+    <dl>
+      <dt>Prompt</dt><dd id="l-prompt">–</dd>
+      <dt>Reading the prompt</dt><dd id="l-prefill">–</dd>
+      <dt>Writing</dt><dd id="l-decode">–</dd>
+    </dl>
+
+    <h2>Machine</h2>
+    <dl>
+      <dt>Threads</dt><dd id="m-threads">–</dd>
+      <dt>Model file</dt><dd id="m-file">–</dd>
+      <dt>Answers served</dt><dd id="m-req">–</dd>
+    </dl>
+    <p class="note">The model is larger than this machine's memory. Its weights live on disk and the pager keeps the ones in use in RAM, so the first answer is slow while they load, and a follow-up question is faster.</p>
+  </aside>
+</div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+let messages = store.get("cp.messages", []);
+let apiKey = store.get("cp.key", "");
+let modelId = "";
+let busy = false;
+let controller = null;
+
+function headers() {
+  const h = { "Content-Type": "application/json" };
+  if (apiKey) h["Authorization"] = "Bearer " + apiKey;
+  return h;
+}
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: headers() });
+  if (r.status === 401) {
+    const k = prompt("This server needs an API key:");
+    if (k) { apiKey = k; store.set("cp.key", k); return api(path, opts); }
+  }
+  return r;
+}
+
+// ---- rendering: text, with ``` fences and `inline` code
+function esc(s) { return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+function render(text) {
+  const parts = text.split(/```/);
+  return parts.map((p, i) => {
+    if (i % 2 === 1) { const nl = p.indexOf("\n"); return "<pre><code>" + esc(nl >= 0 ? p.slice(nl + 1) : p) + "</code></pre>"; }
+    return esc(p).replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  }).join("");
+}
+function bubble(m) {
+  const d = document.createElement("div");
+  d.className = "msg " + m.role;
+  d.innerHTML = '<div class="body"></div>' + (m.meta ? '<div class="meta"></div>' : "");
+  d.querySelector(".body").innerHTML = render(m.content);
+  if (m.meta) d.querySelector(".meta").textContent = m.meta;
+  return d;
+}
+function drawLog() {
+  const log = $("log");
+  log.innerHTML = "";
+  if (!messages.length) {
+    log.innerHTML = '<div class="empty"><p><b>Ask anything.</b></p><p>The first answer takes a while — the model reads its weights from disk. Watch the Monitor on the right.</p></div>';
+    return;
+  }
+  for (const m of messages) log.appendChild(bubble(m));
+  log.scrollTop = log.scrollHeight;
+}
+
+// ---- chat
+async function send(text) {
+  messages.push({ role: "user", content: text });
+  const answer = { role: "assistant", content: "" };
+  messages.push(answer);
+  drawLog();
+  const el = $("log").lastChild.querySelector(".body");
+  setBusy(true);
+  controller = new AbortController();
+  const payload = {
+    model: modelId,
+    stream: true,
+    messages: messages.slice(0, -1).filter((m) => m.role !== "error").map(({ role, content }) => ({ role, content })),
+  };
+  try {
+    const r = await fetch("/v1/chat/completions", { method: "POST", headers: headers(), body: JSON.stringify(payload), signal: controller.signal });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      throw new Error((e.error && e.error.message) || "HTTP " + r.status);
+    }
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const block = buf.slice(0, i); buf = buf.slice(i + 2);
+        for (const line of block.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") continue;
+          const j = JSON.parse(data);
+          if (j.error) throw new Error(j.error.message);
+          const c = j.choices && j.choices[0];
+          if (c && c.delta && c.delta.content) {
+            answer.content += c.delta.content;
+            el.innerHTML = render(answer.content);
+            $("log").scrollTop = $("log").scrollHeight;
+          }
+          if (c && c.finish_reason === "length") answer.meta = "stopped at the length limit";
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === "AbortError") answer.meta = "stopped";
+    else { messages.pop(); messages.push({ role: "error", content: "Error: " + e.message }); }
+  }
+  controller = null;
+  store.set("cp.messages", messages);
+  setBusy(false);
+  drawLog();
+}
+
+function setBusy(b) {
+  busy = b;
+  $("send").textContent = b ? "Stop" : "Send";
+  $("send").classList.toggle("primary", !b);
+  $("new-chat").disabled = b;
+}
+
+$("form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (busy) { if (controller) controller.abort(); return; }
+  const t = $("input").value.trim();
+  if (!t) return;
+  $("input").value = "";
+  autosize();
+  send(t);
+});
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("form").requestSubmit(); }
+});
+function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 200) + "px"; }
+$("input").addEventListener("input", autosize);
+$("new-chat").addEventListener("click", async () => {
+  messages = []; store.set("cp.messages", messages); drawLog();
+  await api("/api/reset", { method: "POST" }).catch(() => {});
+});
+
+// ---- monitor
+const GB = 1024 ** 3, MB = 1024 ** 2;
+function fmtBytes(b) { return b >= GB ? (b / GB).toFixed(2) + " GB" : (b / MB).toFixed(0) + " MB"; }
+function pct(a, b) { return b > 0 ? Math.max(0, Math.min(100, (100 * a) / b)) : 0; }
+
+async function poll() {
+  let s = null;
+  try { const r = await api("/api/stats"); if (r.ok) s = await r.json(); } catch {}
+  if (!s) {
+    $("dot").className = "dot down"; $("phase").textContent = "Server not reachable";
+    $("phase-detail").textContent = ""; $("phase-bar-wrap").hidden = true;
+    return setTimeout(poll, 2000);
+  }
+  modelId = s.model;
+  $("model-name").textContent = s.model;
+  const phaseName = { loading: "Loading the model", idle: "Ready", prefill: "Reading the prompt", decode: "Writing" }[s.phase] || s.phase;
+  $("dot").className = "dot " + s.phase;
+  $("phase").textContent = phaseName + (s.queued > 0 ? " · " + s.queued + " queued" : "");
+  const inPrefill = s.phase === "prefill";
+  $("phase-bar-wrap").hidden = !inPrefill;
+  $("phase-bar").style.width = pct(s.layer, s.n_layers) + "%";
+  $("phase-detail").textContent =
+    inPrefill ? `layer ${s.layer} of ${s.n_layers} · ${fmtBytes(s.turn_bytes_fetched)} read from disk` :
+    s.phase === "decode" ? `${s.generated} tokens · ${s.tok_s.toFixed(2)} tok/s` : "";
+
+  const active = s.phase === "prefill" || s.phase === "decode";
+  $("s-gen").textContent = active ? s.generated : s.last_turn ? s.last_turn.generated : "–";
+  $("s-tps").textContent = active ? (s.tok_s > 0 ? s.tok_s.toFixed(2) + " tok/s" : "–") : s.last_turn ? s.last_turn.tok_s.toFixed(2) + " tok/s" : "–";
+  $("s-turn-read").textContent = s.requests || active ? fmtBytes(s.turn_bytes_fetched) : "–";
+
+  $("ctx-bar").style.width = pct(s.context_tokens, s.max_ctx) + "%";
+  $("s-ctx").textContent = `${s.context_tokens} / ${s.max_ctx} tokens`;
+
+  if (s.budget_mb >= 0) {
+    $("mem-bar").style.width = pct(s.resident_bytes, s.budget_mb * MB) + "%";
+    $("s-res").textContent = `${fmtBytes(s.resident_bytes)} of ${(s.budget_mb / 1024).toFixed(1)} GB`;
+    const acc = s.hits + s.misses;
+    $("s-hit").textContent = acc ? ((100 * s.hits) / acc).toFixed(1) + "%" : "–";
+    $("s-read").textContent = fmtBytes(s.bytes_fetched);
+    $("s-ev").textContent = s.evictions.toLocaleString();
+  } else {
+    $("s-res").textContent = "no pager";
+  }
+  if (s.last_turn) {
+    const l = s.last_turn;
+    $("l-prompt").textContent = l.prompt_tokens + " tokens";
+    $("l-prefill").textContent = l.prefill_s.toFixed(1) + " s";
+    $("l-decode").textContent = `${l.generated} tok in ${l.decode_s.toFixed(1)} s`;
+  }
+  $("m-threads").textContent = s.threads + (s.pinned.length ? ` (CPUs ${s.pinned.join(",")})` : "");
+  $("m-file").textContent = s.file_bytes ? fmtBytes(s.file_bytes) : "–";
+  $("m-req").textContent = s.requests;
+  setTimeout(poll, active || s.phase === "loading" ? 500 : 1500);
+}
+
+drawLog();
+poll();
+</script>
+</body>
+</html>
