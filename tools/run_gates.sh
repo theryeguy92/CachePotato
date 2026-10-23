@@ -58,6 +58,44 @@ if [ -f weights/qwen2.5-0.5b-instruct/model.safetensors ]; then
     [ $rc -eq 0 ] || fail=1
 fi
 
+if [ -f weights/qwen3-30b-a3b/model-00001-of-00016.safetensors ]; then
+    printf '  %-22s ' "qwen3_c_blocks"
+    out=$(python3 tools/verify_qwen3_blocks.py 2>&1); rc=$?
+    echo "$out" | grep -E "^QWEN3 C BLOCKS" | tail -1 | sed 's/^/ /'
+    [ $rc -eq 0 ] || fail=1
+fi
+
+# C1 paging. THE gate for the pager: at an unlimited budget the output must be
+# BIT-IDENTICAL to the unpaged run, and at a budget tight enough to evict it must still
+# be (eviction drops pages of a file mapping; it must not change what they say). The
+# 2048 MB budget was chosen because it evicts on the recorded prompt — a run with zero
+# evictions would test the counters and not the policy. Skipped without the 32.5 GB file.
+if [ -f weights/qwen3_30b_a3b_q8.v4cp ]; then
+    printf '  %-22s ' "qwen3_paging_c1"
+    out=$(python3 tools/verify_qwen3_paging.py --budget-mb 2048 2>&1); rc=$?
+    echo "$out" | grep -E "^C1 PAGING" | tail -1 | sed 's/^/ /'
+    [ $rc -eq 0 ] || fail=1
+
+    # C2's numbers come from an incremental decode loop, which is a second way of computing
+    # attention (KV cache, RoPE position, causal bound). Gate it the way gate 1 gates the
+    # GPT-2 incremental path: decode logits must be BIT-IDENTICAL to prefill's at the same
+    # position. Without this the regions/token table would describe an unverified path.
+    printf '  %-22s ' "qwen3_decode_step"
+    out=$(python3 tools/verify_qwen3_decode.py --gen 8 2>&1); rc=$?
+    echo "$out" | grep -E "^C2 STEP GATE" | tail -1 | sed 's/^/ /'
+    [ $rc -eq 0 ] || fail=1
+fi
+
+# Tier B: expert PLACEMENT can be recompiled without changing the answer. One layer is enough —
+# the claim is about where bytes live, and a second layer would only repeat the sum. Guarded by
+# the checkpoint because it converts (2 x 1-layer files, ~3.5 min).
+if [ -f weights/qwen3-30b-a3b/model-00001-of-00016.safetensors ]; then
+    printf '  %-22s ' "qwen3_tierb_grouping"
+    out=$(python3 tools/verify_tierb_grouping.py 2>&1); rc=$?
+    echo "$out" | grep -E "^TIER B GROUPING" | tail -1 | sed 's/^/ /'
+    [ $rc -eq 0 ] || fail=1
+fi
+
 printf '  %-22s ' "qwen_kernels"
 out=$(python3 tools/verify_qwen_kernels.py 2>&1); rc=$?
 echo "$out" | grep -E "^QWEN KERNELS" | tail -1 | sed 's/^/ /'

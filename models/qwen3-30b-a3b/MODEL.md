@@ -103,3 +103,32 @@ weights describe reality. Every fact in §1 is therefore cross-checked against a
 - **Q4-class encoding is not settled.** A symmetric group-32 scheme was tried on the 0.5B model and
   was not good enough there; this model needs a *better* 4-bit scheme (or 2-bit) to fit, and the
   quality question has to be re-asked at 30B rather than assumed from 0.5B.
+
+## 6. Tie-breaking is not an edge case here — it is the norm (measured 2026-10-18)
+
+The baseline validator found that **every one of the 240 (layer, token) positions** in the recorded
+routing trace has at least one tie at the 8th/9th expert boundary. Router logits are recorded in
+bf16, which carries ~8 mantissa bits, so among 128 experts two probabilities land on *exactly* the
+same value routinely. "The top 8" therefore has no unique answer at the boundary, and `torch.topk`
+and `argsort` may legitimately choose different members.
+
+This is not a nuisance to work around; it constrains what the port can claim:
+
+1. **The C block must have a documented tie-break rule, and it must be deterministic.** The
+   gpt2-moe block uses "strict `>`, lower expert id wins", which is a fine rule — but it has to be
+   stated, because it decides 8 of 128 experts at almost every token.
+2. **Tier B's `routing exactly invariant` claim is unaffected** — it compares our engine to *itself*
+   under two layouts, so a fixed own-rule suffices. That is the strong claim and it survives.
+3. **C-vs-HF routing agreement must be tie-aware.** Comparing exact index sets against this trace
+   would report mismatches that are not errors. The comparison must be "the selected set is a valid
+   top-8 given ties" — every chosen expert at least as likely as the 8th largest, and no unchosen
+   expert strictly more likely. `tools/check_qwen3_baseline.py` implements exactly this rule and is
+   the reference for what "agreement" means.
+4. **Recorded weights are unambiguous where recorded indices are not.** They matched
+   softmax+renormalise to 1.79e-07, which is what proved the trace's indices correct in the first
+   place. Any future routing check should use *both*: the set must be valid given ties, and the
+   weights must match.
+
+Practical consequence for B5: expected routing agreement with HF is not a percentage to be maximised
+— it should be **exact under the tie-aware rule**, and anything less is a real bug rather than
+rounding.

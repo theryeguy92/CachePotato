@@ -1,0 +1,23 @@
+C2 measurement 2026-10-18T19:04:11Z
+model weights/qwen3_30b_a3b_q8.v4cp
+prompt 785,6722,315,9625,374
+gen 8
+# CachePotato eval artifact metadata.
+# BIT-IDENTITY IS PER-MACHINE: two runs of THIS binary on THIS cpu are byte-identical;
+# the same source on another cpu is not, because different vector code reorders the
+# summations. Compare bytes only within a machine; across machines compare the function.
+utc: 2026-10-18T19:04:11Z
+host: T480
+cpu: Intel(R) Core(TM) i5-8250U CPU @ 1.60GHz
+isa: avx2 fma sse4.2
+compiler: 16.2.1 20260810
+git: e745f93
+model: weights/qwen3_30b_a3b_q8.v4cp
+model_bytes: 32479225664
+mode: decode
+layers: 48
+tokens: 785,6722,315,9625,374
+n_tokens: 5
+n_gen: 8
+weight_regions: 6579
+pager: CP_BUDGET=8192 MB + CP_PAGER_SYS=1

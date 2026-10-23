@@ -28,26 +28,33 @@ GROUP = 32
 BLOCK_BYTES = 18
 
 def encode_q4_0(x):
+    """Vectorised over blocks. This must stay bit-identical to the reference below, and it
+    does: the arithmetic is done in the same dtypes as the scalar loop (amax as float64
+    because `float(np.float32)` is exact; d/8 in float64 then rounded to fp16; the division
+    `row / dq` in float32, which is what numpy's weak promotion does with a Python scalar).
+    The scalar version needed 26 minutes for ONE layer of Qwen3-30B (18.8M blocks, one numpy
+    call chain each) — an hour per token of conversion for the full model."""
     a = np.ascontiguousarray(x, dtype=np.float32)
     if a.shape[-1] % GROUP:
         raise ValueError(f"last dim {a.shape[-1]} is not a multiple of {GROUP}")
-    flat = a.reshape(-1, GROUP)
-    out = bytearray()
-    for row in flat:
-        amax = float(np.abs(row).max())
-        d = amax / 8.0 if amax > 0 else 0.0
-        dh = np.float16(d)
-        dq = float(dh)
-        if dq > 0:
-            q = np.clip(np.rint(row / dq), -8, 7).astype(np.int32)
-        else:
-            q = np.zeros(GROUP, dtype=np.int32)
-        q = q & 0xF                                   # two's complement in 4 bits
-        packed = ((q[:16].astype(np.int32) | (q[16:].astype(np.int32) << 4))
-                  & 0xFF).astype(np.uint8)   # byte k = element k | element k+16
-        out += np.array([dh], dtype=np.float16).tobytes()
-        out += packed.tobytes()
-    return bytes(out), a.shape
+    rows = a.shape[0] * (a.shape[1] // GROUP) if a.ndim == 2 else a.size // GROUP
+    flat32 = a.reshape(rows, GROUP)
+    amax = np.abs(flat32).max(axis=1).astype(np.float64)
+    d = np.where(amax > 0, amax / 8.0, 0.0)
+    dh = d.astype(np.float16)
+    dq32 = dh.astype(np.float32)
+    q = np.zeros(flat32.shape, dtype=np.int32)
+    nz = dq32 > 0
+    if nz.any():
+        q[nz] = np.clip(np.rint(flat32[nz] / dq32[nz, None]), -8, 7).astype(np.int32)
+    q &= 0xF
+    packed = ((q[:, :16] | (q[:, 16:] << 4)) & 0xFF).astype(np.uint8)
+    out = np.empty((rows, BLOCK_BYTES), dtype=np.uint8)
+    bits = dh.view(np.uint16)
+    out[:, 0] = (bits & 0xFF).astype(np.uint8)
+    out[:, 1] = (bits >> 8).astype(np.uint8)
+    out[:, 2:] = packed
+    return out.tobytes(), a.shape
 
 def decode_q4_0(blocks, shape, dtype=np.float32):
     n = int(np.prod(shape))

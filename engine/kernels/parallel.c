@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include "parallel.h"
 
@@ -36,8 +37,24 @@ static struct {
     pthread_cond_t sleep;
 } J = { .mu = PTHREAD_MUTEX_INITIALIZER, .sleep = PTHREAD_COND_INITIALIZER };
 
+/* Optional: bind each thread to its own core. On a 4C/8T part the OS otherwise migrates
+   threads between HT siblings, and a migrated thread loses its L1/L2 contents — the x vector
+   and the four accumulators are exactly what a decode matmul keeps hot. Off by default so no
+   recorded benchmark moves; CP_PIN_CORES=1 turns it on. */
+static int pin_cores(void) {
+    const char *pc = getenv("CP_PIN_CORES");
+    return pc && *pc && atoi(pc) != 0;
+}
+static void pin_self(int core) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    sched_setaffinity(0, sizeof set, &set);
+}
+
 static void *worker(void *arg) {
     long id = (long)arg;
+    if (pin_cores()) pin_self((int)id + 1);   /* the child pins itself */
     int seen = 0;
     for (;;) {
         int g, spins = 0;
@@ -76,6 +93,7 @@ static void start(int nthreads) {
     J.started = 1;
     J.nthreads = nthreads;
     J.nworkers = nthreads - 1;
+    if (pin_cores()) pin_self(0);   /* the caller also runs chunk 0 */
     for (long i = 0; i < J.nworkers; i++)
         if (pthread_create(&J.tid[i], NULL, worker, (void *)i) != 0) {
             fprintf(stderr, "parallel: pthread_create failed at %ld; using %ld thread(s)\n",

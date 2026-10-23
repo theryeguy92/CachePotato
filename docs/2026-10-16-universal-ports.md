@@ -1,7 +1,17 @@
 # Direction: universal ports and Tier-B co-design
 
-**Status:** agreed 2026-10-16, not yet implemented.
+**Status:** agreed 2026-10-16. Implemented since as Phase 8; see [Progress](PROGRESS.md).
 **Branch:** `feat/universal-ports-tier-b`.
+
+> **Update, 2026-10-23.** Three things in this note have since been overtaken:
+> - **The §4 latency table was measured badly.** A later calibration over a 30 GB file put 4 KB
+>   reads at ~334 µs, not ~1,705 µs (see the [Roadmap](ROADMAP.md)), so latency is *not* nearly
+>   independent of read size.
+> - **The §6 permutation risk was tested.** Permuting experts leaves routing exactly unchanged and
+>   moves the logits by ~5.7e-06 through the router softmax. Canonical summation order was
+>   deferred, not adopted.
+> - **Tier B was tried on Qwen3-30B-A3B and lost.** Layout recompilation is exact, but
+>   co-selection grouping was slower; on this machine the limit is bytes, not read count.
 
 This note is the checked-in source of truth for a scope decision made on 2026-10-16:
 extend CachePotato from *one hand-built model* to *a model-agnostic engine plus one
@@ -53,7 +63,7 @@ storage hierarchy of the machine they will run on.
 
 The engine half of the thesis is also the half with the strongest existing evidence:
 Phase 3's "paging machinery works" result (RSS tracks budget 545 MB → 74 MB, correct
-output verified against a Python reference) was a Tier-B result, established *before*
+output verified against a Python reference) is an engine result, established *before*
 any λ work and independently of it.
 
 ## 4. Why layout is the lever (measured)

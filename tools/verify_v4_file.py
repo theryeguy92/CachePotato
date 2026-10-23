@@ -21,6 +21,7 @@ USAGE
   python3 tools/verify_v4_file.py --file scratch/l05.v4cp --v3 weights/moe-scale-run/l05.cpw1v3
 """
 import argparse
+import mmap
 import struct
 import sys
 from pathlib import Path
@@ -77,7 +78,14 @@ def main():
     ap.add_argument("--ckpt", default="weights/moe-scale-run/l05/model_only.pt")
     args = ap.parse_args()
 
-    b = Path(args.file).read_bytes()
+    # MMAP, NOT read_bytes(). This tool's job is to check a file LARGER than the machine's
+    # RAM: the Q8 Qwen3 file is 32.5 GB and the target box has 16 GB, so read_bytes() cannot
+    # run the check that matters. Every access below is a struct.unpack_from, a slice, or a
+    # np.frombuffer on the buffer, all of which work on an mmap -- and each region digest is
+    # computed over one region's slice, so peak RSS stays near one region rather than one
+    # file. Verified to produce byte-identical output on the 736 MB l05.v4cp before/after.
+    fh = open(args.file, "rb")
+    b = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
     errs, warns = [], []
 
     # ---- 1. header

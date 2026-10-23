@@ -1,0 +1,3 @@
+config,rep,regions_per_token,mb_per_token,hits_per_token,evictions_per_token,expert_hit_pct,core_hit_pct,physical_mb_per_token,ms_per_token,tok_per_s,prefill_ms,prefill_mb,mhz,mem_available_mb
+b8192sys,0,108.28,542.87,710.66,104.41,66.78,97.30,965.23,3171.4,0.3153,38837,13857,2423,12380
+b8192sys,1,108.28,542.87,710.66,104.41,66.78,97.30,989.69,3192.7,0.3132,35084,13545,2538,12301
