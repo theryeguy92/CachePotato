@@ -1,7 +1,11 @@
 # Handoff — starting the pager for Qwen3-30B-A3B
 
-Written 2026-10-18 at the end of the port work. **Read this first, then start at §5.** The point of
-this document is that it contains the *state*, not the history.
+Written 2026-10-18 at the end of the port work. **Read this first, then start at §5.** This
+document records the *state* at that point, not the history.
+
+> **Historical.** C1 and C2 are done: see [C1](2026-10-18-c1-pager-wiring.md) and
+> [C2](2026-10-19-c2-results-and-thesis.md). The file now lives on the T480, and the gate suite has
+> grown from 17 to 21.
 
 ## 1. Where things stand
 
@@ -21,8 +25,8 @@ file is 32.5 GB and the potato has 16 GB, so the model cannot even be loaded the
 | its manifest | server: `weights/qwen3_30b_a3b_q8.json` | name → source tensor, offset, size |
 | HF baseline | server: `data/traces/qwen3_30b_a3b_full.npz` | 586 arrays: logits, 48-layer intermediates, **routing trace** |
 | unpaged eval output | server: `data/traces/eval_p0.{logits,route,router}` | the B5 control |
-| checkpoint | server: `weights/qwen3-30b-a3b/` | 57 GB, 16 shards |
-| 1-layer files (local) | T480: `scratch/qwen3_l1f.v4cp` (f32), `qwen3_a3.l4cp` (Q8) | for fast local iteration |
+| checkpoint | server: `weights/qwen3-30b-a3b/` | 61.1 GB (57 GiB) bf16, 16 shards |
+| 1-layer files (local) | T480: `scratch/qwen3_l1f.v4cp` (f32), `scratch/qwen3_a3.v4cp` (Q8) | for fast local iteration |
 
 **The 32.5 GB file must come to the T480** for the paging work. Everything else can stay.
 

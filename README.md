@@ -16,7 +16,7 @@
 <sub>Allowing a larger model to run on a machine, even a potato.</sub><br>
 <sub>A model-agnostic engine with one port per open-weight model. Three run today — GPT-2 small, Qwen2.5-0.5B, and Qwen3-30B-A3B (32.5 GB on a 16 GB laptop) — see [Progress &amp; results](docs/PROGRESS.md#phase-8--the-engine-meets-someone-elses-model).</sub>
 
-[**Start here**](#start-here-if-you-want-to-use-it) · [**Build & run**](#build--run) · [**Progress & results**](docs/PROGRESS.md) · [**Experiments**](docs/EXPERIMENTS.md) · [**Roadmap**](docs/ROADMAP.md)
+[**Start here**](#quick-start) · [**Build & run**](#build--run) · [**Progress & results**](docs/PROGRESS.md) · [**Experiments**](docs/EXPERIMENTS.md) · [**Roadmap**](docs/ROADMAP.md)
 
 </div>
 
@@ -44,13 +44,13 @@ under a RAM budget so a model larger than memory can still run.
 **What this project adds.** CachePotato bets on a different mechanism: 
 - It treats the **on-disk layout of the weights** as a compilation target (expert
 ordering, region grouping, alignment) rather than only as a runtime caching policy.
-- **Reordering is proved a symmetry** — routing bit-identical and logits exact — before it is relied on.
+- **Reordering is proved a symmetry**: routing bit-identical and logits exact before it is relied on.
 
 ---
 
 ---
 
-## Start here if you want to use it
+## Quick Start
 
 > **CachePotato is a from-scratch C inference engine — no CUDA, no ggml, no Python at runtime —
 > built to answer one question honestly: what does running a model larger than RAM actually cost
@@ -62,7 +62,7 @@ Most "run an LLM locally" work optimises throughput on hardware that already fit
 starts from the other end: a model that does *not* fit, a hard memory budget, and a custom paged
 file format in which the unit of paging (a region) is also the unit of measurement.
 
-### What you can do with it today
+### Capabilities & Limitations
 
 | | |
 |---|---|
@@ -252,34 +252,80 @@ python3 tools/verify_cpw1_v3.py                         # export + routing gate
 
 ## Limitations & non-goals
 
+**Scope of every number here**
 
-- **One machine, one model.** Everything was measured on a single ThinkPad T480 (SATA SSD,
-  16 GB RAM) against one dense control. There is no multi-device, NUMA, or GPU story.
-- **The result is conditional.** Sparse + paging wins **only where the dense model does not
-  fit**. At 512 MB the two are statistically tied.
+- **One machine.** Everything was measured on a single ThinkPad T480: i5-8250U (4 cores, AVX2/FMA,
+  no AVX-512), 16 GB RAM, a SATA SSD on btrfs that the engine reads at an effective ~0.39 GB/s
+  (an O_DIRECT probe saturates at 370–400 MB/s). There is no GPU, NUMA or
+  multi-device story. Bit-identity is **per machine**: the same source on a different CPU emits
+  different vector code and different bytes, so cross-machine checks compare function, not bytes.
+- **The speed is a property of this disk and this RAM.** On the 30B, a token is bytes divided by
+  bandwidth on both sides, and the cost model fits to ~2% (at Q8, 13 GB: ~3.5 GB from RAM in
+  374 ms + 348 MB from disk in 895 ms). Faster storage or more RAM changes the numbers; a better
+  kernel mostly does not.
+
+**The 30B port (Qwen3-30B-A3B)**
+
+- **Usable speed is not a claim.** 1.22 tok/s at a 13 GB budget with the 4-bit file, 0.80 at Q8,
+  0.36 at Q8 with an 8 GB budget and real disk reads. At Q8 the curve saturates at ~13 GB because
+  the remaining reads are the compulsory ones: the experts each token newly selects (the 4-bit
+  file has not had a budget sweep). Good for one self-contained question; agentic
+  write → run → fix loops would need an estimated 10–30x this.
+- **The fast file is lossy.** `qwen3_q4attn.v4cp` stores the experts and attention matrices as Q4_0
+  (4.5 bpw), with `embed`/`lm_head` at Q8_0 and norms at f32. Against Q8 it scores 93.3% / 97.5%
+  teacher-forced next-token agreement on two probes of 120 generated tokens each. That clears a
+  pre-registered 90% gate, but it is two probes and not a task benchmark. Free-running agreement
+  is far lower, because one flipped token changes every later context; it is reported but is not
+  the criterion.
+- **Whole-model Q4_0 is unsettled.** It reads 1.40 tok/s but was rejected (70.8% on the factual
+  probe) on a 24-token run, a gate length later shown too noisy to decide anything. The rejection
+  is probably right and has not been re-measured at 120 tokens.
+- **The paging gates run on the Q8 file.** Paged vs unpaged bit-identity and decode vs prefill
+  bit-identity are gated on `qwen3_30b_a3b_q8.v4cp`. The 4-bit files pass the format validator
+  (structure, regions, digests) but are not in the paging gate suite.
+- **The pager's edge over the OS is small, and only near the working set.** At 11 GB it fetches the
+  same regions the unpaged run demands (54.8 vs 54.7 per token); at 11–13 GB it runs 0.77–0.80
+  tok/s against the unpaged control's 0.71 at Q8, while reading fewer physical bytes. Below the
+  working set the OS page cache wins, because it gets all the free RAM while the budget is a hard
+  cap. Pinning the core tier (`CP_PIN_CORE=1`, not the `CP_PIN_CORES` CPU-affinity switch) is the
+  one eviction-policy win, and only at budgets of ≤4 GB. A pager-owned read arena and co-selection
+  expert grouping were measured and lost; prefetch was ruled out before it was built, because 86.8%
+  of touches already hit.
+- **Model quality is the base model's.** Nothing here measures Qwen3-30B-A3B's quality beyond its
+  agreement with Q8. Greedy decoding only, and a 2,048-token context: when it fills, the chat
+  driver says so and starts a new conversation.
+
+**The co-design result (gpt2-moe, Phase 7)**
+
+- **It is conditional.** Sparse + paging wins **only where the dense model does not fit**. At
+  512 MB the two are statistically tied.
 - **The co-design effect is the weaker of the two results.** +16.3% at p ≈ 0.018 against a
   measured machine noise floor of 8–17%, and it is content-dependent across document blocks.
   The 384 MB re-measurement (+38.2%) is significant but **flagged**: λ=0's access pattern
   exhausts the hot tier, so that figure is a whole-hierarchy effect, not pure expert paging.
-- **Usable speed is not a claim.** The 30B port runs exactly and at 1.14 tok/s with 4-bit experts
-  at a 13 GB budget (0.80 at Q8, 0.36 at 8 GB with real disk reads). 4-bit experts + attention is a
-  Tier-C choice and costs ~5% next-token agreement with Q8 on a matched context (gated at 120
-  generated tokens; 93.3% / 97.5%). 4-bit on `lm_head`/`embed` as well reads 1.40 tok/s but is
-  unvalidated — its rejection rested on a 24-token measurement, which later work showed to be
-  too noisy to trust. The measured envelope on this machine is set by
-  **compulsory expert traffic, not compute**: compute is 374 ms/token, disk is 895 ms at 13 GB, and
-  the curve saturates because the remaining reads are exactly the experts each token selects. A
-  model with fewer active parameters is the lever, not a faster kernel.
-- **Model quality is not a claim.** This is a 12-layer, 736 MB research artifact at
-  GPT-2-small scale, pretrained on FineWeb-Edu. It proves an architecture; it is not a useful
-  assistant. Quality was checked only against a pre-registered repetition-rate gate.
-- **Single-threaded, scalar, fp32.** No SIMD kernels, no threading, no quantization. The
-  ~134 MB/s effective read bandwidth on small scattered expert regions is known headroom.
-- **No test target yet.** `make` builds the engine and trainer; `tests/` is a placeholder.
-  Correctness is currently enforced by the `tools/verify_*.py` gates against recorded
-  reference data rather than by a `make test`.
-- **Not a production serving system.** No batching, No paged KV cache, No HTTP server. The
-  REPL is the interface.
+  Locality-aware routing has not been tried on any model the project did not train.
+- **The model is a research artifact.** 12 layers, 736 MB, GPT-2-small scale, pretrained on
+  FineWeb-Edu. It proves an architecture; it is not a useful assistant, and its quality was checked
+  only against a pre-registered repetition-rate gate.
+
+**The engine**
+
+- **"Model-agnostic" means one port per architecture family.** The Qwen paths
+  (`engine/blocks/qwen2.c`, `qwen3_moe.c`) have their own loaders and forward passes beside the
+  GPT-2 `Model`, so `cachepotato -i` speaks only GPT-2. The Qwen3 v4 loader still hardcodes
+  `rope_theta` (1e6) and top-8, and sizes its expert tables for 128 experts, so a Qwen3-family
+  model with different values needs a loader change and its own gate.
+- **Weights are not shipped, and conversion needs Python.** The runtime is C only, but producing a
+  file means downloading the published checkpoint (61 GB bf16 for the 30B) and running the
+  converters in `tools/` and `models/` (`pip install -r tools/requirements.txt`: numpy, torch,
+  transformers).
+- **No `make test`.** `tests/` is a placeholder. Correctness is enforced by
+  [`tools/run_gates.sh`](tools/run_gates.sh) against recorded reference data. On a fresh clone only
+  the four kernel and decoder gates can pass: the Qwen and v4 gates skip themselves when their
+  gitignored weight files are absent, and the GPT-2/gpt2-moe gates fail, because they expect the
+  generated `weights/toy.bin`, the trained gpt2-moe checkpoint and the corpus to be present.
+- **Not a production serving system.** One user, one model, one process: no batching, no paged KV
+  cache, no HTTP or OpenAI-compatible server. The REPL and the chat drivers are the interface.
 
 ## Documentation
 

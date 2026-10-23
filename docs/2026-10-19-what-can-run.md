@@ -13,8 +13,11 @@ envelope from today's measured cost model and checks it against the current open
 to <1%). Compute scales with **active** parameters: **111.6 ms per 1B active** at 4 threads.
 
 For a model that **fits**, the disk term vanishes (weights come from RAM, already inside the 374 ms).
-Calibrating against the one fitting model we have measured (Qwen2.5-0.5B: predicted 10.4 tok/s,
-README says 10–15 on four threads) gives:
+
+*(Correction: the table below does not follow from 111.6 ms per 1B. Its values imply ~190 ms per 1B
+active. At 111.6 ms the 0.5B would predict ~17.9 tok/s, and the measured figure is 15.5 tok/s, so
+the table is conservative by roughly 1.5×. The ordering of the rows, which is what the argument
+uses, is unaffected.)*
 
 | model class | active/token | predicted tok/s | fits 16 GB? |
 |---|---:|---:|---|
@@ -54,20 +57,25 @@ higher (74.2%). Treat them as pointers, not rankings.
 
 **0.8 tok/s was never the engine's ceiling — it was Q8 paging.** The same model at Q4:
 
-- expert regions halve (2.4 MB instead of 4.78 MB), so the compulsory traffic drops from ~348 MB to
+- expert regions roughly halve (~2.65 MB instead of ~5.0 MB), so the compulsory traffic drops from ~348 MB to
   ~100–150 MB/token → 260–380 ms of disk;
 - compute rises (nibble unpacking is more expensive than Q8's byte→float), call it 1.5× → ~560 ms;
 - total ≈ 0.8–0.95 s/token → **~1.1–1.4 tok/s**.
 
 That is a **1.4–1.8× on the exact model we already run**, with no new architecture, no new model, and
 the engine already has Q4_0 plus `verify_q4_decode`/`verify_q8_kernels` gates. The cost is Tier-C
-quality (the vault rejected Q4_0 for the 0.5B on quality grounds; at 30B the same 4.5 bpw is a
-different proposition and needs its own quality check).
+quality (the vault records Q4_0 as rejected for the 0.5B; at 30B the same 4.5 bpw is a different
+proposition and needs its own quality check).
 
 And **3.4–4 tok/s is real**, but only for a model that fits with ≤1.5B active — i.e. Qwen2.5-Coder-
 1.5B, which is a much weaker coder than a 30B.
 
 ## Two candidate next steps (both need a decision, not just work)
+
+*(Update: option A was taken. Q4_0 on the experts measured 1.14 tok/s, and Q4_0 on the experts and
+attention measured **1.22 tok/s**, passing a 120-token quality gate. See
+[Where tok/s goes](2026-10-19-tok-s-levers.md), Rounds 5–7. Options B and C have not been
+started.)*
 
 **A. Q4 conversion of the current model (~1 h).** Add `q4_0` to the Qwen3 converter, convert
 (≈25 min), verify with `verify_v4_file` (digests), measure at 13 GB. Predicted **1.1–1.4 tok/s**,
@@ -106,9 +114,9 @@ CP_PAGER=1 CP_BUDGET=13312 CP_THREADS=4 CP_PIN_CORES=1 \
 
 - `48` is the layer count (the v4 header has it; the driver is told), `200` is the per-answer
   token cap. Type a message, "exit" or ctrl-D to leave.
-- **Budget:** 13312 MB is the fast setting and leaves ~2.7 GB for the OS on this 15.7 GB machine —
-  close heavy applications, and drop to 8192 if it starts swapping (0.36 tok/s: swapping looks
-  exactly like a bad model).
+- **Budget:** 13312 MB (13 GiB) is the fast setting and leaves ~2.4 GiB of this machine's 15.4 GiB
+  for everything else. Close heavy applications, and drop to 8192 if it starts swapping. A
+  swapping run looks exactly like a broken model; for comparison, 8 GB at Q8_0 measured 0.36 tok/s.
 - **Files:** `scratch/qwen3_q4attn.v4cp` is the fast one (4-bit experts + attention, 1.2 tok/s,
   93.3% / 97.5% next-token agreement with Q8). `scratch/qwen3_q8_chunked.v4cp` is the exact one
   (0.8 tok/s).

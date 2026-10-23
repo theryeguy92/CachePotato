@@ -13,7 +13,7 @@ The seam is `qwen3_bind_layer`, and the unit is the file's own region (SPEC §8)
 | `pager_add_region(off, len, is_expert)` | `engine/pager/pager.c` | called once per region while `qwen3_map` walks the table; the id returned **is** the table index |
 | `tensor_reg[n_tens]` | `qwen3_map` | tensor → region lookup, so `qwen3_bind_layer` can record ids rather than re-deriving anything |
 | `reg_exp[e]`, `reg_ln1`, … | `qwen3_bind_layer` | the region ids of the layer that was just bound |
-| `pager_touch_region(id)` | `qwen3_layer` | 9 core regions + 1 per selected expert, per token, BEFORE the read |
+| `pager_touch_region(id)` | `qwen3_layer` | 9 core regions + 1 per selected expert, per layer per token, BEFORE the read |
 | `pager_enforce()` | `qwen3_eval.c` | between layers, after `qwen3_layer` returns |
 | `pager_step(t)` / `<prefix>.pager` | `qwen3_eval.c` | per-token rows: regions fetched, bytes fetched, hits, evictions |
 

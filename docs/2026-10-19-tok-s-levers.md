@@ -36,6 +36,9 @@ is right for the engine and wrong for a measurement harness.
 
 ## Where the 3.18 s goes (30B at 8 GB, honest disk, 4 threads)
 
+"Honest disk" means `CP_PAGER_SYS=1`: evicted regions are also dropped from the OS page cache, so a
+miss is a real disk read rather than a page-cache hit.
+
 Per generated token, from the io counter and the deterministic page counts:
 
 | term | time | share | notes |
@@ -44,24 +47,25 @@ Per generated token, from the io counter and the deterministic page counts:
 | compute | ~0.7–0.9 s | 22–28% | 3.35 B active elements at 4 threads (≈0.27 s per 1B) |
 | serial per-token overhead | ~0.2 s | 6% | 48 × `qwen3_bind_layer`, each walking 18,867 tensor records with an `sscanf` per expert (18,432 of them) |
 
-So on the honest arm the token is **I/O-bound by ~4:1** — the opposite of what the single-threaded
+The three terms are separate estimates, and they add up to slightly more than the measured 3.18 s.
+So on the honest arm the token is **I/O-bound by roughly 3:1** — the opposite of what the single-threaded
 numbers suggested, and it reorders the levers: the disk is now the thing to fix, and the kernel
 matters mainly for models that fit.
 
 ## The levers, in value order
 
-**1. Threads (done, free, 1.68×).** 0.147 → 0.21 tok/s. Also raises the dense models, which are
-purely compute-bound.
+**1. Threads (done, free, 2.14×).** 0.147 → 0.314 tok/s on the honest arm. Also raises the dense
+models, which never touch the disk.
 
-**2. Overlap I/O with compute (≈1.3–1.9×, medium cost).** Disk and compute are serial today: 3.2 s
-of reading, then ~1.4 s of arithmetic, per token. But the *next* layer's regions are known as soon as
+**2. Overlap I/O with compute (≈1.3–1.9×, medium cost).** Disk and compute are serial today: ~2.5 s
+of reading, then ~0.7–0.9 s of arithmetic, per token. But the *next* layer's regions are known as soon as
 the router for this layer runs, and the *next token's* experts overlap the current token's 71–83% of
 the time. One prefetch thread issuing `pread` into the arena while the main threads compute would
-hide most of the 3.2 s. This is the v3 `CP_PREFETCH_W` idea with the arena behind it, and it is the
+hide most of the 2.5 s. This is the v3 `CP_PREFETCH_W` idea with the arena behind it, and it is the
 single largest remaining factor for the paging regime. Gate: bit-identity (values do not change).
 
-**3. Stop over-reading (≈2×, low cost, already half-built).** The 1.27 GB/token of disk traffic is
-~1.9× the 0.55 GB the regions actually need: `mmap` fault-around reads past the region. The arena's
+**3. Stop over-reading (≈2×, low cost, already half-built).** The ~0.98 GB/token of disk traffic
+is ~1.8× the 0.54 GB the regions actually need: `mmap` fault-around reads past the region. The arena's
 `pread` fixes it (measured 1.00× on a single tensor) but currently loses because a *region* is not an
 *access unit* — the 330 MB `embed` region is touched for 4 KB. Declaring `embed` as row-chunks and
 using the arena gives ~0.55 GB/token → I/O ~1.4 s. Combined with (2): I/O hidden behind compute.
@@ -79,7 +83,8 @@ elements instead of 32), and keep 2–4 output rows in flight so the FMA chains 
 **not bit-identical** (different rounding), so it needs approval and must pass the existing
 `q8_kernels` gate (1e-5 relative) plus B5's tolerance. The second is bit-identical.
 
-**6. Q4 for the experts (2× bytes, not yet justified).** The GEMV bench says 4-bit reaches 9.56
+**6. Q4 for the experts (2× bytes, not yet justified).** *(Update: measured in Rounds 5–7 below.
+In the disk-bound regime it paid, and it is now the shipped configuration.)* The GEMV bench says 4-bit reaches 9.56
 GFLOP/s against fp32's 6.3 at 8 threads, but the engine measured Q4 *slower* in-cache and its quality
 is Tier C. Only worth revisiting after (2) and (3), and it does nothing for a model that fits.
 
@@ -87,6 +92,10 @@ is Tier C. Only worth revisiting after (2) and (3), and it does nothing for a mo
 maths at T=1; AVX-512 (absent on this CPU: `avx2 fma sse4.2`); more than 4 threads.
 
 ## What each target gets
+
+*(Superseded: Round 3 below refits compute at 374 ms for 3.35 B active, i.e. ~0.11 s per 1B rather
+than 0.27 s, and [What this laptop can run](2026-10-19-what-can-run.md) redoes this table. Kept as
+the estimate made at the time.)*
 
 Anchored on the measured 0.27 s per 1B active elements at 4 threads and 0.39 GB/s on the honest arm:
 
@@ -114,7 +123,7 @@ the paging levers (2 and 3) are what the 30B needs.**
 2. **Bind once** — small, bit-identical, and it removes a per-token cost that will look bigger once
    the I/O is hidden.
 3. **Region-sized reads: `embed` by row + arena** — the converter change both negative results
-   pointed at. Then re-measure: expect disk traffic 1.27 → ~0.55 GB/token.
+   pointed at. Then re-measure: expect disk traffic ~0.98 → ~0.55 GB/token.
 4. **Overlap I/O with compute** — prefetch thread into the arena; the largest single factor for the
    paging regime.
 5. **Kernel work (scale hoist + multi-row)** — the only lever that helps the *dense* target too, and
@@ -125,17 +134,19 @@ ported 3B feel usable, and it is also the only one with a numerics decision in i
 
 ## Measured outcomes (2026-10-19, in the agreed order)
 
-**Step 4 — bind once: DONE, +11%.** 3182 → **2861 ms/token (0.350 tok/s)** at 8 GB, 4 threads,
+The headings below use the lever numbers from the list above, not the order of the plan.
+
+**Lever 4, bind once: DONE, +11%.** 3182 → **2861 ms/token (0.350 tok/s)** at 8 GB, 4 threads,
 honest disk. Bit-identical (all five paging arms re-gated).
 
-**Step 2 — embed by row: code done and gated, full conversion pending.** `--embed-rows 1024`
+**Lever 3, embed by row: code done and gated, full conversion pending.** `--embed-rows 1024`
 gives 149 embed regions instead of one 330 MB region; the engine resolves the chunk for a token's
 row and the pager fetches ~2 MB instead of the whole table. Verified **bit-identical** on a 1-layer
 file against the one-region version (unpaged and with the arena). The 32.5 GB re-conversion was
 started twice and abandoned both times because it competes with every measurement for CPU/disk —
 it needs a clean window, and its result is the next number to get.
 
-**Step 5 — kernel: DONE (bit-identical part), and the numerics part was measured and rejected.**
+**Lever 5, kernel: DONE (bit-identical part), and the numerics part was measured and rejected.**
 
 | change | 1 thread | 4 threads | verdict |
 |---|---|---|---|
@@ -144,20 +155,20 @@ it needs a clean window, and its result is the next number to get.
 | hoist the block scale out of the dot | 0.94 → 0.47 ms (2×) | 768×2048 **0.13 → 0.19 ms (worse)**, 2048×768 +12%, 4096×2048 +9% | **rejected** — a wash, and it costs bit-identity |
 
 **But at 8 GB none of it shows:** 2861 → 2915 ms (within noise), because 2.5 s of the 2.9 s token
-is disk. The kernel lever is real and will show once the bytes come down (step 2) or at a budget
+is disk. The kernel lever is real and will show once the bytes come down (lever 3) or at a budget
 where the token is compute-bound. That is the ordering lesson: **I/O first, compute second.**
 
-**Step 3 — prefetch: rejected before building it, from the data already on disk.** The plan was to
+**Lever 2, prefetch: rejected before building it, from the data already on disk.** The plan was to
 prefetch the previous token's expert set on the assumption that 71–83% of a token's experts recur.
 The pager's own hit rate says the opposite of what the plan needs: **86.8% of touches are already
 hits** (710 of 819 regions), so the previous token's 384 regions are *resident* when the next token
 starts — queuing them reads nothing. The 108 regions that miss are, by definition, the experts the
 previous token did *not* select, and no prefetch can know them before the router runs. At 8 GB the
 I/O is demand-driven on unpredictable experts; there is nothing to overlap it with. The only real
-way to cut it is fewer bytes (step 2), a bigger budget (4→11 GB halves the fetches), or a layout
+way to cut it is fewer bytes (lever 3), a bigger budget (8→11 GB halves the fetches), or a layout
 that raises reuse (Tier B, measured and negative).
 
-## Step 2 measured: chunked embed helps, the arena still does not — and now we know why
+## Lever 3 measured: chunked embed helps, the arena still does not, and why
 
 Full re-conversion with 149 embed regions (6,727 regions, 19,015 tensors, `V4 FORMAT: PASS`), and
 the 48-layer output is **bit-identical** to the one-region file. Measured at 8 GB / 4 threads /
@@ -191,12 +202,12 @@ the cache reuses**, not pure waste. It only becomes waste when the pager owns th
 them. The read path the measurements favour is therefore **mmap for the data + chunked regions for
 the accounting**, which is exactly the 0.375 tok/s row.
 
-### What is left, honestly
+### What is left
 
 - **Total for this round: 0.147 → 0.375 tok/s (2.55×)** at 8 GB, with page counts, file format and
   numerics unchanged (bit-identity gated at every step).
 - The remaining I/O is demand-driven: **86.8% of touches are already hits**, so there is nothing to
-  prefetch (step 3), and the bytes are block-rounded (step 2). Both levers are now closed by
+  prefetch (lever 2), and the bytes are block-rounded (lever 3). Both levers are now closed by
   measurement, not by opinion.
 - What remains is **compute** (the token is ~1.4 s compute at 4 threads, ~0.7 s I/O now) and **budget**:
   the 11 GB arm halves the fetches through reuse alone (~0.45–0.5 tok/s expected) without touching a
@@ -234,23 +245,24 @@ Final measurement (chunked file, 4 threads, cold start, 32 tokens):
 - **Fewer compulsory regions**: a top-4 model (half the active experts) would halve the bytes;
   that is a model choice, not an engine one.
 - **More reuse**: Tier B measured negative at 11.2% co-selection.
-- **A faster disk**: the 0.389 GB/s is the SATA SSD's measured sequential rate.
+- **A faster disk**: 0.389 GB/s is the engine's effective read rate from this SATA SSD (an
+  `O_DIRECT` probe saturates at 370–400 MB/s).
 
-Time on this machine: **~0.8 tok/s ceiling for this model**, and the engine is within 30% of it being
-pure compute. The next useful thing is not a kernel — it is a *smaller-active* model (the Qwen3-Coder
+Time on this machine: **~0.8 tok/s ceiling for this model at Q8_0**, and compute is only ~30% of
+the token. The next useful thing is not a kernel — it is a *smaller-active* model (the Qwen3-Coder
 port at the same geometry, or a 3B for speed), measured with this same harness.
 
 ## Round 4: the engine is a bandwidth machine — both halves of the token are bytes
 
 Adding up what a token must stream, from the file's own region accounting (13 GB arm):
 
-| term | bytes/token | rate | time | measured |
+| term | bytes/token | rate | time | from the fit |
 |---|---:|---:|---:|---:|
-| **RAM**: core regions (incl. `lm_head`) 1,597 MB + 384 expert regions 1,925 MB | **3,523 MB** | 9.4 GB/s (4-thread effective) | 366 ms | 374 ms |
-| **disk**: physical reads after reuse | **348 MB** | 0.389 GB/s (SSD) | 896 ms | 895 ms |
-| | | | **1,262 ms** | **1,252 ms** |
+| **RAM**: core regions (incl. `lm_head`) 1,597 MB + 384 expert regions 1,925 MB | **3,523 MB** | 9.4 GB/s (4-thread effective) | 375 ms | 374 ms |
+| **disk**: physical reads after reuse | **348 MB** | 0.389 GB/s (SSD) | 895 ms | 895 ms |
+| | | | **1,270 ms** | measured token: **1,252 ms** |
 
-Two percent on both terms. **There is no arithmetic ceiling here — the engine is limited by
+Each term agrees with the fit to within 0.3%, and the sum is within 1.5% of the measured token. **There is no arithmetic ceiling here — the engine is limited by
 bytes/bandwidth on both sides**, so no kernel technique can move it. This closes the whole
 technique list:
 
@@ -286,8 +298,11 @@ Whole-model Q4_0 (17,220 MB, 6,727 regions) at 13 GB / 4 threads / 32 tokens, 2 
 | Q8_0 | 38.3 | 348.5 | 1252 | 0.799 |
 | **Q4_0** | 32.9 | **120.4** | **710** | **1.40** |
 
-**The bytes model is confirmed**: halving the encoding took 1.75x off the token (predicted 1.58,
-measured 1.41; the gap is the nibble-unpack cost, ~215 ms). Disk traffic fell further than half
+**The bytes model is confirmed**: halving the encoding made the token 1.76× faster (1,252 →
+710 ms). The model predicted 1.58 tok/s (634 ms) and the run measured 1.40. Two errors partly
+cancel: disk came in *under* the prediction (120 vs ~174 MB/token, because smaller regions keep more
+of the working set resident), while compute came in ~215 ms *over* it (~400 ms against the halved
+187 ms), which is the cost of unpacking 4-bit values. Disk traffic fell further than half
 (348 → 120 MB) because smaller regions mean more of the working set is resident at the same budget.
 
 **But it does not pass the quality gate**, which was pre-registered before measuring:
@@ -338,7 +353,7 @@ Two things worth understanding about the numbers:
   attention and `lm_head` exact is the budget they occupy.
 - **Physical bytes per token rose to 184 MB because the regions got small.** An expert at Q4 is
   2.65 MB, which is smaller than the filesystem's 4 MiB I/O unit, so block rounding costs ~1.58x
-  per fetch. This is the same rounding documented in step 2, now biting at a smaller region size:
+  per fetch. This is the same rounding documented under lever 3, now biting at a smaller region size:
   quantisation shrinks the payload but not the minimum read. If a Q4 file were laid out with two
   experts per region (5.3 MB), the rounding would amortise — but that is Tier B grouping, which
   costs cache efficiency, and it measured negative at 11 GB.
@@ -375,7 +390,7 @@ statistically equivalent, and the faster one wins.
 | Q4 whole model | 32.9 | 120.4 | 710 | 1.40 | 91.7 / **70.8** (n=24 only) |
 
 **The last 20% delivered 7%**, not the 14% the bytes model suggested: quantising attention
-(Wq/Wk/Wv/Wo, 0.9 GB) saves 449 MB of file but only 52 ms/token, because attention is the part of
+(Wq/Wk/Wv/Wo, 0.9 GB) saves ~453 MB of file (17,984 → 17,531 MB) but only 52 ms/token, because attention is the part of
 the working set that was already 97% resident — it halves RAM bytes, not disk bytes.
 
 ### The open question this leaves
@@ -388,4 +403,5 @@ and an `--gen 120` gate run. Until then, 1.22 tok/s is the fastest configuration
 gate with enough power to mean something.
 
 The same suspicion applies to the *speed* side: with `lm_head` and `embed` at Q4 the token was
-710 ms; the 100 ms between that and 1.22 is what keeping the logits path exact costs.
+710 ms; the ~110 ms between that and the 822 ms of the 1.22 tok/s file is what keeping `embed`
+and `lm_head` at Q8_0 costs.
