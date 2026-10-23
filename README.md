@@ -4,19 +4,19 @@
 
 # CachePotato
 
-**Running a sparse language model on a "potato". Co-designing a sparse language model and the memory-hierarchy engine.**
+**Running a sparse language model on a "potato". Designing a sparse language model and the memory-hierarchy engine.**
 
 [![Language](https://img.shields.io/badge/language-C11-555555?style=flat-square&logo=c&logoColor=white)](#build--run)
 [![Dependencies](https://img.shields.io/badge/third--party%20deps-none-brightgreen?style=flat-square)](#build--run)
 [![Build](https://img.shields.io/badge/build-make%20%C2%B7%20zero--config-orange?style=flat-square)](#build--run)
-[![Status](https://img.shields.io/badge/phase-8%20in%20progress%20%C2%B7%203%20ports%20running-blue?style=flat-square)](#status)
+[![Status](https://img.shields.io/badge/phase-8%20in%20progress%20%C2%B7%202%20ports%20running-blue?style=flat-square)](#status)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 
 <sub>SSD, RAM and CPU cache treated as one addressable memory space. </sub><br>
 <sub>Allowing a larger model to run on a machine, even a potato.</sub><br>
-<sub>A model-agnostic engine with one port per open-weight model. Three run today — GPT-2 small, Qwen2.5-0.5B, and Qwen3-30B-A3B (32.5 GB, on a 16 GB laptop) — see [Phase 8](#phase-8--the-engine-meets-someone-elses-model).</sub>
+<sub>A model-agnostic engine with one port per open-weight model. Two ports run today — see [Phase 8](#phase-8--the-engine-meets-someone-elses-model).</sub>
 
-[**Start here**](#start-here-if-you-want-to-use-it) · [**Results**](#results) · [**Where this is going**](#where-this-is-going) · [**Build & run**](#build--run) · [**Status**](#status) · [**Reproduce**](#reproducing-the-benchmarks) · [**Experiment log**](bench/results/)
+[**Results**](#results) · [**Where this is going**](#where-this-is-going) · [**Build & run**](#build--run) · [**Status**](#status) · [**Reproduce**](#reproducing-the-benchmarks) · [**Experiment log**](bench/results/)
 
 </div>
 
@@ -39,80 +39,13 @@ weights from disk is **not original to this project**.
   unifies SSD/RAM/VRAM, keeps always-needed weights resident, streams the expert pool on demand,
   and ships a CLI, an OpenAI-compatible server and CPU/CUDA/Metal backends.
 
-**What is shared.** The core thesis — a zero-dependency-ish C runtime that pages expert weights
-under a RAM budget so a model larger than memory can still run — is shared with both.
+**The shared idea:** A zero-dependency-ish C runtime that **pages** expert weights
+under a RAM budget so a model larger than memory can still run.
 
-**What this project adds.** CachePotato bets on a different
-*mechanism*: it treats the **on-disk layout of the weights** as a compilation target (expert
-ordering, region grouping, alignment) rather than only as a runtime caching policy, and it
-insists that such a reordering be **proved a symmetry**: routing bit-identical, logits exact —
-before it is relied on. Alongside that, the project's port contract requires every model to ship
-an *independent* reference implementation and a recorded baseline that must never be regenerated
-to make a failing test pass. Those two things: layout-as-compilation with a proven symmetry, and
-verification structured to catch a shared misunderstanding are the contributions worth
-defending.
-
----
-
-## Start here if you want to use it
-
-> **CachePotato is a from-scratch C inference engine — no CUDA, no ggml, no Python at runtime —
-> built to answer one question honestly: what does running a model larger than RAM actually cost
-> on a laptop, in bytes, latency, and correctness?** It runs a 32.5 GB Qwen3-30B-A3B on a 16 GB
-> ThinkPad at **1.2 tok/s** from a 17 GB 4-bit file, and the paged output is gated
-> **bit-identically** against the unpaged model.
-
-Most "run an LLM locally" work optimises throughput on hardware that already fits the model. This
-starts from the other end: a model that does *not* fit, a hard memory budget, and a custom paged
-file format in which the unit of paging (a region) is also the unit of measurement.
-
-### What you can do with it today
-
-| | |
-|---|---|
-| **Run a 30B on a 16 GB laptop** | `CP_PAGER=1 CP_BUDGET=13312 CP_THREADS=4 CP_PIN_CORES=1 ./build/qwen3_chat scratch/qwen3_q4attn.v4cp 48 200` — ~20 s for the first prompt (cold disk), then ~0.8 s/token. Follow-ups stay in the KV cache and run faster (2.2 tok/s measured on turn 2). |
-| **Something interactive** | the 0.5B chat at ~10–15 tok/s on four threads — the one that feels like a normal assistant. |
-| **See *why* it is slow** | per-token counters: regions fetched, MB read from disk, hit rates, evictions. This is the part a general-purpose runtime will not show you. |
-| **Experiment with quantisation safely** | the format carries f32 / Q8_0 / Q4_0, and any lossy encoding has to pass a pre-registered quality gate. Q4 experts+attention passes at 93.3% / 97.5% next-token agreement with Q8; whole-model Q4 failed it (70.8%). |
-| **Trust the output** | paging is bit-identical to not paging; decode is bit-identical to prefill. Same machine, same bytes — every artifact carries a machine stamp. |
-
-### What it is not
-
-- **Not fast.** 1.2 tok/s is one self-contained question, one file, walk away. Not a chat partner,
-  and not an agent: a write → run → fix → repeat loop needs 10–30x this.
-- **Not a sampler.** Greedy only, deliberately — the gate structure rests on the output being a
-  deterministic function of the weights. A temperature knob is the first thing that would erode
-  that, so it is absent rather than half-supported.
-- **Not production.** One user, one model, one machine. No GPU/NUMA story, no concurrency, no API server.
-- **Not a speed champion against mature runtimes.** The token is bytes divided by bandwidth on both
-  the disk and the RAM side, measured to 2%. A runtime with more mature kernels may well be faster
-  on the same model; the claim here is *repeatable measurement and exactness*, not throughput.
-- **One port per architecture family.** A new family means a new block implementation and its own gates.
-
-### Three commands
-
-```bash
-make
-# fast (4-bit experts + attention, 1.2 tok/s)      exact (Q8, 0.8 tok/s):
-CP_PAGER=1 CP_BUDGET=13312 CP_THREADS=4 CP_PIN_CORES=1 \
-  ./build/qwen3_chat scratch/qwen3_q4attn.v4cp 48 200
-```
-
-Needs ~50 GB of disk for the weight files (32.5 GB Q8 + 17.5 GB Q4), a 13 GB RAM budget, and
-nothing else. `48` is the layer count and `200` the per-answer token cap; type `exit` to leave.
-Drop `CP_BUDGET` to 8192 if other applications need memory — swapping looks exactly like a broken
-model (0.36 tok/s). Details: [Build & run](#build--run).
-
-### Why it is different
-
-The engine is the instrument, not only the product. Every design choice here is backed by a
-measurement that can be reproduced and, where it lost, recorded as a loss: the pager ties the OS
-page cache at equal memory and beats it at 13 GB; core pinning recovers 2.1x of the reads at a 2 GB
-budget; prefetch was disproved before it was built; the region arena and expert grouping are
-documented negative results; and the 4-bit path exists because the bytes model predicted a 2x win
-and the quality gate decided which variant was allowed to have it. If you want to know what a
-paging scheme costs on *this* machine, the numbers are in [`docs/`](docs/) and
-[`bench/results/`](bench/results/).
+**What this project adds.** CachePotato bets on a different mechanism: 
+- It treats the **on-disk layout of the weights** as a compilation target (expert
+ordering, region grouping, alignment) rather than only as a runtime caching policy.
+- Reordering a **proved a symmetry**: routing bit-identical, logits before it is relied on. 
 
 ---
 
@@ -230,13 +163,12 @@ framework that produced the model; and a `verify/gate.py`. The independence is t
 2026-09-25 two implementations agreed with each other, disagreed with the frozen spec, and every
 gate passed. A reference that shares code with the thing it checks cannot catch that.
 
-### The three ports
+### The two ports (More to come soon)
 
 | port | tier | size | what it proves |
 |---|---|---|---|
 | [`gpt2-moe`](models/gpt2-moe/MODEL.md) | A (as-is), MoE | 736 MB | the contract works end to end on a MoE with recorded routing |
 | [`qwen2.5-0.5b`](models/qwen2.5-0.5b/MODEL.md) | A (as-is), dense | 525 MB (Q8) | the engine can meet a foreign architecture and **talk** |
-| `qwen3-30b-a3b` | B (paged), MoE | 32.5 GB Q8 / 17.5 GB Q4 | the paging thesis on a model **4x larger than RAM**: bit-identical under a budget, 0.80 tok/s at Q8, **1.22 tok/s** at Q4 |
 
 **gpt2-moe** is the project's own model, ported through the contract. Its independent numpy
 reference reproduces the routing recorded from the trained model **20480/20480 selections
@@ -249,7 +181,7 @@ Unicode-aware pre-tokenizer plus BPE plus special tokens.
 
 ### Verification & the order it was built
 
-Every step is a gate in [`tools/run_gates.sh`](tools/run_gates.sh) (20 gates, all passing).
+Every step is a gate in [`tools/run_gates.sh`](tools/run_gates.sh) (16 gates, all passing).
 
 | step | result |
 |---|---|
@@ -469,7 +401,6 @@ dependency and the rule says so here rather than leaving the claim quietly false
 ```sh
 make          # builds build/cachepotato (engine) and build/train (C trainer)
 make run      # interactive REPL against weights/toy.bin
-make build/qwen3_chat   # the 30B chat CLI (see Start here)
 ```
 
 Weights are gitignored; generate them from source:
@@ -548,9 +479,9 @@ python3 tools/verify_cpw1_v3.py                         # export + routing gate
 demo exists: a trained sparse model served by the paging engine, benchmarked against a dense
 baseline, with the locality hit rate reported.
 
-**In progress: universal ports (Phase 8).** The engine is now model-agnostic: three ports run
+**In progress: universal ports (Phase 8).** The engine is now model-agnostic: two ports run
 through one contract ([`models/CONTRACT.md`](models/CONTRACT.md)), a self-describing
-[format](format/SPEC.md) with three encodings (f32, Q8_0, Q4_0), and 20 gates. See
+[format](format/SPEC.md) with two block encodings, and 16 gates. See
 [Phase 8](#phase-8--the-engine-meets-someone-elses-model) for what was measured and what is still
 missing. The paging experiment itself is now done on a model that does not fit — exact, and at
 0.80 tok/s at a 13 GB budget — batch-usable, not interactive. The next step is not a bigger
@@ -567,7 +498,7 @@ model but a smaller, faster one: see
 | 5 — Training loop | C trainer with gradient-checked backprop | ✅ |
 | 6 — Scale training + data | PyTorch MoE trainer, FineWeb-Edu, λ=0/0.5 ablation | ✅ |
 | 7 — Integration | Paging engine + trained sparse model, Q1/Q2/Q3 gates | ✅ |
-| 8 — Universal ports | `engine/` split, `format/SPEC.md`, three ports running, Q8_0 + Q4_0 encodings, 20 gates | 🔄 in progress |
+| 8 — Universal ports | `engine/` split, `format/SPEC.md`, two ports running (Tier A), Q8_0 encoding, 16 gates | 🔄 in progress |
 | 9+ — Scale, agentic workloads | Tool calling, domain SFT, longer-context tiers | ⏳ later |
 
 ## Limitations & non-goals
