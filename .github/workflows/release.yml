@@ -1,0 +1,54 @@
+name: release
+
+# Push a tag that matches cli/Cargo.toml's version (e.g. v0.1.0) to publish a release.
+# install.sh downloads the asset this job uploads, by name, from the latest release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04   # glibc 2.35: the binary runs on distributions at least this new
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+      # portable, not -march=native: AVX2 + FMA is what the kernels need. On the reference
+      # T480 the x86-64-v3 build's output is byte-identical to the native build's, and its
+      # speed was within run-to-run noise (2.40-3.08 vs 2.41-3.27 tok/s, warm cache).
+      CACHEPOTATO_MARCH: x86-64-v3
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: tag matches the crate version
+        run: |
+          v=$(grep -m1 '^version' cli/Cargo.toml | cut -d'"' -f2)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match cli/Cargo.toml version $v"; exit 1
+          fi
+
+      - name: build
+        run: cargo build --release --locked --manifest-path cli/Cargo.toml
+
+      - name: smoke test
+        run: |
+          ./cli/target/release/cachepotato --version
+          ./cli/target/release/cachepotato list
+
+      - name: package
+        run: |
+          d="cachepotato-$TARGET"
+          mkdir "$d"
+          cp cli/target/release/cachepotato LICENSE "$d/"
+          tar -czf "$d.tar.gz" "$d"
+          sha256sum "$d.tar.gz" > "$d.tar.gz.sha256"
+          cat "$d.tar.gz.sha256"
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "CachePotato $GITHUB_REF_NAME" --generate-notes \
+            "cachepotato-$TARGET.tar.gz" "cachepotato-$TARGET.tar.gz.sha256"

@@ -32,3 +32,4 @@ scratch/port_*.v4cp
 
 # Rust CLI build output
 cli/target/
+cli/target-*/
