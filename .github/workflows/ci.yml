@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # the C engine and its drivers, as `make` builds them for a developer
+      - name: make
+        run: make -j"$(nproc)"
+
+      # the CLI exactly as a release builds it: portable x86-64-v3, lockfile respected
+      - name: clippy
+        env:
+          CACHEPOTATO_MARCH: x86-64-v3
+        run: cargo clippy --release --locked --manifest-path cli/Cargo.toml -- -D warnings
+      - name: cargo build
+        env:
+          CACHEPOTATO_MARCH: x86-64-v3
+        run: cargo build --release --locked --manifest-path cli/Cargo.toml
+      - name: smoke test
+        run: |
+          ./cli/target/release/cachepotato --version
+          ./cli/target/release/cachepotato list
+          ./cli/target/release/cachepotato doctor
+
+      - name: shellcheck install.sh
+        run: shellcheck install.sh

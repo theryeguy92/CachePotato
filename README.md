@@ -88,13 +88,20 @@ file format in which the unit of paging (a region) is also the unit of measureme
 ### Three commands
 
 ```bash
-git clone https://github.com/theryeguy92/CachePotato && cd CachePotato
-cargo install --path cli          # builds the C engine into a `cachepotato` binary
+curl -fsSL https://raw.githubusercontent.com/theryeguy92/CachePotato/main/install.sh | sh
+cachepotato doctor                # what this machine can run, before downloading anything
 cachepotato run qwen3-30b-a3b     # downloads 17.5 GB on first run, then chat
 ```
 
-Linux on x86-64 with AVX2, a C compiler and Rust. `cachepotato doctor` checks the machine
-first: CPU, free memory, disk type and space, and what each model would get. The weights come
+Linux on x86-64 with AVX2 and FMA (roughly Intel Haswell / AMD Zen and newer, glibc 2.35+).
+The installer checks the CPU, downloads the prebuilt binary from the latest
+[release](https://github.com/theryeguy92/CachePotato/releases), verifies its SHA-256 and puts
+it in `~/.local/bin`; nothing is installed system-wide. To skip the pipe-to-shell, download the
+`.tar.gz` and `.sha256` from the release page and run `sha256sum -c` yourself. To build from
+source instead (needs a C compiler and Rust): `cargo install --path cli` in a clone.
+
+`cachepotato doctor` reports the CPU, free memory, disk type and space, and what each model
+would get. The weights come
 pre-converted from [Hugging Face](https://huggingface.co/ryanlevey/cachepotato-qwen3-30b-a3b)
 and are checked against the repo's SHA-256 sums; an interrupted download resumes.
 
