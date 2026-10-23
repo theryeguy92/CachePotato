@@ -486,6 +486,15 @@ static void pager_report_resident(void) {
                 arena_bytes / 1048576.0, n_arena_fallback, arena_pread_bytes / 1048576.0);
 }
 
+void pager_totals(PagerTotals *out) {
+    long res = 0;
+    for (int i = 0; i < n_regions; i++)
+        if (regions[i].resident) res += (long)regions[i].bytes;
+    out->hits = n_hits; out->misses = n_misses; out->bytes_fetched = bytes_missed;
+    out->evictions = n_evictions; out->resident_bytes = res; out->budget_bytes = budget;
+    out->regions = n_regions;
+}
+
 void pager_report(void) {
     if (budget < 0)
         return;

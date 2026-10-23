@@ -7,7 +7,7 @@ TRAINER := engine/core/weights.c engine/core/weights_v4.c engine/kernels/kernels
 
 .PHONY: all calibrate
 
-all: $(BUILD)/cachepotato $(BUILD)/train $(BUILD)/qwen3_eval
+all: $(BUILD)/cachepotato $(BUILD)/train $(BUILD)/qwen3_eval $(BUILD)/qwen3_chat $(BUILD)/qwen_chat
 
 # Host calibration probe (Phase 8 T3): measures the memory hierarchy and emits a
 # machine profile. Not part of the engine — a separate diagnostic binary.
@@ -23,20 +23,24 @@ $(BUILD)/cachepotato: src/main.c $(ENGINE)
 QWEN_SRC := tools/qwen_chat.c engine/blocks/qwen2.c engine/tokenizers/tokenizer.c \
             engine/tokenizers/tokenizer_qwen.c engine/kernels/kernels.c engine/kernels/parallel.c
 $(BUILD)/qwen_chat: $(QWEN_SRC)
+	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 # Qwen3-30B chat CLI through the pager (the model does not fit; see docs/2026-10-19-what-can-run.md).
-QWEN3_CHAT_SRC := tools/qwen3_chat.c engine/blocks/qwen3_moe.c engine/kernels/kernels.c \
+# A thin client of engine/api/cachepotato.h, the same API the Rust CLI links.
+QWEN3_CHAT_SRC := tools/qwen3_chat.c engine/api/cachepotato.c engine/blocks/qwen3_moe.c engine/kernels/kernels.c \
                   engine/kernels/parallel.c engine/pager/pager.c engine/core/weights.c \
                   engine/core/weights_v4.c engine/tokenizers/tokenizer.c \
                   engine/tokenizers/tokenizer_qwen.c
 $(BUILD)/qwen3_chat: $(QWEN3_CHAT_SRC)
+	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 # Decode benchmark for A/B work (tools/ab.py drives it).
 BENCH_SRC := tools/bench_decode.c engine/blocks/qwen2.c engine/kernels/kernels.c \
              engine/kernels/parallel.c
 $(BUILD)/bench_decode: $(BENCH_SRC)
+	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 # Qwen3-30B-A3B eval driver (B5 + C1 paging). Built but not run by `make`: it wants the
@@ -46,6 +50,7 @@ QWEN3_SRC := tools/qwen3_eval.c engine/blocks/qwen3_moe.c engine/kernels/kernels
              engine/kernels/parallel.c engine/pager/pager.c engine/core/weights.c \
              engine/core/weights_v4.c
 $(BUILD)/qwen3_eval: $(QWEN3_SRC)
+	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 $(BUILD)/train: $(TRAINER)

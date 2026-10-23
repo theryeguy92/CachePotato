@@ -73,6 +73,16 @@ const void *pager_region_get(int id);
    that was current, which is exact when one step is in flight (decode) and a rate
    when a whole prompt is batched through one forward. */
 void pager_step(int step);                  /* charge subsequent touches to `step` */
+
+/* Cumulative counters for a caller that displays them (the CLI's monitor). The same events
+   pager_report() prints; reading them changes nothing. budget_bytes is -1 when the pager is
+   disabled and LONG_MAX when it is unlimited. */
+typedef struct {
+    long hits, misses, bytes_fetched, evictions;
+    long resident_bytes, budget_bytes;
+    int  regions;
+} PagerTotals;
+void pager_totals(PagerTotals *out);
 int  pager_dump_steps(const char *path);    /* 0 ok; one row per step */
 
 #endif

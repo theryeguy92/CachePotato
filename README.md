@@ -7,7 +7,7 @@
 **Running a sparse language model on a "potato". Designing a sparse language model and the memory-hierarchy engine.**
 
 [![Language](https://img.shields.io/badge/language-C11-555555?style=flat-square&logo=c&logoColor=white)](#build--run)
-[![Dependencies](https://img.shields.io/badge/third--party%20deps-none-brightgreen?style=flat-square)](#build--run)
+[![Dependencies](https://img.shields.io/badge/engine%20third--party%20deps-none-brightgreen?style=flat-square)](#build--run)
 [![Build](https://img.shields.io/badge/build-make%20%C2%B7%20zero--config-orange?style=flat-square)](#build--run)
 [![Status](https://img.shields.io/badge/phase-8%20in%20progress%20%C2%B7%203%20ports%20running-blue?style=flat-square)](docs/PROGRESS.md#status)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
@@ -66,7 +66,7 @@ file format in which the unit of paging (a region) is also the unit of measureme
 
 | | |
 |---|---|
-| **Run a 30B on a 16 GB laptop** | `CP_PAGER=1 CP_BUDGET=13312 CP_THREADS=4 CP_PIN_CORES=1 ./build/qwen3_chat scratch/qwen3_q4attn.v4cp 48 200` — ~20 s for the first prompt (cold disk), then ~0.8 s/token. Follow-ups stay in the KV cache and run faster (2.2 tok/s measured on turn 2). |
+| **Run a 30B on a 16 GB laptop** | `cachepotato run qwen3-30b-a3b` — ~20 s for the first prompt (cold disk), then ~0.8 s/token. Follow-ups stay in the KV cache and run faster (2.2 tok/s measured on turn 2). |
 | **Something interactive** | the 0.5B chat at ~10–15 tok/s on four threads — the one that feels like a normal assistant. |
 | **See *why* it is slow** | per-token counters: regions fetched, MB read from disk, hit rates, evictions. This is the part a general-purpose runtime will not show you. |
 | **Experiment with quantisation safely** | the format carries f32 / Q8_0 / Q4_0, and any lossy encoding has to pass a pre-registered quality gate. Q4 experts+attention passes at 93.3% / 97.5% next-token agreement with Q8; whole-model Q4 failed it (70.8%). |
@@ -88,16 +88,27 @@ file format in which the unit of paging (a region) is also the unit of measureme
 ### Three commands
 
 ```bash
-make
-# fast (4-bit experts + attention, 1.2 tok/s)      exact (Q8, 0.8 tok/s):
-CP_PAGER=1 CP_BUDGET=13312 CP_THREADS=4 CP_PIN_CORES=1 \
-  ./build/qwen3_chat scratch/qwen3_q4attn.v4cp 48 200
+git clone https://github.com/theryeguy92/CachePotato && cd CachePotato
+cargo install --path cli          # builds the C engine into a `cachepotato` binary
+cachepotato run qwen3-30b-a3b     # downloads 17.5 GB on first run, then chat
 ```
 
-Needs ~50 GB of disk for the weight files (32.5 GB Q8 + 17.5 GB Q4), a 13 GB RAM budget, and
-nothing else. `48` is the layer count and `200` the per-answer token cap; type `exit` to leave.
-Drop `CP_BUDGET` to 8192 if other applications need memory — swapping looks exactly like a broken
-model (0.36 tok/s). Details: [Build & run](#build--run).
+Linux on x86-64 with AVX2, a C compiler and Rust. `cachepotato doctor` checks the machine
+first: CPU, free memory, disk type and space, and what each model would get. The weights come
+pre-converted from [Hugging Face](https://huggingface.co/ryanlevey/cachepotato-qwen3-30b-a3b)
+and are checked against the repo's SHA-256 sums; an interrupted download resumes.
+
+| | |
+|---|---|
+| `qwen3-30b-a3b` | 4-bit experts + attention, 17.5 GB, 1.2 tok/s on the T480 — the default |
+| `qwen3-30b-a3b:q8` | 8-bit, 32.5 GB, 0.8 tok/s — the exact reference |
+
+The pager budget is set from available memory (leaving 2 GB for everything else) and the
+threads from the physical cores; `--budget <MB>` and `--threads <n>` override them. A budget
+that makes the machine swap looks exactly like a broken model (0.36 tok/s), which is why the
+default is conservative. `--pin-cores` is the measured setting on this Intel part. Models live
+in `~/.local/share/cachepotato` (`CACHEPOTATO_HOME` moves them). Details:
+[Build & run](#build--run).
 
 ### Why it is different
 
@@ -175,11 +186,22 @@ runtime, no third-party libraries. (pthread was added on 2026-10-17 for the bit-
 threaded kernels; it is a platform C library, not a package, but it is a real link
 dependency and the rule says so here rather than leaving the claim quietly false.)
 
+The user-facing `cachepotato` binary is a Rust crate (`cli/`) that compiles the same C engine
+in through `engine/api/cachepotato.h`. The crates (`clap`, `reqwest`, `sha2`, `indicatif`) are
+used for the command line and the download only; none of them touches the arithmetic, and a
+gate (`tools/verify_cli_chat.sh`) checks that the Rust binary emits exactly the bytes the C
+driver emits.
+
 ```sh
-make          # builds build/cachepotato (engine) and build/train (C trainer)
+make          # build/cachepotato (GPT-2 engine), build/train, build/qwen3_chat, build/qwen_chat
 make run      # interactive REPL against weights/toy.bin
-make build/qwen3_chat   # the 30B chat CLI (see Start here)
+cd cli && cargo build --release   # cli/target/release/cachepotato
 ```
+
+`build/qwen3_chat <model.v4cp> [max_new]` is the C chat driver: the same API without the
+downloader, reading `CP_BUDGET` / `CP_THREADS` / `CP_PIN_CORES` when they are set. The layer
+count comes from the file, and the tokenizer is looked up next to the model, in its
+`tokenizer/` folder, then in `weights/`.
 
 Weights are gitignored; generate them from source:
 
@@ -241,6 +263,8 @@ python3 tools/verify_cpw1_v3.py                         # export + routing gate
 | `engine/` | The C runtime, model-agnostic. `core/` (mmap loader, CPW1 v2/v3, forward + incremental decode, trace replay), `pager/` (regions, LRU, prefetch), `kernels/`, `tokenizers/`, `blocks/` (**empty** — splitting `model.c`'s block types out of `core/` is a pending refactor) |
 | `models/` | One port per model: [`CONTRACT.md`](models/CONTRACT.md) (what a port must ship) and `gpt2-moe/` — the project's own model ported through it, with an independent numpy reference, a converter and the port gate |
 | `format/` | [`SPEC.md`](format/SPEC.md) — the self-describing weight format (CPW1 v4). **Implemented and gated**: a v3→v4 round-trip reproduces the recorded PyTorch routing 100% and survives a shuffled physical payload, i.e. tensors are addressed by offset |
+| `engine/api/` | `cachepotato.h` — the public C API (open, chat with a token callback, stats). The chat drivers and the Rust CLI are clients of it |
+| `cli/` | The `cachepotato` command (Rust): `run`, `pull`, `list`, `doctor`. Compiles `engine/` in via `build.rs` |
 | `src/` | `main.c` (CLI/REPL/bench/gates) and `train.c` (the C trainer) — the two entry points, now that the runtime lives in `engine/` |
 | `experiments/` | Phase 0 scratch programs — mmap/`madvise` probes, SSD latency. Learning artifacts, not engine code |
 | `docs/` | Dated direction notes — currently the universal-ports pivot and its evidence |
@@ -315,10 +339,11 @@ python3 tools/verify_cpw1_v3.py                         # export + routing gate
   GPT-2 `Model`, so `cachepotato -i` speaks only GPT-2. The Qwen3 v4 loader still hardcodes
   `rope_theta` (1e6) and top-8, and sizes its expert tables for 128 experts, so a Qwen3-family
   model with different values needs a loader change and its own gate.
-- **Weights are not shipped, and conversion needs Python.** The runtime is C only, but producing a
-  file means downloading the published checkpoint (61 GB bf16 for the 30B) and running the
-  converters in `tools/` and `models/` (`pip install -r tools/requirements.txt`: numpy, torch,
-  transformers).
+- **Converting a model yourself needs Python.** The Qwen3-30B-A3B files are published
+  pre-converted on [Hugging Face](https://huggingface.co/ryanlevey/cachepotato-qwen3-30b-a3b).
+  Producing any other file means downloading the published checkpoint (61 GB bf16 for the 30B)
+  and running the converters in `tools/` and `models/` (`pip install -r tools/requirements.txt`:
+  numpy, torch, transformers).
 - **No `make test`.** `tests/` is a placeholder. Correctness is enforced by
   [`tools/run_gates.sh`](tools/run_gates.sh) against recorded reference data. On a fresh clone only
   the four kernel and decoder gates can pass: the Qwen and v4 gates skip themselves when their

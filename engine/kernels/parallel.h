@@ -22,6 +22,11 @@
 /* Initialise lazily from CP_THREADS (default 1, clamped to [1, 64]). Returns thread count. */
 int  cp_threads(void);
 
+/* Start the pool with n threads instead of reading CP_THREADS (n <= 0 falls back to it).
+ * pin: 1/0 overrides CP_PIN_CORES, -1 keeps it. Only the first call that starts the pool
+ * counts; later calls return the running thread count. */
+int  cp_threads_init(int n, int pin);
+
 /* Run fn(ctx, lo, hi) over contiguous slices of [0, n). Blocks until all slices finish.
  * Runs serially when the pool has one thread. */
 void cp_parallel_for(int n, void (*fn)(void *ctx, int lo, int hi), void *ctx);

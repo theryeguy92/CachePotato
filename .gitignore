@@ -29,3 +29,6 @@ scratch/*.v4cp
 
 # port-generated v4 files (hundreds of MB; regenerate with models/<port>/convert.py)
 scratch/port_*.v4cp
+
+# Rust CLI build output
+cli/target/

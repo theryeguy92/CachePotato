@@ -20,6 +20,7 @@ typedef struct { const void *p; int enc; } QW3T;
 
 typedef struct {
     int d_model, n_heads, n_kv, head_dim, d_exp, n_experts, topk, vocab;
+    int n_layers;           /* from the v4 block table (qwen3_map); 0 for the blob loader */
     float rope_theta, rms_eps;
     const float *ln1, *ln2, *q_norm, *k_norm;   /* (d_model) and (head_dim) */
     QW3T Wq, Wk, Wv, Wo;                        /* (n_heads*hd, d) (n_kv*hd, d) (d, n_heads*hd) */
@@ -104,6 +105,12 @@ int qwen3_load_blob(QW3Layer *m, const char *path, float **owned);
 /* CPW1 v4 loader: reads the published format, one layer at a time.
    Returns 0 on success; the file is mmapped and stays mapped for the model's lifetime. */
 int qwen3_map(QW3Layer *m, const char *path);        /* mmap + read the encoding table */
+/* qwen3_map with the pager budget given rather than read from CP_PAGER / CP_BUDGET:
+   QW3_BUDGET_ENV reads them (what qwen3_map does), QW3_BUDGET_NONE attaches no pager,
+   LONG_MAX attaches one that never evicts, anything else is a budget in bytes. */
+#define QW3_BUDGET_ENV  (-2L)
+#define QW3_BUDGET_NONE (-1L)
+int qwen3_map_ex(QW3Layer *m, const char *path, long budget_bytes);
 int qwen3_bind_layer(QW3Layer *m, int layer);        /* resolve one layer's tensors */
 int qwen3_load_v4(QW3Layer *m, const char *path, int layer);   /* map + bind (A5 gate) */
 #endif
